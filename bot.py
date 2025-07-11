@@ -138,4 +138,4 @@ async def оновити(ctx):
         print(f"💥 [оновити] Виняток: {e}")
 
 # ▶️ Запуск
-bot.run(TOKEN)
+bot.run(TOKEN) 
