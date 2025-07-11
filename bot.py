@@ -1,4 +1,4 @@
-import discord
+\import discord
 from discord.ext import commands
 from discord import app_commands
 from discord.ui import View, Button
@@ -9,15 +9,14 @@ from dotenv import load_dotenv
 import datetime
 import aiohttp
 
-# Завантаження змінних
+# 🔐 Завантаження змінних
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
-PING_URL = os.getenv("PING_URL")
 PORT = int(os.getenv("PORT"))
-DEPLOY_HOOK_URL = "https://api.render.com/deploy/srv-d1op6fk9c44c73ft182g?key=K_iwnXTdqgc"
+DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")  # Render hook для оновлення
 
-# Flask для keep-alive
+# ☁️ Flask для keep-alive
 app = Flask('')
 
 @app.route('/')
@@ -25,16 +24,16 @@ def home():
     return "Bot is online"
 
 def run():
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=PORT)  # 🔧 критично — використовує PORT з .env
 
 threading.Thread(target=run).start()
 
-# Налаштування бота
+# 🤖 Discord bot
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="", intents=intents)
 
-# Кнопки слотів
+# 🎯 View-кнопки для слотів
 class SlotView(View):
     @discord.ui.button(label="Записатись", style=discord.ButtonStyle.success)
     async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -45,7 +44,7 @@ class SlotView(View):
         await interaction.message.delete()
         await interaction.response.send_message("❌ Ви відмовились від слота", ephemeral=True)
 
-# Старт і логування
+# 🚀 Старт бота
 @bot.event
 async def on_ready():
     print(f"🔌 Bot ready @ {datetime.datetime.now()}")
@@ -56,7 +55,7 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Помилка при запуску: {e}")
 
-# Обробка повідомлень
+# 🧹 Автоочищення `моїслоти`
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -77,7 +76,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# Слеш-команда "моїслоти"
+# ✳️ Слеш-команда `/моїслоти`
 @bot.tree.command(name="моїслоти", description="Показати свої слоти приватно")
 async def my_slots(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -87,18 +86,18 @@ async def my_slots(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Команда "перезапуск"
+# 🔁 Команда `перезапуск`
 @bot.command()
 async def перезапуск(ctx):
     await ctx.send("🔁 Бот перезапущено (умовно)")
 
-# Команда "clear"
+# 🧽 Команда `clear`
 @bot.command()
 async def clear(ctx, amount: int = 10):
     await ctx.channel.purge(limit=amount)
     await ctx.send(f"🧹 Очищено {amount} повідомлень", delete_after=5)
 
-# Команда "запис"
+# 📅 Команда `запис`
 @bot.command()
 async def запис(ctx):
     embed = discord.Embed(
@@ -108,12 +107,17 @@ async def запис(ctx):
     )
     await ctx.send(embed=embed, view=SlotView())
 
-# Команда "оновити" з логом
+# 🧪 Тестова команда — перевірка hook
+@bot.command()
+async def тест(ctx):
+    await ctx.send(f"HOOK: {DEPLOY_HOOK_URL}")
+
+# 🔄 Оновлення бота через Render hook
 @bot.command()
 async def оновити(ctx):
     if not DEPLOY_HOOK_URL:
         await ctx.send("❌ Deploy Hook не знайдено. Змінна DEPLOY_HOOK_URL = None")
-        print("⛔ [оновити] Не знайдено DEPLOY_HOOK_URL. Оновлення не запущено.")
+        print("⛔ [оновити] DEPLOY_HOOK_URL = None")
         return
 
     await ctx.send("🔄 Запускаю оновлення…")
@@ -122,17 +126,16 @@ async def оновити(ctx):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(DEPLOY_HOOK_URL) as resp:
-                print(f"📬 [оновити] Статус відповіді Render: {resp.status}")
-
+                print(f"📬 [оновити] Статус відповіді: {resp.status}")
                 if resp.status == 200:
-                    await ctx.send("✅ Оновлення запущено! Render виконає деплой за кілька секунд.")
-                    print("✅ [оновити] Оновлення успішно запущено.")
+                    await ctx.send("✅ Оновлення запущено! Бот оновиться за кілька секунд.")
+                    print("✅ [оновити] Успішно.")
                 else:
-                    await ctx.send(f"❌ Помилка при оновленні. Код відповіді: {resp.status}")
-                    print(f"⛔ [оновити] Відповідь не 200 OK → {resp.status}")
+                    await ctx.send(f"❌ Помилка оновлення. Код: {resp.status}")
+                    print(f"⛔ [оновити] Код не 200 → {resp.status}")
     except Exception as e:
-        await ctx.send(f"❌ Запит не вдалося виконати: {e}")
-        print(f"💥 [оновити] Виникла помилка: {e}")
+        await ctx.send(f"❌ Помилка при запиті: {e}")
+        print(f"💥 [оновити] Виняток: {e}")
 
-# Запуск
+# ▶️ Запуск
 bot.run(TOKEN)
