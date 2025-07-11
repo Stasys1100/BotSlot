@@ -1,0 +1,11 @@
+services:
+  - type: web_service
+    name: discord-bot-web
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: DISCORD_TOKEN
+      - key: LOG_CHANNEL_ID
+      - key: PING_URL
+      - key: PORT
