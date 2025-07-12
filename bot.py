@@ -8,38 +8,48 @@ from discord.ui import View, Button
 from dotenv import load_dotenv
 from keep_alive import keep_alive
 
+# ─── 1. Keep-alive і .env ───────────────────────────────────────────────────────
 keep_alive()
 load_dotenv()
 
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 
-# Інтент для читання тексту повідомлень
+# ─── 2. Інтент і створення бота ─────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Довільний список рядків – кнопки лише для тих, які починаються з N. або N:
-slot_lines = [
-    "1. Командир відділення (RK-95)",
-    "2: Марксмен (RK-95)",
-    "3. Гранатометник (Rk-95/M136)",
-    "4: Лідер групи (RK-95)",
-    "5. Кулеметник (PKM)",
-    "6: Стрілець (RK-95)",
-    "7: Лідер групи (RK-95)",
-    "8: Кулеметник (PKM)",
-    "9: Медик (RK-95)"
-]
+# ─── 3. Зчитуємо слоти з файлу slots.txt або беремо список за замовчуванням ────
+SLOT_FILE = "slots.txt"
+if os.path.exists(SLOT_FILE):
+    with open(SLOT_FILE, encoding="utf-8") as f:
+        slot_lines = [line.strip() for line in f if line.strip()]
+else:
+    slot_lines = [
+        "1. Командир відділення (RK-95)",
+        "2: Марксмен (RK-95)",
+        "3. Гранатометник (Rk-95/M136)",
+        "4: Лідер групи (RK-95)",
+        "5. Кулеметник (PKM)",
+        "6: Стрілець (RK-95)",
+        "7. Лідер групи (RK-95)",
+        "8. Кулеметник (PKM)",
+        "9: Медик (RK-95)"
+    ]
+
+# Список поточно зайнятих слотів (None → вільний)
 slot_users = [None] * len(slot_lines)
 
+# ─── 4. Функція-фільтр: рядок починається з "N." або "N:"? ─────────────────────────
 def is_slot(line: str) -> bool:
     text = line.strip()
-    for n in range(1, 100):
+    for n in range(1, len(slot_lines) + 1):
         if text.startswith(f"{n}.") or text.startswith(f"{n}:"):
             return True
     return False
 
+# ─── 5. View та Button для динамічного створення ────────────────────────────────
 class SlotView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -54,30 +64,35 @@ class SlotButton(Button):
         free = slot_users[index] is None
         label = f"{index+1}. {'Вільний' if free else 'Відмовитись'}"
         style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
-        super().__init__(label=label, style=style, custom_id=f"slot_{index}", row=row)
+        super().__init__(label=label, style=style,
+                         custom_id=f"slot_{index}", row=row)
         self.index = index
 
     async def callback(self, interaction: discord.Interaction):
         user = interaction.user
+        # 1) Якщо вільний – займаємо
         if slot_users[self.index] is None:
             slot_users[self.index] = user
             await interaction.response.send_message(
                 f"✅ Ви записались у слот {self.index+1}", ephemeral=True
             )
+        # 2) Якщо це ви ж – відмовляєтесь
         elif slot_users[self.index] == user:
             slot_users[self.index] = None
             await interaction.response.send_message(
                 f"❌ Ви відмовились від слота {self.index+1}", ephemeral=True
             )
+        # 3) Якщо зайнятий іншим – попереджаємо
         else:
             await interaction.response.send_message(
-                "⚠️ Цей слот зайнятий іншим користувачем", ephemeral=True
+                "⚠️ Цей слот вже зайнятий іншим користувачем", ephemeral=True
             )
             return
 
-        # Оновлюємо список і кнопки в повідомленні
+        # Після зміни – оновлюємо повідомлення
         await interaction.message.edit(content=format_slots(), view=SlotView())
 
+# Формуємо текст із валідними слотами та mentions
 def format_slots() -> str:
     header = "**Запис у слоти**\n"
     body = ""
@@ -87,43 +102,57 @@ def format_slots() -> str:
             body += f"{line}\n{mention}\n"
     return header + body
 
+# ─── 6. Слухаємо події ──────────────────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
-    print("[on_ready] Бот стартував")
+    print(f"[on_ready] Bot started @ {datetime.datetime.utcnow().isoformat()} UTC")
     print(f"[on_ready] message_content intent = {bot.intents.message_content}")
-    print(f"[on_ready] Guilds = {[g.name for g in bot.guilds]}")
+    # Повідомлення про релонч у першому доступному текстовому каналі
+    commit = subprocess.getoutput("git rev-parse --short HEAD")
     for guild in bot.guilds:
         for channel in guild.text_channels:
-            perms = channel.permissions_for(guild.me)
-            print(f"[on_ready] Канал {channel.name} → send_messages={perms.send_messages}")
-            if perms.send_messages:
-                commit = subprocess.getoutput("git rev-parse --short HEAD")
+            if channel.permissions_for(guild.me).send_messages:
                 try:
                     await channel.send(f"🔄 Бот перезапущено\n📦 Commit: `{commit}`")
                     return
-                except Exception as e:
-                    print(f"[on_ready] Помилка при відправці: {e}")
+                except:
+                    continue
 
 @bot.event
 async def on_message(message: discord.Message):
-    print(f"[on_message] отримано: {message.content}")
+    # ‣ Ігноруємо боти
     if message.author.bot:
         return
 
+    # ‣ Лог у консоль для діагностики
+    print(f"[on_message] {message.author}: {message.content}")
+
+    # ‣ Якщо це команда (починається на префікс) – пропускаємо на обробку команд
+    if message.content.startswith(bot.command_prefix):
+        await bot.process_commands(message)
+        return
+
+    # ‣ Якщо в тексті є “запис слоти” – показуємо список кнопок
     if "запис слоти" in message.content.lower():
         global slot_users
         slot_users = [None] * len(slot_lines)
-        ctx = await bot.get_context(message)
-        await ctx.send(content=format_slots(), view=SlotView())
+        await message.channel.send(content=format_slots(), view=SlotView())
 
+    # ‣ В будь-якому випадку пропускаємо командний цикл
     await bot.process_commands(message)
+
+# ─── 7. Додаткові команди ─────────────────────────────────────────────────────
 
 @bot.command()
 async def debug(ctx: commands.Context):
     """
-    Показує стан інтента та навколишню діагностику.
+    Віддає базову діагностику:
+     • message_content intent
+     • список серверів
+     • кількість слотів
     """
-    guilds = [g.name for g in bot.guilds]
+    guilds = ", ".join(g.name for g in bot.guilds)
     await ctx.send(
         f"🔍 message_content intent = `{bot.intents.message_content}`\n"
         f"🗂 Guilds: {guilds}\n"
@@ -142,8 +171,7 @@ async def статус(ctx: commands.Context):
 @bot.command()
 async def оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        await ctx.send("❌ DEPLOY_HOOK_URL не задано")
-        return
+        return await ctx.send("❌ DEPLOY_HOOK_URL не задано")
     async with aiohttp.ClientSession() as sess:
         async with sess.post(DEPLOY_HOOK_URL):
             await ctx.send("🔄 Оновлення викликано! Render запускає нову версію…")
@@ -159,4 +187,5 @@ async def gitpush(ctx: commands.Context):
     embed.set_footer(text="Після push → !оновити для Render-деплою")
     await ctx.send(embed=embed)
 
+# ─── 8. Стартуємо бота ─────────────────────────────────────────────────────────
 bot.run(TOKEN)
