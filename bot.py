@@ -66,6 +66,19 @@ def format_slots():
     return text
 
 @bot.event
+async def on_ready():
+    print(f"✅ Bot started @ {datetime.datetime.now(datetime.UTC).isoformat()} UTC")
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if channel.permissions_for(guild.me).send_messages:
+                try:
+                    commit = subprocess.getoutput("git rev-parse --short HEAD")
+                    await channel.send(f"🔄 Бот перезапущено\n📦 Commit: `{commit}`")
+                    break
+                except:
+                    pass
+
+@bot.event
 async def on_message(message):
     if message.author.bot:
         return
@@ -74,8 +87,7 @@ async def on_message(message):
         global slot_users
         slot_users = [None] * len(slot_lines)
         await ctx.send(content=format_slots(), view=SlotView())
-    else:
-        await bot.process_commands(message)
+    await bot.process_commands(message)
 
 @bot.command()
 async def моїслоти(ctx):
@@ -100,7 +112,7 @@ async def оновити(ctx):
         return
     async with aiohttp.ClientSession() as session:
         async with session.post(DEPLOY_HOOK_URL) as resp:
-            await ctx.send(f"🔔 Render: {resp.status}")
+            await ctx.send("🔄 Оновлення викликано! Render запускає нову версію…")
 
 @bot.command()
 async def gitpush(ctx):
