@@ -1,9 +1,3 @@
-<<<<<<< HEAD
 .env
 __pycache__/
 *.pyc
-=======
-.env
-__pycache__/
-*.py[cod]
->>>>>>> 4eb119b2590fe79adbe3bf214a17f59858d87082
