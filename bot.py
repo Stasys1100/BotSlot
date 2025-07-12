@@ -24,29 +24,35 @@ def home():
     return "Bot is online"
 
 def run():
-    app.run(host='0.0.0.0', port=PORT)  # ☑️ Працюючий порт
+    app.run(host='0.0.0.0', port=PORT)
+
 threading.Thread(target=run).start()
 
-# Discord bot з префіксом
+# Ініціалізація бота
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Кнопки
+# Клас для кнопок слотів
 class SlotView(View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
     @discord.ui.button(label="Записатись", style=discord.ButtonStyle.success)
     async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("✅ Ви записались!", ephemeral=True)
 
     @discord.ui.button(label="Відмовитись", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Відповідь та видалення повідомлення з іконкою
         try:
             await interaction.message.delete()
             await interaction.response.send_message("❌ Ви відмовились від слота", ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"⚠️ Помилка видалення: {e}", ephemeral=True)
+            # можливо, повідомлення вже видалено
+            await interaction.response.send_message(f"⚠️ Помилка: {e}", ephemeral=True)
 
-# Запуск
+# Обробка подій при запуску (ready)
 @bot.event
 async def on_ready():
     print(f"🔌 Bot ready @ {datetime.datetime.now()}")
@@ -59,7 +65,7 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Стартова помилка: {e}")
 
-# Команди через on_message
+# Основна обробка повідомлень
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -67,10 +73,12 @@ async def on_message(message):
 
     msg = message.content.lower()
 
+    # Тест команда
     if msg == "!тест":
         await message.channel.send(f"HOOK: {DEPLOY_HOOK_URL}")
         return
 
+    # Оновлення
     if msg == "!оновити":
         if not DEPLOY_HOOK_URL:
             await message.channel.send("❌ Hook не знайдено")
@@ -87,10 +95,14 @@ async def on_message(message):
             await message.channel.send(f"💥 Виняток: {e}")
         return
 
+    # Перезапуск
     if msg == "!перезапустити":
         await message.channel.send("🔁 Перезапуск виконано (умовно)")
+        # Перезапуск у реальному часі - його потрібно робити зовні, або через зовнішні скрипти
+        # Але тут залишається для прикладу тільки повідомлення
         return
 
+    # Команда для натискання слотів
     if msg == "!запис":
         embed = discord.Embed(
             title="Слоти 🔄",
@@ -100,6 +112,7 @@ async def on_message(message):
         await message.channel.send(embed=embed, view=SlotView())
         return
 
+    # Мої слоти (звичайний меседж)
     if msg == "моїслоти":
         try:
             await message.delete()
@@ -115,7 +128,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# Slаsh-команда /моїслоти
+# Команда /моїслоти (слеш команда)
 @bot.tree.command(name="моїслоти", description="Показати свої слоти приватно")
 async def slash_slots(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -125,5 +138,7 @@ async def slash_slots(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Старт бота
-bot.run(TOKEN) 
+# Підтвердження перезапуску або інша логіка тут можлива (якщо потрібно)
+
+# Запуск
+bot.run(TOKEN)
