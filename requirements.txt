@@ -1,4 +1,11 @@
+<<<<<<< HEAD
 discord.py==2.5.2
 aiohttp
 Flask
 python-dotenv
+=======
+discord.py
+aiohttp
+python-dotenv
+flask
+>>>>>>> 4eb119b2590fe79adbe3bf214a17f59858d87082
