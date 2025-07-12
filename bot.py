@@ -1,7 +1,7 @@
 import os
 import subprocess
-import datetime
 import aiohttp
+import datetime
 import discord
 from discord.ext import commands
 from discord.ui import View, Button
@@ -18,7 +18,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# 💬 Список слотів — без змін
 slot_lines = [
     "1. Ryhmäjohtaja/Командир відділення (RK-95)",
     "2. Tarkka-ampuja/Марксмен (RK-95)",
@@ -60,26 +59,21 @@ class SlotButton(Button):
         await interaction.message.edit(content=format_slots(), view=SlotView())
 
 def format_slots():
-    result = "**Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara**\n"
+    text = "**Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara**\n"
     for i, line in enumerate(slot_lines):
         user = slot_users[i].mention if slot_users[i] else ""
-        result += f"{line}\n{user}\n"
-    return result
-
-@bot.command(name="запис_слоти")
-async def запис_слоти(ctx):
-    global slot_users
-    slot_users = [None] * len(slot_lines)
-    await ctx.send(content=format_slots(), view=SlotView())
+        text += f"{line}\n{user}\n"
+    return text
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-    lowered = message.content.lower()
-    if "слот" in lowered:
+    if message.content.strip().lower() == "запис слоти":
         ctx = await bot.get_context(message)
-        await запис_слоти(ctx)
+        global slot_users
+        slot_users = [None] * len(slot_lines)
+        await ctx.send(content=format_slots(), view=SlotView())
     else:
         await bot.process_commands(message)
 
