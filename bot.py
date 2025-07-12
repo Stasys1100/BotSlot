@@ -43,7 +43,7 @@ class SlotView(View):
     def __init__(self):
         super().__init__(timeout=None)
         for i in range(len(slot_titles)):
-            row = i // 5  # max 5 per row
+            row = i // 5
             self.add_item(SlotButton(i, row))
 
 class SlotButton(Button):
