@@ -83,6 +83,18 @@ async def запис_слоти(ctx):
         text += title + "\n\n"
     await ctx.send(text, view=SlotView())
 
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
+
+    lowered = message.content.lower()
+    if "слот" in lowered:
+        ctx = await bot.get_context(message)
+        await запис_слоти(ctx)
+    else:
+        await bot.process_commands(message)
+
 def get_commit_hash():
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
