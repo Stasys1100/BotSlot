@@ -4,179 +4,188 @@ import subprocess
 import aiohttp
 import datetime
 import discord
+
 from discord.ext import commands
 from discord.ui import View, Button
 from dotenv import load_dotenv
 from keep_alive import keep_alive
 
-# ─── 1. Keep-alive і завантаження .env ───────────────────────────────────────────
+# ─── 1. Keep-alive + завантаження ENV ─────────────────────────────────────────
 keep_alive()
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 
-# ─── 2. Інтенти і створення бота ────────────────────────────────────────────────
+# ─── 2. Інтенти і створення бота ──────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─── 3. Сесії: message_id → { title, lines, users } ─────────────────────────────
+# ─── 3. Зберігаємо стан усіх “відділень” у sessions ───────────────────────────
+# ключ = message.id, значення = dict { title, lines: [str], owners: [User|None] }
 sessions: dict[int, dict] = {}
-TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
+TRIGGER = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
+
 def build_embed(session: dict) -> discord.Embed:
-    """Повертає Embed для однієї сесії слотування."""
+    """Створює Embed по даним конкретної сесії."""
     e = discord.Embed(title=session["title"], color=discord.Color.blue())
-    e.description = "\n".join(
-        f"{line} – Зайнято {user.mention}" if user else line
-        for line, user in zip(session["lines"], session["users"])
-    )
+    lines = []
+    for text, owner in zip(session["lines"], session["owners"]):
+        lines.append(f"{text} – Зайнято {owner.mention}" if owner else text)
+    e.description = "\n".join(lines)
     return e
 
+
 class SlotButton(Button):
-    """Кнопка зайняти/відмовитись від слота для конкретної сесії."""
-    def __init__(self, session_id: int, idx: int, row: int):
-        session = sessions[session_id]
-        free = session["users"][idx] is None
+    """Button із прив’язкою до тієї самої сесії (message_id) і свого index."""
+    def __init__(self, message_id: int, idx: int, row: int):
+        self.session_id = message_id
+        self.idx = idx
+        session = sessions[message_id]
+        owner = session["owners"][idx]
+        free = owner is None
+
         label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
         style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
+
         super().__init__(
             label=label,
             style=style,
-            custom_id=f"slot_{session_id}_{idx}",
+            custom_id=f"slot-{message_id}-{idx}",
             row=row
         )
 
-    async def callback(self, interaction: discord.Interaction):
-        # Розбираємо сесію й індекс слота з custom_id
-        _, sid, idx = interaction.data["custom_id"].split("_")
-        sid, idx = int(sid), int(idx)
-        session = sessions[sid]
-        user = interaction.user
-        owner = session["users"][idx]
+    async def callback(self, inter: discord.Interaction):
+        user = inter.user
+        session = sessions[self.session_id]
+        owner = session["owners"][self.idx]
 
-        # 1) Якщо слот вільний → спроба зайняти
+        # 1) Якщо вільний, і ви ще ніде не записані → зайняти
         if owner is None:
-            if user in session["users"]:
-                return await interaction.response.send_message(
-                    "⚠️ Ви вже зайняли слот у цьому відділенні. Спершу звільніть його.",
-                    ephemeral=True
+            if user in session["owners"]:
+                return await inter.response.send_message(
+                    "⚠️ Ви вже зайняли слот в цьому відділенні.", ephemeral=True
                 )
-            session["users"][idx] = user
+            session["owners"][self.idx] = user
 
         # 2) Якщо ви власник цього слота → звільнити
         elif owner == user:
-            session["users"][idx] = None
+            session["owners"][self.idx] = None
 
-        # 3) Якщо слот зайнятий іншим → блок
+        # 3) Якщо це чужий слот → заборона
         else:
-            return await interaction.response.send_message(
+            return await inter.response.send_message(
                 "⚠️ Ви не можете звільнити чужий слот.", ephemeral=True
             )
 
-        # Оновлюємо лише це повідомлення
-        await interaction.response.edit_message(
+        # Редагуємо лише це повідомлення
+        await inter.response.edit_message(
             embed=build_embed(session),
-            view=SlotView(sid)
+            view=SlotView(self.session_id)
         )
 
+
 class SlotView(View):
-    """View із кнопками для всіх слотів конкретної сесії."""
-    def __init__(self, session_id: int):
+    """View із кнопками для конкретного message_id."""
+    def __init__(self, message_id: int):
         super().__init__(timeout=None)
-        lines = sessions[session_id]["lines"]
-        for idx in range(len(lines)):
+        count = len(sessions[message_id]["lines"])
+        for idx in range(count):
             row = idx // 5
-            self.add_item(SlotButton(session_id, idx, row))
+            self.add_item(SlotButton(message_id, idx, row))
+
 
 @bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
+async def on_ready():
+    print(f"[on_ready] Logged in as {bot.user} @ {datetime.datetime.utcnow().isoformat()} UTC")
+    commit = subprocess.getoutput("git rev-parse --short HEAD")
+    emb = discord.Embed(
+        title="🔄 Бот перезапущено",
+        description=f"📦 Commit `{commit}`",
+        color=discord.Color.green()
+    )
+    for g in bot.guilds:
+        # перший доступний канал з правом send_messages
+        ch = discord.utils.find(
+            lambda c: isinstance(c, discord.TextChannel)
+                      and c.permissions_for(g.me).send_messages,
+            g.text_channels
+        )
+        if ch:
+            try:
+                await ch.send(embed=emb)
+            except:
+                pass
+
+
+@bot.event
+async def on_message(msg: discord.Message):
+    if msg.author.bot:
         return
 
-    lines = message.content.splitlines()
-    if any("запис слоти" in l.lower() for l in lines):
-        # Парсимо заголовок і слоти
+    # Ловимо будь-яке “запис слоти” у тексті
+    lines = msg.content.splitlines()
+    if any("запис слоти" in L.lower() for L in lines):
         header = None
         slots = []
+
         for raw in lines:
-            txt = raw.strip()
-            if not txt:
+            text = raw.strip()
+            if not text or "запис слоти" in text.lower() or "everyone" in text.lower():
                 continue
-            # Пропускаємо тригер і everyone
-            if "запис слоти" in txt.lower() or "everyone" in txt.lower():
-                continue
-            m = TRIGGER_RE.match(txt)
+            m = TRIGGER.match(text)
             if m:
-                slots.append(txt)
+                slots.append(text)
             elif header is None:
-                header = txt
+                header = text
 
         slots = slots[:25]
         session = {
             "title": header or DEFAULT_TITLE,
             "lines": slots,
-            "users": [None] * len(slots)
+            "owners": [None] * len(slots)
         }
 
-        # Відправляємо Embed, зберігаємо сесію та додаємо View
+        # Відправляємо Embed, реєструємо session під message.id і додаємо View
         embed = build_embed(session)
-        sent = await message.channel.send(embed=embed)
-        sid = sent.id
-        sessions[sid] = session
-        await sent.edit(view=SlotView(sid))
+        sent = await msg.channel.send(embed=embed)
+        sessions[sent.id] = session
+        await sent.edit(view=SlotView(sent.id))
 
-    await bot.process_commands(message)
+    await bot.process_commands(msg)
 
-@bot.event
-async def on_ready():
-    print(f"[on_ready] Bot started @ {datetime.datetime.utcnow().isoformat()} UTC")
-    commit = subprocess.getoutput("git rev-parse --short HEAD")
-    restart_embed = discord.Embed(
-        title="🔄 Бот перезапущено",
-        description=f"📦 Commit: `{commit}`",
-        color=discord.Color.green()
-    )
-    for guild in bot.guilds:
-        channel = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel)
-                       and c.permissions_for(guild.me).send_messages,
-            guild.text_channels
-        )
-        if channel:
-            try:
-                await channel.send(embed=restart_embed)
-            except:
-                pass
 
-# ─── Команди користувача ──────────────────────────────────────────────────────
+# ─── Ось ваші команди ──────────────────────────────────────────────────────────
 @bot.command()
 async def моїслоти(ctx: commands.Context):
-    """Показує, у яких слотах ви записані в кожному відділенні."""
-    output = []
+    """Показати слоти, де ви зараз записані (усі відділення)."""
+    out = []
     for sid, sess in sessions.items():
         taken = [
             sess["lines"][i]
-            for i, u in enumerate(sess["users"])
+            for i, u in enumerate(sess["owners"])
             if u == ctx.author
         ]
         if taken:
-            output.append(f"**{sess['title']}**\n" + "\n".join(taken))
+            out.append(f"**{sess['title']}**\n" + "\n".join(taken))
 
-    if output:
-        await ctx.send("\n\n".join(output))
+    if out:
+        await ctx.send("\n\n".join(out))
     else:
-        await ctx.send("🕸 Ви не записані у жоден слот")
+        await ctx.send("🕸 Ви не записані в жодне відділення.")
+
 
 @bot.command()
 async def debug(ctx: commands.Context):
     guilds = ", ".join(g.name for g in bot.guilds)
     await ctx.send(
-        f"🔍 intent.message_content = `{bot.intents.message_content}`\n"
-        f"🗂 Servers: {guilds}\n"
-        f"ℹ️ Active sessions: {len(sessions)}"
+        f"🔍 message_content intent = `{bot.intents.message_content}`\n"
+        f"🗂 Guilds: {guilds}\n"
+        f"🔑 Active sessions: {len(sessions)}"
     )
+
 
 @bot.command()
 async def статус(ctx: commands.Context):
@@ -187,6 +196,7 @@ async def статус(ctx: commands.Context):
     emb.add_field(name="Hook", value=DEPLOY_HOOK_URL or "None", inline=False)
     await ctx.send(embed=emb)
 
+
 @bot.command()
 async def оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
@@ -195,15 +205,19 @@ async def оновити(ctx: commands.Context):
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Render-деплой тригерено!")
 
+
 @bot.command()
 async def gitpush(ctx: commands.Context):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    emb.add_field(name="1. cd до папки",   value="`cd C:\\Users\\stasd\\Downloads\\botslot`", inline=False)
-    emb.add_field(name="2. git add",       value="`git add .`",                             inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`',       inline=False)
-    emb.add_field(name="4. git push",      value="`git push origin main`",                 inline=False)
+    emb.add_field(name="1. cd до папки",
+                  value="`cd C:\\Users\\stasd\\Downloads\\botslot`", inline=False)
+    emb.add_field(name="2. git add", value="`git add .`", inline=False)
+    emb.add_field(name="3. git commit",
+                  value='`git commit -m "Оновлення слота"`', inline=False)
+    emb.add_field(name="4. git push", value="`git push origin main`", inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── Запуск бота ────────────────────────────────────────────────────────────────
+
+# ─── 9. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
