@@ -8,6 +8,7 @@ import threading
 from dotenv import load_dotenv
 import datetime
 import aiohttp
+import sys
 
 # Завантаження змінних із .env
 load_dotenv()
@@ -15,6 +16,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 PORT = int(os.getenv("PORT"))
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
+RESTART_COMMAND = os.getenv("RESTART_COMMAND")  # наприклад, "bash restart.sh"
 
 # Flask для keep-alive
 app = Flask('')
@@ -33,26 +35,30 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Клас для кнопок слотів
+# Змінна для збереження слотів — простий підхід
+user_slots = {}  # {user_id: [списки слотів]}
+
+# Власний клас View для слотів
 class SlotView(View):
-    def __init__(self):
+    def __init__(self, user_id):
         super().__init__(timeout=None)
+        self.user_id = user_id
 
     @discord.ui.button(label="Записатись", style=discord.ButtonStyle.success)
     async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("✅ Ви записались!", ephemeral=True)
+        # Можна додати логіку для збереження
 
     @discord.ui.button(label="Відмовитись", style=discord.ButtonStyle.danger)
     async def decline(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Відповідь та видалення повідомлення з іконкою
         try:
             await interaction.message.delete()
             await interaction.response.send_message("❌ Ви відмовились від слота", ephemeral=True)
+            # Тут обов’язково оновлюємо дані або логіку
         except Exception as e:
-            # можливо, повідомлення вже видалено
             await interaction.response.send_message(f"⚠️ Помилка: {e}", ephemeral=True)
 
-# Обробка подій при запуску (ready)
+# Під час запуску (ready) — можливо ініціалізувати або логувати
 @bot.event
 async def on_ready():
     print(f"🔌 Bot ready @ {datetime.datetime.now()}")
@@ -73,12 +79,11 @@ async def on_message(message):
 
     msg = message.content.lower()
 
-    # Тест команда
+    # Команди
     if msg == "!тест":
         await message.channel.send(f"HOOK: {DEPLOY_HOOK_URL}")
         return
 
-    # Оновлення
     if msg == "!оновити":
         if not DEPLOY_HOOK_URL:
             await message.channel.send("❌ Hook не знайдено")
@@ -95,24 +100,32 @@ async def on_message(message):
             await message.channel.send(f"💥 Виняток: {e}")
         return
 
-    # Перезапуск
+    # Реальний перезапуск бота (зовнішній скрипт)
     if msg == "!перезапустити":
-        await message.channel.send("🔁 Перезапуск виконано (умовно)")
-        # Перезапуск у реальному часі - його потрібно робити зовні, або через зовнішні скрипти
-        # Але тут залишається для прикладу тільки повідомлення
+        await message.channel.send("🔁 Перезапуск у процесі...")
+        # Викликаємо команду для зовнішнього перезапуску
+        if RESTART_COMMAND:
+            import subprocess
+            subprocess.Popen(RESTART_COMMAND, shell=True)
+            sys.exit()  # Виключаємо поточний процес
+        else:
+            await message.channel.send("❌ команда для перезапуску не налаштована")
         return
 
-    # Команда для натискання слотів
+    # Запис слотів
     if msg == "!запис":
         embed = discord.Embed(
             title="Слоти 🔄",
             description="Оберіть дію нижче:",
             color=discord.Color.blue()
         )
-        await message.channel.send(embed=embed, view=SlotView())
+        # Створюємо канал слотів
+        channel_id = message.channel.id
+        # Відображаємо слот
+        await message.channel.send(embed=embed, view=SlotView(message.author.id))
         return
 
-    # Мої слоти (звичайний меседж)
+    # Мої слоти (звичайне повідомлення)
     if msg == "моїслоти":
         try:
             await message.delete()
@@ -128,7 +141,7 @@ async def on_message(message):
 
     await bot.process_commands(message)
 
-# Команда /моїслоти (слеш команда)
+# Слеш команда
 @bot.tree.command(name="моїслоти", description="Показати свої слоти приватно")
 async def slash_slots(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -138,7 +151,5 @@ async def slash_slots(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Підтвердження перезапуску або інша логіка тут можлива (якщо потрібно)
-
-# Запуск
+# Запуск бота
 bot.run(TOKEN)
