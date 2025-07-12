@@ -1,115 +1,99 @@
 import os
-import threading
 import datetime
 import subprocess
 import aiohttp
 import discord
 from discord.ext import commands
-from discord.ui import View, Button
-from flask import Flask
+from discord.ui import View, button
 from dotenv import load_dotenv
 
-# .env
+# ENVIRONMENT
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID")
 PORT = int(os.getenv("PORT", "10000"))
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 
-# Flask для Render
-app = Flask("")
-@app.route("/")
-def home():
-    return "Bot is online"
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT)
-threading.Thread(target=run_flask, daemon=True).start()
+# 🔐 Safety check
+if not TOKEN:
+    raise RuntimeError("❌ DISCORD_TOKEN не заданий у .env або Environment")
 
-# Discord bot
+# DISCORD BOT
 intents = discord.Intents.default()
 intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 
-# Коміт хеш
 def get_commit_hash():
     try:
         return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decode().strip()
-    except:
+    except Exception:
         return "unknown"
 
-# Кнопки для слота
+# SLOT VIEW
 class SlotView(View):
-    @discord.ui.button(label="Записатись", style=discord.ButtonStyle.success)
-    async def sign_up(self, interaction, button):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @button(label="Записатись", style=discord.ButtonStyle.success, custom_id="slot_signup")
+    async def sign_up(self, interaction: discord.Interaction, _: discord.ui.Button):
         await interaction.response.send_message("✅ Ви записались!", ephemeral=True)
 
-    @discord.ui.button(label="Відмовитись", style=discord.ButtonStyle.danger)
-    async def decline(self, interaction, button):
+    @button(label="Відмовитись", style=discord.ButtonStyle.danger, custom_id="slot_decline")
+    async def decline(self, interaction: discord.Interaction, _: discord.ui.Button):
         try:
             await interaction.message.delete()
             await interaction.response.send_message("❌ Слот видалено", ephemeral=True)
-        except Exception as e:
-            await interaction.response.send_message(f"⚠️ Помилка: {e}", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("⚠️ Немає прав на видалення", ephemeral=True)
+        except Exception as exc:
+            await interaction.response.send_message(f"⚠️ Помилка: {exc}", ephemeral=True)
 
-# Bot ready
+# EVENTS
 @bot.event
 async def on_ready():
-    print(f"🔌 Bot started @ {datetime.datetime.utcnow().isoformat()}")
+    print(f"✅ Bot started @ {datetime.datetime.utcnow().isoformat()} UTC")
     print(f"• PORT: {PORT}")
-    print(f"• Hook: {DEPLOY_HOOK_URL}")
+    print(f"• Commit: {get_commit_hash()}")
     if LOG_CHANNEL_ID and LOG_CHANNEL_ID.isdigit():
         chan = bot.get_channel(int(LOG_CHANNEL_ID))
         if chan:
-            await chan.send("🛰 Бот активний та готовий")
+            await chan.send("🛰 Бот запущено успішно!")
 
-# Команда: !запис
+# COMMANDS
 @bot.command()
 async def запис(ctx):
-    embed = discord.Embed(
-        title="Слоти 🔄",
-        description="Оберіть дію нижче:",
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title="Слоти 🔄", description="Оберіть дію нижче:", color=discord.Color.blue())
     await ctx.send(embed=embed, view=SlotView())
 
-# Команда: !оновити
 @bot.command()
 async def оновити(ctx):
     if not DEPLOY_HOOK_URL:
-        await ctx.send("❌ Hook не знайдено")
+        await ctx.send("❌ Хук не знайдено")
         return
-    await ctx.send("🔄 Відправляю запит на Render…")
     async with aiohttp.ClientSession() as session:
         async with session.post(DEPLOY_HOOK_URL) as resp:
             await ctx.send(f"🔔 Render: {resp.status}")
 
-# Команда: !перезапустити
 @bot.command()
 async def перезапустити(ctx):
-    await ctx.send("🔁 Перезапуск виконано")
+    await ctx.send("🔁 Перезапуск виконано (умовно)")
 
-# Команда: !моїслоти
 @bot.command()
 async def моїслоти(ctx):
-    embed = discord.Embed(
-        title="Ваші слоти 🎯",
-        description="Приватна версія",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="Ваші слоти 🎯", description="Приватна версія", color=discord.Color.green())
     try:
         await ctx.author.send(embed=embed)
     except:
-        await ctx.send("⚠️ Не вдалося надіслати DM")
+        await ctx.send("⚠️ Не вдалося надіслати у DM")
 
-# Команда: !status
 @bot.command()
 async def status(ctx):
     embed = discord.Embed(title="🧠 Bot Status", color=discord.Color.blue())
     embed.add_field(name="Commit", value=get_commit_hash(), inline=True)
-    embed.add_field(name="Port", value=str(PORT), inline=True)
+    embed.add_field(name="PORT", value=str(PORT), inline=True)
     embed.add_field(name="Hook", value=DEPLOY_HOOK_URL or "None", inline=False)
     embed.add_field(name="Token", value="✅" if TOKEN else "❌", inline=True)
     await ctx.send(embed=embed)
 
-# Запуск
+# RUN
 bot.run(TOKEN)
