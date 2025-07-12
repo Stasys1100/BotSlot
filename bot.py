@@ -16,7 +16,7 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 PORT = int(os.getenv("PORT"))
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 
-# Flask для keep-alive
+# ☁️ Flask для keep-alive
 app = Flask('')
 
 @app.route('/')
@@ -24,16 +24,16 @@ def home():
     return "Bot is online"
 
 def run():
-    app.run(host='0.0.0.0', port=PORT)  # ✅ ключовий фікс: порт з .env
+    app.run(host='0.0.0.0', port=PORT)  # ✅ фіксований спосіб для Render
 
 threading.Thread(target=run).start()
 
-# Налаштування бота
+# 🤖 Discord-бот
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# View-кнопки для слотів
+# 📋 View-кнопки
 class SlotView(View):
     @discord.ui.button(label="Записатись", style=discord.ButtonStyle.success)
     async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -44,7 +44,7 @@ class SlotView(View):
         await interaction.message.delete()
         await interaction.response.send_message("❌ Ви відмовились від слота", ephemeral=True)
 
-# Стартова подія
+# 🚀 Запуск
 @bot.event
 async def on_ready():
     print(f"🔌 Bot ready @ {datetime.datetime.now()}")
@@ -56,12 +56,11 @@ async def on_ready():
     except Exception as e:
         print(f"❌ Помилка запуску: {e}")
 
-# Автообробка повідомлень
+# 📨 Повідомлення
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
         return
-
     if message.content.lower() == "моїслоти":
         try:
             await message.delete()
@@ -69,14 +68,13 @@ async def on_message(message):
             pass
         embed = discord.Embed(
             title="Ваші слоти 🎯",
-            description="Це текстова версія слотів",
+            description="Текстова версія слотів",
             color=discord.Color.green()
         )
         await message.channel.send(embed=embed, delete_after=30)
-
     await bot.process_commands(message)
 
-# Slаsh-команда /моїслоти
+# ⚙️ Слеш-команда /моїслоти
 @bot.tree.command(name="моїслоти", description="Показати свої слоти приватно")
 async def slash_slots(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -86,7 +84,27 @@ async def slash_slots(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Команди з префіксом '!'
+# 🧪 Команди з префіксом '!'
+@bot.command()
+async def тест(ctx):
+    await ctx.send(f"HOOK: {DEPLOY_HOOK_URL}")
+
+@bot.command()
+async def оновити(ctx):
+    if not DEPLOY_HOOK_URL:
+        await ctx.send("❌ Hook не знайдено")
+        return
+    await ctx.send("🔄 Відправляю запит на Render…")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(DEPLOY_HOOK_URL) as resp:
+                if resp.status == 200:
+                    await ctx.send("✅ Оновлення запущено!")
+                else:
+                    await ctx.send(f"❌ Помилка: {resp.status}")
+    except Exception as e:
+        await ctx.send(f"💥 Виняток: {e}")
+
 @bot.command()
 async def перезапуск(ctx):
     await ctx.send("🔁 Бот перезапущено (умовно)")
@@ -105,26 +123,5 @@ async def запис(ctx):
     )
     await ctx.send(embed=embed, view=SlotView())
 
-@bot.command()
-async def тест(ctx):
-    await ctx.send(f"HOOK: {DEPLOY_HOOK_URL}")
-
-@bot.command()
-async def оновити(ctx):
-    if not DEPLOY_HOOK_URL:
-        await ctx.send("❌ Hook не знайдено")
-        return
-
-    await ctx.send("🔄 Відправляю запит на Render…")
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(DEPLOY_HOOK_URL) as resp:
-                if resp.status == 200:
-                    await ctx.send("✅ Оновлення запущено!")
-                else:
-                    await ctx.send(f"❌ Помилка: {resp.status}")
-    except Exception as e:
-        await ctx.send(f"💥 Виняток: {e}")
-
-# Запуск
-bot.run(TOKEN)
+# ▶️ Запуск бота
+bot.run(TOKEN) 
