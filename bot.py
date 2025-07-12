@@ -85,10 +85,13 @@ async def on_message(message):
 
     content = message.content.strip().lower()
     if "запис слоти" in content:
-        ctx = await bot.get_context(message)
-        global slot_users
-        slot_users = [None] * len(slot_lines)
-        await ctx.send(content=format_slots(), view=SlotView())
+        try:
+            ctx = await bot.get_context(message)
+            global slot_users
+            slot_users = [None] * len(slot_lines)
+            await ctx.send(content=format_slots(), view=SlotView())
+        except Exception as e:
+            print(f"[ERROR] on_message: {e}")
 
     await bot.process_commands(message)
 
@@ -120,7 +123,7 @@ async def оновити(ctx):
 @bot.command()
 async def gitpush(ctx):
     embed = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    embed.add_field(name="1. Перейти в папку", value="`cd C:\\Users\\stasd\\Downloads\\botslot`", inline=False)
+    embed.add_field(name="1. Перейти в папку", value="`cd C:\Users\stasd\Downloads\botslot`", inline=False)
     embed.add_field(name="2. Додати файли", value="`git add .`", inline=False)
     embed.add_field(name="3. Коміт", value='`git commit -m "Оновлення слота"`', inline=False)
     embed.add_field(name="4. Push", value="`git push origin main`", inline=False)
