@@ -46,6 +46,7 @@ class SlotButton(Button):
 
     async def callback(self, interaction: discord.Interaction):
         user = interaction.user
+        print(f"[callback] Користувач: {user.name}, Слот: {self.index + 1}")
         if slot_users[self.index] is None:
             slot_users[self.index] = user
             await interaction.response.send_message(f"✅ Ви записались у слот {self.index + 1}", ephemeral=True)
@@ -55,7 +56,6 @@ class SlotButton(Button):
         else:
             await interaction.response.send_message("⚠️ Слот зайнятий іншим", ephemeral=True)
             return
-
         await interaction.message.edit(content=format_slots(), view=SlotView())
 
 def format_slots():
@@ -67,7 +67,7 @@ def format_slots():
 
 @bot.event
 async def on_ready():
-    print(f"✅ Bot started @ {datetime.datetime.now(datetime.UTC).isoformat()} UTC")
+    print("[on_ready] Бот запущено — перевірка каналів…")
     for guild in bot.guilds:
         for channel in guild.text_channels:
             if channel.permissions_for(guild.me).send_messages:
@@ -75,24 +75,22 @@ async def on_ready():
                     commit = subprocess.getoutput("git rev-parse --short HEAD")
                     await channel.send(f"🔄 Бот перезапущено\n📦 Commit: `{commit}`")
                     break
-                except:
-                    pass
+                except Exception as e:
+                    print(f"[on_ready] Помилка: {e}")
 
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
-
-    content = message.content.strip().lower()
-    if "запис слоти" in content:
+    print(f"[on_message] Отримано: {message.content}")
+    if "запис слоти" in message.content.lower():
         try:
-            ctx = await bot.get_context(message)
             global slot_users
             slot_users = [None] * len(slot_lines)
+            ctx = await bot.get_context(message)
             await ctx.send(content=format_slots(), view=SlotView())
         except Exception as e:
-            print(f"[ERROR] on_message: {e}")
-
+            print(f"[on_message] Помилка: {e}")
     await bot.process_commands(message)
 
 @bot.command()
