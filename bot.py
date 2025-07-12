@@ -127,4 +127,4 @@ async def оновити(ctx):
         await ctx.send(f"💥 Виняток: {e}")
 
 # Запуск бота
-bot.run(TOKEN)
+bot.run(TOKEN) 
