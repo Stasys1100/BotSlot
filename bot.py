@@ -124,4 +124,4 @@ async def запис(ctx):
     await ctx.send(embed=embed, view=SlotView())
 
 # ▶️ Запуск бота
-bot.run(TOKEN) 
+bot.run(TOKEN)  
