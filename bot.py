@@ -82,11 +82,14 @@ async def on_ready():
 async def on_message(message):
     if message.author.bot:
         return
-    if message.content.strip().lower() == "запис слоти":
+
+    content = message.content.strip().lower()
+    if "запис слоти" in content:
         ctx = await bot.get_context(message)
         global slot_users
         slot_users = [None] * len(slot_lines)
         await ctx.send(content=format_slots(), view=SlotView())
+
     await bot.process_commands(message)
 
 @bot.command()
