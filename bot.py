@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 import datetime
 import aiohttp
 
-# Завантаження змінних з .env
+# Завантаження змінних із .env
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
@@ -24,16 +24,16 @@ def home():
     return "Bot is online"
 
 def run():
-    app.run(host='0.0.0.0', port=PORT)
+    app.run(host='0.0.0.0', port=PORT)  # ✅ ключовий фікс: порт з .env
 
 threading.Thread(target=run).start()
 
-# Налаштування бота з префіксом '!'
+# Налаштування бота
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Кнопки для слотів
+# View-кнопки для слотів
 class SlotView(View):
     @discord.ui.button(label="Записатись", style=discord.ButtonStyle.success)
     async def sign_up(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -44,19 +44,19 @@ class SlotView(View):
         await interaction.message.delete()
         await interaction.response.send_message("❌ Ви відмовились від слота", ephemeral=True)
 
-# Запуск і синхронізація слеш-команд
+# Стартова подія
 @bot.event
 async def on_ready():
     print(f"🔌 Bot ready @ {datetime.datetime.now()}")
     try:
-        synced = await bot.tree.sync()  # 🔧 обовʼязково для слеш-команд
+        synced = await bot.tree.sync()
         print(f"📘 Synced {len(synced)} command(s)")
         channel = bot.get_channel(LOG_CHANNEL_ID)
         await channel.send(f"🚀 Бот стартував @ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     except Exception as e:
         print(f"❌ Помилка запуску: {e}")
 
-# Автоочищення для команди "моїслоти"
+# Автообробка повідомлень
 @bot.event
 async def on_message(message):
     if message.author == bot.user:
@@ -69,14 +69,14 @@ async def on_message(message):
             pass
         embed = discord.Embed(
             title="Ваші слоти 🎯",
-            description="Це текстова версія слотів з таймером",
+            description="Це текстова версія слотів",
             color=discord.Color.green()
         )
         await message.channel.send(embed=embed, delete_after=30)
 
     await bot.process_commands(message)
 
-# Слеш-команда /моїслоти
+# Slаsh-команда /моїслоти
 @bot.tree.command(name="моїслоти", description="Показати свої слоти приватно")
 async def slash_slots(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -86,7 +86,7 @@ async def slash_slots(interaction: discord.Interaction):
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
-# Текстові команди
+# Команди з префіксом '!'
 @bot.command()
 async def перезапуск(ctx):
     await ctx.send("🔁 Бот перезапущено (умовно)")
@@ -112,7 +112,7 @@ async def тест(ctx):
 @bot.command()
 async def оновити(ctx):
     if not DEPLOY_HOOK_URL:
-        await ctx.send("❌ DEPLOY_HOOK_URL не знайдено")
+        await ctx.send("❌ Hook не знайдено")
         return
 
     await ctx.send("🔄 Відправляю запит на Render…")
@@ -126,5 +126,5 @@ async def оновити(ctx):
     except Exception as e:
         await ctx.send(f"💥 Виняток: {e}")
 
-# Запуск бота
-bot.run(TOKEN) 
+# Запуск
+bot.run(TOKEN)
