@@ -123,7 +123,7 @@ async def оновити(ctx):
 @bot.command()
 async def gitpush(ctx):
     embed = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    embed.add_field(name="1. Перейти в папку", value="`cd C:\Users\stasd\Downloads\botslot`", inline=False)
+    embed.add_field(name="1. Перейти в папку", value="`cd C:\\Users\\stasd\\Downloads\\botslot`", inline=False)
     embed.add_field(name="2. Додати файли", value="`git add .`", inline=False)
     embed.add_field(name="3. Коміт", value='`git commit -m "Оновлення слота"`', inline=False)
     embed.add_field(name="4. Push", value="`git push origin main`", inline=False)
