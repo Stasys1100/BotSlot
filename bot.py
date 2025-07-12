@@ -21,17 +21,21 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─── 3. Регекс для слотів, для згадок і контейнер сесій ────────────────────────
+# ─── 3. Регекс та контейнер для сесій ──────────────────────────────────────────
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
-# sessions: message_id → { "title": str, "lines": [str], "owners": [Member|None] }
+# sessions: message_id → {
+#   "title": str,
+#   "lines": List[str],      # очищені рядки без тегів
+#   "owners": List[Member|None]
+# }
 sessions: dict[int, dict] = {}
 
 
 def build_embed(session: dict) -> discord.Embed:
-    """Створює Embed для конкретної сесії слотування."""
+    """Побудова Embed для сесії слотів."""
     e = discord.Embed(title=session["title"], color=discord.Color.blue())
     desc_lines = []
     for line, owner in zip(session["lines"], session["owners"]):
@@ -44,7 +48,7 @@ def build_embed(session: dict) -> discord.Embed:
 
 
 class SlotButton(Button):
-    """Кнопка Зайняти/Відмовитись із прив’язкою до конкретного message_id."""
+    """Кнопка “Зайняти/Відмовитись” для конкретного слоту сесії."""
     def __init__(self, session_id: int, idx: int, row: int):
         self.session_id = session_id
         self.idx = idx
@@ -66,25 +70,25 @@ class SlotButton(Button):
         session = sessions[self.session_id]
         owner = session["owners"][self.idx]
 
-        # Вільний слот → зайняти (якщо ще не маєте слота в цій сесії)
+        # Якщо вільно → зайняти (якщо ще не маєте слоту)
         if owner is None:
             if any(u == user for u in session["owners"] if u):
                 return await interaction.response.send_message(
-                    "⚠️ Ви вже маєте слот в цьому відділенні.", ephemeral=True
+                    "⚠️ Ви вже маєте слот у цьому відділенні.", ephemeral=True
                 )
             session["owners"][self.idx] = user
 
-        # Ваш слот → звільнити
+        # Якщо це ваш слот → звільнити
         elif owner == user:
             session["owners"][self.idx] = None
 
-        # Чужий слот → блок
+        # Якщо чужий → блок
         else:
             return await interaction.response.send_message(
                 f"⚠️ Цей слот закріплено за {owner.mention}.", ephemeral=True
             )
 
-        # Редагуємо тільки це повідомлення
+        # Оновлюємо тільки це повідомлення
         await interaction.response.edit_message(
             embed=build_embed(session),
             view=SlotView(self.session_id)
@@ -92,7 +96,7 @@ class SlotButton(Button):
 
 
 class SlotView(View):
-    """View із кнопками для певного session_id."""
+    """View із кнопками для всіх слотів конкретної сесії."""
     def __init__(self, session_id: int):
         super().__init__(timeout=None)
         count = len(sessions[session_id]["lines"])
@@ -112,8 +116,8 @@ async def on_ready():
     )
     for guild in bot.guilds:
         ch = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel) and
-                      c.permissions_for(guild.me).send_messages,
+            lambda c: isinstance(c, discord.TextChannel)
+                      and c.permissions_for(guild.me).send_messages,
             guild.text_channels
         )
         if ch:
@@ -129,7 +133,7 @@ async def on_message(message: discord.Message):
         return
 
     lines = message.content.splitlines()
-    # Триґер: “запис слоти” у будь-якому рядку
+    # Тригер: “запис слоти” у будь-якому рядку
     if any("запис слоти" in L.lower() for L in lines):
         header = None
         slots: list[str] = []
@@ -142,21 +146,27 @@ async def on_message(message: discord.Message):
 
             m = TRIGGER_RE.match(txt)
             if m:
-                # це слот-рядок
-                slots.append(txt)
-
-                # шукаємо справжню згадку в <@...>
+                # знайшли слот-рядок
+                # Визначаємо owner за справжньою mention <@…>
                 owner: discord.Member | None = None
                 for mention in message.mentions:
-                    if f"<@{mention.id}>" in txt or f"<@!{mention.id}>" in txt:
+                    token = f"<@{mention.id}>"
+                    alt    = f"<@!{mention.id}>"
+                    if token in txt or alt in txt:
                         owner = mention
                         break
+
+                # Очищаємо рядок від mention-тегів
+                clean_txt = MENTION_RE.sub("", txt).strip()
+                slots.append(clean_txt)
                 owners.append(owner)
+
             elif header is None:
+                # перший “ненумерований” рядок — заголовок
                 header = txt
 
-        # UI ліміт
-        slots = slots[:25]
+        # UI-ліміт: максимум 25 слотів
+        slots  = slots[:25]
         owners = owners[: len(slots)]
 
         session = {
@@ -165,10 +175,10 @@ async def on_message(message: discord.Message):
             "owners": owners
         }
 
+        # Відправляємо Embed+View, реєструємо сесію
         embed = build_embed(session)
-        sent = await message.channel.send(embed=embed)
+        sent  = await message.channel.send(embed=embed)
         sessions[sent.id] = session
-        # Після реєстрації session додаємо View
         await sent.edit(view=SlotView(sent.id))
 
     await bot.process_commands(message)
@@ -187,15 +197,16 @@ async def моїслоти(ctx: commands.Context):
         ]
         if taken:
             out.append(f"**{sess['title']}**\n" + "\n".join(taken))
+
     await ctx.send("\n\n".join(out) if out else "🕸 Ви не записані в жоден слот")
 
 
 @bot.command()
 async def debug(ctx: commands.Context):
-    guilds = ", ".join(g.name for g in bot.guilds)
+    gnames = ", ".join(g.name for g in bot.guilds)
     await ctx.send(
         f"🔍 intent.message_content = `{bot.intents.message_content}`\n"
-        f"🗂 Guilds: {guilds}\n"
+        f"🗂 Guilds: {gnames}\n"
         f"🔑 Active sessions: {len(sessions)}"
     )
 
