@@ -21,14 +21,14 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─── 3. Регулярний вираз для парсингу слотів і глобальні змінні ────────────────
+# ─── 3. Регекс для парсингу слотів і змінні ────────────────────────────────────
 slot_pattern  = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
-slot_lines    = []                              # List[str] із текстом кожного слота
-slot_users    = []                              # List[User|None] відповідний заповнювач
+slot_lines    = []   # ["1. Slot A", "2: Slot B", ...]
+slot_users    = []   # [User|None, ...]
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
-embed_title   = DEFAULT_TITLE                   # Заголовок ембеда, змінюється динамічно
+embed_title   = DEFAULT_TITLE
 
-# ─── 4. Функція для побудови одного Embed без порожніх ліній ────────────────────
+# ─── 4. Функція для побудови чистого Embed без порожніх рядків ────────────────
 def make_embed() -> discord.Embed:
     e = discord.Embed(title=embed_title, color=discord.Color.blue())
     lines = []
@@ -41,7 +41,7 @@ def make_embed() -> discord.Embed:
     e.description = "\n".join(lines)
     return e
 
-# ─── 5. View + Button для слотів (по 5 кнопок у рядку, 1 слот на користувача) ──
+# ─── 5. View і Button (по 5 кнопок у рядку, 1 слот на користувача) ───────────
 class SlotView(View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -60,35 +60,36 @@ class SlotButton(Button):
 
     async def callback(self, interaction: discord.Interaction):
         user = interaction.user
-        occupied = [i for i, u in enumerate(slot_users) if u == user]
+        current_owner = slot_users[self.index]
 
-        # Спроба зайняти слот
-        if slot_users[self.index] is None:
-            if occupied:
-                no = occupied[0] + 1
+        # якщо слот вільний – пробуємо зайняти
+        if current_owner is None:
+            # перевірка: у користувача ще немає свого слота
+            if any(u == user for u in slot_users):
+                # вже має слот → блок
                 return await interaction.response.send_message(
-                    f"⚠️ Ви вже в слоті {no}. Спершу звільніть його.",
+                    "⚠️ Ви вже зайняли інший слот. Спершу звільніть його.",
                     ephemeral=True
                 )
             slot_users[self.index] = user
 
-        # Спроба звільнити власний слот
-        elif slot_users[self.index] == user:
+        # якщо власник – звільняємо
+        elif current_owner == user:
             slot_users[self.index] = None
 
-        # Слот зайнятий іншим
+        # якщо хтось інший – не даємо відмовитися
         else:
             return await interaction.response.send_message(
-                "⚠️ Цей слот уже зайнятий", ephemeral=True
+                "⚠️ Ви не можете звільнити чужий слот.", ephemeral=True
             )
 
-        # Редагуємо **єдине** повідомлення
+        # редагуємо одне повідомлення без додаткових нотіфікацій
         await interaction.response.edit_message(embed=make_embed(), view=SlotView())
 
-# ─── 6. Подія on_ready: повідомлення про перезапуск у всіх доступних каналах ─────
+# ─── 6. on_ready: розсилаємо повідомлення про перезапуск у всі гільдії ─────────
 @bot.event
 async def on_ready():
-    print(f"[on_ready] Bot started @ {datetime.datetime.utcnow().isoformat()} UTC")
+    print(f"[on_ready] Бот запущено @ {datetime.datetime.utcnow().isoformat()} UTC")
     print(f"[on_ready] message_content intent = {bot.intents.message_content}")
     commit = subprocess.getoutput("git rev-parse --short HEAD")
     restart_embed = discord.Embed(
@@ -98,63 +99,58 @@ async def on_ready():
     )
     for guild in bot.guilds:
         channel = discord.utils.find(
-            lambda c: (
-                isinstance(c, discord.TextChannel)
-                and c.permissions_for(guild.me).send_messages
-            ),
+            lambda c: isinstance(c, discord.TextChannel)
+                      and c.permissions_for(guild.me).send_messages,
             guild.text_channels
         )
         if channel:
             try:
                 await channel.send(embed=restart_embed)
             except Exception as e:
-                print(f"[on_ready] Failed to send to {guild.name}/{channel.name}: {e}")
+                print(f"[on_ready] Cannot send to {guild.name}/{channel.name}: {e}")
 
-# ─── 7. Подія on_message: ловимо «запис слоти» і парсимо ваше повідомлення ─────
+# ─── 7. on_message: ловимо “запис слоти”, парсимо заголовок і слоти ────────────
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
-    content_lines = message.content.splitlines()
-    if any("запис слоти" in l.lower() for l in content_lines):
+    lines = message.content.splitlines()
+    if any("запис слоти" in l.lower() for l in lines):
         global slot_lines, slot_users, embed_title
 
         parsed = []
         header = None
 
-        for raw in content_lines:
+        for raw in lines:
             text = raw.strip()
             if not text:
                 continue
-            # Пропускаємо тригер та everyone
+            # пропускаємо тригер та @everyone
             if "запис слоти" in text.lower() or "everyone" in text.lower():
                 continue
             m = slot_pattern.match(text)
             if m:
-                # Забираємо оригінальний рядок з номером та описом
                 parsed.append(text)
             elif header is None:
-                # Перша нерольова лінія стає заголовком
                 header = text
 
         slot_lines = parsed[:25]
         slot_users = [None] * len(slot_lines)
         embed_title = header or DEFAULT_TITLE
 
-        # Відправляємо одне повідомлення з Embed + View
+        # надсилаємо єдине повідомлення Embed+View
         await message.channel.send(embed=make_embed(), view=SlotView())
 
     await bot.process_commands(message)
 
-# ─── 8. Ваші команди ────────────────────────────────────────────────────────────
+# ─── 8. Команди користувача ───────────────────────────────────────────────────
 @bot.command()
 async def моїслоти(ctx: commands.Context):
     """Показує, у якому слоті ви зараз записані."""
     taken = [slot_lines[i] for i, u in enumerate(slot_users) if u == ctx.author]
     if taken:
-        text = "\n".join(taken)
-        await ctx.send(f"🎯 Ви записані у:\n{text}")
+        await ctx.send("🎯 Ви записані у:\n" + "\n".join(taken))
     else:
         await ctx.send("🕸 Ви не записані у жоден слот")
 
@@ -163,14 +159,14 @@ async def debug(ctx: commands.Context):
     """Діагностика: intent, сервери, кількість слотів."""
     guilds = ", ".join(g.name for g in bot.guilds)
     await ctx.send(
-        f"🔍 intent.message_content = `{bot.intents.message_content}`\n"
+        f"🔍 intent = `{bot.intents.message_content}`\n"
         f"🗂 Servers: {guilds}\n"
         f"ℹ️ Slots parsed: {len(slot_lines)}"
     )
 
 @bot.command()
 async def статус(ctx: commands.Context):
-    """Показує поточний commit, стан токена та webhook."""
+    """Показує commit, стан токена та webhook."""
     commit = subprocess.getoutput("git rev-parse --short HEAD")
     emb = discord.Embed(title="🧠 Bot Status", color=discord.Color.blue())
     emb.add_field(name="Commit", value=commit, inline=True)
@@ -180,7 +176,7 @@ async def статус(ctx: commands.Context):
 
 @bot.command()
 async def оновити(ctx: commands.Context):
-    """Тригер нового деплою через Render webhook."""
+    """Trigger нового деплою через Render webhook."""
     if not DEPLOY_HOOK_URL:
         return await ctx.send("❌ DEPLOY_HOOK_URL не задано")
     async with aiohttp.ClientSession() as sess:
@@ -198,5 +194,5 @@ async def gitpush(ctx: commands.Context):
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── 9. Запуск бота ─────────────────────────────────────────────────────────────
+# ─── 9. Старт бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
