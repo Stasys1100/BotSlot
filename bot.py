@@ -126,4 +126,4 @@ async def slash_slots(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # Старт бота
-bot.run(TOKEN)
+bot.run(TOKEN) 
