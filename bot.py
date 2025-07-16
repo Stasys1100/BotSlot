@@ -17,25 +17,24 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 
-# ─── 2. Інтенти та створення бота ───────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─── 3. Регулярки і контейнери сесій ───────────────────────────────────────────
+# ─── 2. Регулярки та сесії ──────────────────────────────────────────────────────
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 sessions: dict[int, dict] = {}  # message_id → { title, lines, owners }
+threads: dict[int, list[int]] = {}  # thread_id → list of message_ids
 
-# ─── 4. Нагадування щоп’ятниці і щонеділі о 19:30 ─────────────────────────────
+# ─── 3. Нагадування VTG ─────────────────────────────────────────────────────────
 REMINDER_CHANNEL_ID = 1160843618433630228
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
-    # п’ятниця=4 або неділя=6, час 19:30
     if now.weekday() in (4, 6) and now.hour == 19 and now.minute == 30:
         channel = bot.get_channel(REMINDER_CHANNEL_ID)
         if channel:
@@ -44,7 +43,7 @@ async def vtg_reminder():
             except Exception as e:
                 print(f"[vtg_reminder] Помилка надсилання: {e}")
 
-# ─── 5. Функція для Embed ──────────────────────────────────────────────────────
+# ─── 4. Embed ───────────────────────────────────────────────────────────────────
 def build_embed(session: dict) -> discord.Embed:
     e = discord.Embed(title=session["title"], color=discord.Color.blue())
     lines = []
@@ -56,7 +55,7 @@ def build_embed(session: dict) -> discord.Embed:
     e.description = "\n".join(lines)
     return e
 
-# ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
+# ─── 5. Buttons ─────────────────────────────────────────────────────────────────
 class SlotButton(Button):
     def __init__(self, session_id: int, idx: int, row: int):
         self.session_id = session_id
@@ -66,34 +65,32 @@ class SlotButton(Button):
         style = discord.ButtonStyle.success if owner is None else discord.ButtonStyle.danger
         super().__init__(label=label, style=style, custom_id=f"slot-{session_id}-{idx}", row=row)
 
-    async def callback(self, interaction: discord.Interaction):
-        user = interaction.user
+    async def callback(self, inter: discord.Interaction):
+        user = inter.user
         sess = sessions[self.session_id]
         owner = sess["owners"][self.idx]
+        thread_id = inter.message.channel.id
+        thread_sessions = threads.get(thread_id, [])
 
-        # зайняти вільний слот, якщо у користувача ще немає слота
+        # Перевіряємо всі слоти в цій гілці
+        for mid in thread_sessions:
+            other = sessions[mid]
+            if any(u == user for u in other["owners"] if u):
+                if mid != self.session_id or other["owners"][self.idx] != user:
+                    return await inter.response.send_message(
+                        "⚠️ Ви вже маєте слот у цьому відділенні (гілці).", ephemeral=True
+                    )
+
         if owner is None:
-            if any(u == user for u in sess["owners"] if u):
-                return await interaction.response.send_message(
-                    "⚠️ Ви вже маєте слот у цьому відділенні.", ephemeral=True
-                )
             sess["owners"][self.idx] = user
-
-        # звільнити власний слот
         elif owner == user:
             sess["owners"][self.idx] = None
-
-        # чужий слот — блок
         else:
-            return await interaction.response.send_message(
+            return await inter.response.send_message(
                 f"⚠️ Цей слот закріплено за {owner.mention}.", ephemeral=True
             )
 
-        # оновити лише це повідомлення
-        await interaction.response.edit_message(
-            embed=build_embed(sess),
-            view=SlotView(self.session_id)
-        )
+        await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.session_id))
 
 class SlotView(View):
     def __init__(self, session_id: int):
@@ -103,55 +100,35 @@ class SlotView(View):
             row = idx // 5
             self.add_item(SlotButton(session_id, idx, row))
 
-# ─── 7. on_ready: старт таску + повідомлення про рестарт ────────────────────────
+# ─── 6. Events ──────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"[on_ready] Bot logged in as {bot.user} @ {datetime.datetime.utcnow().isoformat()} UTC")
+    print(f"[on_ready] Bot: {bot.user}")
     commit = subprocess.getoutput("git rev-parse --short HEAD")
-    restart = discord.Embed(
-        title="🔄 Бот перезапущено",
-        description=f"📦 Commit: `{commit}`",
-        color=discord.Color.green()
-    )
-    for guild in bot.guilds:
-        ch = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel) and c.permissions_for(guild.me).send_messages,
-            guild.text_channels
-        )
+    restart = discord.Embed(title="🔄 Бот перезапущено", description=f"📦 Commit: `{commit}`", color=discord.Color.green())
+    for g in bot.guilds:
+        ch = discord.utils.find(lambda c: isinstance(c, discord.TextChannel) and c.permissions_for(g.me).send_messages, g.text_channels)
         if ch:
-            try:
-                await ch.send(embed=restart)
-            except:
-                pass
+            try: await ch.send(embed=restart)
+            except: pass
     vtg_reminder.start()
 
-# ─── 8. on_message: парсинг “запис слоти” ─────────────────────────────────────
 @bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-
-    lines = message.content.splitlines()
+async def on_message(msg: discord.Message):
+    if msg.author.bot: return
+    lines = msg.content.splitlines()
     if any("запис слоти" in l.lower() for l in lines):
-        header = None
-        slots: list[str] = []
-        owners: list[discord.Member | None] = []
-
+        header, slots, owners = None, [], []
         for raw in lines:
             txt = raw.strip()
-            if not txt or "запис слоти" in txt.lower() or "everyone" in txt.lower():
-                continue
+            if not txt or "запис слоти" in txt.lower() or "everyone" in txt.lower(): continue
             m = TRIGGER_RE.match(txt)
             if m:
-                # знайти згадку <@...> у тексті
                 owner = None
-                for mention in message.mentions:
-                    token = f"<@{mention.id}>"
-                    alt = f"<@!{mention.id}>"
-                    if token in txt or alt in txt:
+                for mention in msg.mentions:
+                    if f"<@{mention.id}>" in txt or f"<@!{mention.id}>" in txt:
                         owner = mention
                         break
-                # очистити текст слота від тегів
                 clean = MENTION_RE.sub("", txt).strip()
                 slots.append(clean)
                 owners.append(owner)
@@ -160,43 +137,23 @@ async def on_message(message: discord.Message):
 
         slots = slots[:25]
         owners = owners[:len(slots)]
-
-        session = {"title": header or DEFAULT_TITLE, "lines": slots, "owners": owners}
+        session = { "title": header or DEFAULT_TITLE, "lines": slots, "owners": owners }
         embed = build_embed(session)
-        sent = await message.channel.send(embed=embed)
+        sent = await msg.channel.send(embed=embed)
         sessions[sent.id] = session
+
+        thread_id = msg.channel.id
+        if thread_id not in threads:
+            threads[thread_id] = []
+        threads[thread_id].append(sent.id)
+
         await sent.edit(view=SlotView(sent.id))
 
-    await bot.process_commands(message)
+    await bot.process_commands(msg)
 
-# ─── 9. Команди користувача ──────────────────────────────────────────────────
+# ─── 7. Service Commands ───────────────────────────────────────────────────────
 @bot.command()
-async def моїслоти(ctx: commands.Context):
-    """Показує слоти, у яких ви записані (усі відділення)."""
-    out = []
-    for sid, sess in sessions.items():
-        taken = [
-            sess["lines"][i]
-            for i, u in enumerate(sess["owners"])
-            if u == ctx.author
-        ]
-        if taken:
-            out.append(f"**{sess['title']}**\n" + "\n".join(taken))
-    await ctx.send("\n\n".join(out) if out else "🕸 Ви не записані в жоден слот")
-
-@bot.command()
-async def debug(ctx: commands.Context):
-    """Діагностика: intent, сервери, кількість сесій."""
-    guilds = ", ".join(g.name for g in bot.guilds)
-    await ctx.send(
-        f"🔍 intent.message_content = `{bot.intents.message_content}`\n"
-        f"🗂 Guilds: {guilds}\n"
-        f"🔑 Active sessions: {len(sessions)}"
-    )
-
-@bot.command()
-async def статус(ctx: commands.Context):
-    """Показує commit, стан токена та webhook."""
+async def статус(ctx):
     commit = subprocess.getoutput("git rev-parse --short HEAD")
     emb = discord.Embed(title="🧠 Bot Status", color=discord.Color.blue())
     emb.add_field(name="Commit", value=commit, inline=True)
@@ -205,8 +162,7 @@ async def статус(ctx: commands.Context):
     await ctx.send(embed=emb)
 
 @bot.command()
-async def оновити(ctx: commands.Context):
-    """Trigger нового деплою через Render webhook."""
+async def оновити(ctx):
     if not DEPLOY_HOOK_URL:
         return await ctx.send("❌ DEPLOY_HOOK_URL не задано")
     async with aiohttp.ClientSession() as sess:
@@ -214,23 +170,14 @@ async def оновити(ctx: commands.Context):
     await ctx.send("🔄 Render-деплой тригерено!")
 
 @bot.command()
-async def gitpush(ctx: commands.Context):
-    """Покрокова інструкція: git add → commit → push → !оновити."""
+async def gitpush(ctx):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    emb.add_field(
-        name="1. cd до папки",
-        value="`cd C:\\Users\\stasd\\Downloads\\botslot`",
-        inline=False
-    )
+    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stasd\\Downloads\\botslot`", inline=False)
     emb.add_field(name="2. git add", value="`git add .`", inline=False)
-    emb.add_field(
-        name="3. git commit",
-        value='`git commit -m "Оновлення слота"`',
-        inline=False
-    )
+    emb.add_field(name="3. git commit", value='`git commit -m "Оновлення слота"`', inline=False)
     emb.add_field(name="4. git push", value="`git push origin main`", inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── 10. Старт бота ─────────────────────────────────────────────────────────────
+# ─── 8. Run ─────────────────────────────────────────────────────────────────────
 bot.run(TOKEN)
