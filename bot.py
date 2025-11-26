@@ -575,16 +575,6 @@ async def _статус(ctx: commands.Context):
     commit = subprocess.getoutput("git rev-parse --short HEAD")
     await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
 
-@bot.command(name="gitpush")
-async def _gitpush(ctx: commands.Context):
-    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
-    emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
-    emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
-    emb.set_footer(text="Після push → !оновити")
-    await ctx.send(embed=emb)
-
 # ─── Run ─────────────────────────────────────────────────────────────────────
 if not TOKEN:
     print("DISCORD_TOKEN not set in environment")
