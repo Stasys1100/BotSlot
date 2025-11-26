@@ -81,11 +81,65 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
         embed.description = "— слотів не знайдено —"
     return embed
 
-# ─── 5.2 Парсер mission.sqm ───────────────────────────────────────────────────
+# ─── 5.2 RAP → текст (декодер фрагментів) ───────────────────────────────────────
+def rap_to_text(data: bytes) -> str:
+    """
+    Heuristic RAP decoder:
+    - Перевіряє заголовок 'raP' і витягує читабельні ASCII/UTF-8 фрагменти.
+    - Розбиває на "рядки" за ; та дужками, нормалізує пропуски.
+    - Збирає фрагменти з ключовими словами (class, name=, description=, unitName, groupName).
+    Повертає псевдо-текст mission.sqm, достатній для парсингу регулярками.
+    """
+    # 1) Базове латин-1 декодування, щоб зберегти байти як символи
+    text = data.decode("latin-1", errors="ignore")
+
+    # 2) Витягнути всі читабельні символи (ASCII + базова латиниця + кирилиця)
+    def is_readable(ch: str) -> bool:
+        o = ord(ch)
+        return (32 <= o <= 126) or (0x00A0 <= o <= 0x04FF)  # латиниця/кирилиця
+
+    filtered = "".join(ch if is_readable(ch) else " " for ch in text)
+
+    # 3) Залишити лише блоки навколо ключових слів
+    keywords = ["class Group", "class Unit", "name", "groupName", "description", "unitName", "text", "title", "{", "}", ";"]
+    indices = []
+    for kw in keywords:
+        start = 0
+        while True:
+            idx = filtered.find(kw, start)
+            if idx == -1:
+                break
+            indices.append(idx)
+            start = idx + len(kw)
+
+    if not indices:
+        # Якщо ключів немає — повертаємо фільтрований текст як є
+        candidate = filtered
+    else:
+        # Збираємо великі вікна навколо знайдених ключів
+        window = 3000
+        frags = []
+        for idx in sorted(set(indices)):
+            s = max(0, idx - 250)
+            e = min(len(filtered), idx + window)
+            frags.append(filtered[s:e])
+        candidate = "\n".join(frags)
+
+    # 4) Нормалізуємо пробіли, вставляємо переноси рядків після '};' та ';'
+    candidate = re.sub(r'[ \t]+', ' ', candidate)
+    candidate = candidate.replace("};", "};\n").replace(" {", " {\n").replace("; ", ";\n")
+    # 5) Спрощення: розбити блоки 'class X' у нові рядки
+    candidate = re.sub(r'\bclass\s+Group\b', '\nclass Group', candidate, flags=re.IGNORECASE)
+    candidate = re.sub(r'\bclass\s+Unit\b', '\nclass Unit', candidate, flags=re.IGNORECASE)
+
+    return candidate
+
+# ─── 5.3 Парсер mission.sqm ───────────────────────────────────────────────────
 def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     """
     Повертає [(group_name, [slot1, slot2, ...]), ...]
     Підтримує: name, groupName, description, title для груп; description, unitName, text для юнітів.
+    Працює як з нормальним текстом, так і з RAP-декодованими фрагментами.
     """
     groups: List[Tuple[str, List[str]]] = []
     current_group_name: Optional[str] = None
@@ -154,19 +208,18 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
         cleaned.append((name, slots))
     return cleaned
 
-# ─── 5.3 Допоміжні функції для читання вкладення ────────────────────────────────
-def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
+# ─── 5.4 Витяг з PBO та читання вкладень ───────────────────────────────────────
+def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
     """
-    Повертає текст mission.sqm з PBO або None.
-    Використовує пітоновий пакет pbo (якщо є) або zip-фолбек.
+    Повертає raw bytes mission.sqm з PBO або None.
+    Якщо є пакет pbo — використовуємо його; інакше пробуємо zip-фолбек.
     """
     if pbo:
         try:
             archive = pbo.PBO(io.BytesIO(pbo_bytes))
             for name in archive.list():
                 if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
-                    data = archive.read(name)
-                    return data.decode("utf-8", errors="ignore")
+                    return archive.read(name)
         except Exception:
             pass
 
@@ -174,68 +227,61 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
         z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
         for name in z.namelist():
             if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
-                return z.read(name).decode("utf-8", errors="ignore")
+                return z.read(name)
     except Exception:
         pass
 
     return None
 
-def extract_text_fragments_from_bytes(data: bytes, min_fragment_len: int = 40) -> str:
+async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Декодує байти як latin-1 і витягує фрагменти навколо ключових слів,
-    щоб виловити текст з бінарного SQM/PBO: class Group, class Unit, name=, description=, unitName.
-    """
-    text = data.decode("latin-1", errors="ignore")
-    keywords = ["class Group", "class Unit", "name =", "description =", "unitName"]
-    indices = []
-    for kw in keywords:
-        start = 0
-        while True:
-            idx = text.find(kw, start)
-            if idx == -1:
-                break
-            indices.append(idx)
-            start = idx + len(kw)
-    if not indices:
-        return text
-
-    fragments = []
-    window = 2000
-    for idx in sorted(set(indices)):
-        s = max(0, idx - 200)
-        e = min(len(text), idx + window)
-        frag = text[s:e]
-        if len(frag) >= min_fragment_len:
-            fragments.append(frag)
-    return "\n".join(fragments)
-
-async def read_attachment_text(attachment: discord.Attachment) -> Tuple[str, str]:
-    """
-    Повертає (text, used_encoding_or_method). Підтримує .pbo/.sqm та бінарні фрагменти.
+    Повертає (text, method):
+    - Якщо .pbo → бере mission.sqm, якщо знайдено. Якщо не знайдено — помилка.
+    - Якщо .sqm → визначає, чи це RAP (бінарний), тоді декодує через rap_to_text; інакше пробує стандартні кодування.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
+    # .pbo: витягнути mission.sqm (raw bytes)
     if filename.endswith(".pbo"):
-        extracted = extract_mission_from_pbo_bytes(data)
-        if extracted:
-            return extracted, "extracted-from-pbo"
+        sqm_raw = extract_mission_from_pbo_bytes(data)
+        if not sqm_raw:
+            # Якщо не знайшли явно — пробуємо як RAP напряму
+            text = rap_to_text(data)
+            return text, "pbo-rap-fragments"
+        # Визначити, чи RAP (початок 'raP')
+        if sqm_raw[:3] == b'raP':
+            text = rap_to_text(sqm_raw)
+            return text, "pbo-rap"
+        # Інакше — спроба декодування як текстовий SQM
+        for enc in ("utf-8", "cp1251", "latin-1"):
+            try:
+                return sqm_raw.decode(enc), f"pbo-{enc}"
+            except Exception:
+                continue
+        return sqm_raw.decode("latin-1", errors="ignore"), "pbo-latin1-fallback"
 
+    # .sqm: визначити RAP чи текст
+    if filename.endswith(".sqm"):
+        if data[:3] == b'raP':
+            text = rap_to_text(data)
+            return text, "rap"
+        # текстовий SQM
+        for enc in ("utf-8", "cp1251", "latin-1"):
+            try:
+                return data.decode(enc), enc
+            except Exception:
+                continue
+        return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
+
+    # інше розширення: спроба RAP-фолбек + текстові кодування
+    if data[:3] == b'raP':
+        return rap_to_text(data), "rap-raw"
     for enc in ("utf-8", "cp1251", "latin-1"):
         try:
-            text = data.decode(enc)
-            if "class Group" in text or "class Unit" in text or "class Side" in text:
-                return text, enc
-            readable_ratio = sum(1 for ch in text if 32 <= ord(ch) <= 126) / max(1, len(text))
-            if readable_ratio > 0.2:
-                return text, enc
+            return data.decode(enc), enc
         except Exception:
             continue
-
-    frag_text = extract_text_fragments_from_bytes(data)
-    if "class Group" in frag_text or "class Unit" in frag_text:
-        return frag_text, "extracted-fragments"
-
     return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
@@ -596,19 +642,19 @@ class AssignSlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(AssignSlotButton(sid, idx, uid))
 
-# ─── 10. Команда імпорту mission.sqm / .pbo ─────────────────────────────────────
+# ─── 10. Команда імпорту mission.sqm / .pbo з RAP підтримкою ───────────────────
 @bot.command(name="імпорт_sqm")
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
 
     if not ctx.message.attachments:
-        return await ctx.send("❌ Прикріпіть файл mission.sqm або .pbo до повідомлення.")
+        return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
 
     attachment = ctx.message.attachments[0]
 
     try:
-        text, used_enc = await read_attachment_text(attachment)
+        text, method = await read_attachment_sqm_text(attachment)
     except Exception:
         return await ctx.send("❌ Не вдалося прочитати вкладення.")
 
@@ -617,7 +663,7 @@ async def імпорт_sqm(ctx: commands.Context):
         preview = "\n".join(text.splitlines()[:40])[:1500]
         await ctx.send(
             "ℹ️ Відділення у mission.sqm не знайдено або файл порожній. "
-            f"Спроба декодування/витягу: **{used_enc}**. Ось прев'ю початку файлу для діагностики:"
+            f"Метод обробки: **{method}**. Ось прев'ю початку файлу для діагностики:"
         )
         await ctx.send(f"```\n{preview}\n```")
         return
@@ -635,7 +681,7 @@ async def імпорт_sqm(ctx: commands.Context):
         except Exception:
             pass
 
-    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}.")
+    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. (Метод: {method})")
 
 # ─── 11. Події on_ready та on_message ────────────────────────────────────────────
 @bot.event
