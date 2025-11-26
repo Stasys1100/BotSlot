@@ -214,8 +214,8 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 s = numbered_re.sub('', norm_lines[j]).strip()
                 s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
                 s = re.sub(r'[";]+$', '', s).strip()
-                if s:
-                    slots.append(s)
+                if s and not looks_like_code_block(s):
+                    slots.append(normalize_slot_name(clean_line_for_slot(s)))
                 j += 1
             # якщо не знайшли слоти безпосередньо — спробуємо знайти value/description в наступних 6 рядках
             if not slots:
@@ -225,7 +225,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                     if m:
                         candidate = m.group(1).strip()
                         if candidate:
-                            slots.append(candidate)
+                            slots.append(normalize_slot_name(clean_line_for_slot(candidate)))
                     k += 1
             if slots:
                 groups.append((title.strip(), [re.sub(r'\s{2,}', ' ', s).strip() for s in slots]))
