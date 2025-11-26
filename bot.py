@@ -1,8 +1,5 @@
 # bot.py
-# Discord бот для імпорту mission.sqm / .pbo
-# - Працює на Render (Linux) без необхідності запускати Windows .exe
-# - Якщо EXTRACTPBO_PATH вказано і доступний (локально на Windows), бот спробує його викликати
-# - Інакше використовує zip-фолбек та агресивний rap-декодер (rap_to_text_aggressive)
+# Discord бот: імпорт mission.sqm / .pbo, локальний фолбек, очищення слотів з fuzzy-dedupe
 # .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, VTG_CHANNEL_ID (опц.), EXTRACTPBO_PATH (опц.), EXTRACTOR_API_URL (опц.), EXTRACTOR_API_KEY (опц.)
 
 import os
@@ -23,8 +20,9 @@ import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
+import difflib
 
-# optional keep_alive for some hosts; safe to ignore if not present
+# optional keep_alive
 try:
     from keep_alive import keep_alive
     keep_alive()
@@ -55,13 +53,11 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 0)
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
 
-# Optional: path to ExtractPbo (Windows). On Render (Linux) this will usually be unset.
 EXTRACTPBO_PATH = os.getenv("EXTRACTPBO_PATH", "").strip()
-
-# Optional external extractor service
 EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL", "").strip()
 EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY", "").strip()
 
+# internal state
 processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}
 claims: dict[tuple[int,int], list] = {}
@@ -71,7 +67,7 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
-# ─── Reminder (optional) ─────────────────────────────────────────────────────
+# ─── Reminder ─────────────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
@@ -308,14 +304,8 @@ def extract_mission_from_pbo_bytes_zip(pbo_bytes: bytes) -> Optional[bytes]:
     return None
 
 def extract_mission_with_extractpbo_if_available(pbo_bytes: bytes, timeout: int = 60) -> Optional[str]:
-    """
-    Якщо EXTRACTPBO_PATH вказано і доступний (локально), викликаємо його.
-    Повертає текст mission.sqm або None якщо не вдалося.
-    На Render (Linux) зазвичай поверне None і буде використано zip/rap фолбек.
-    """
     if not EXTRACTPBO_PATH:
         return None
-    # перевірка доступності файлу
     if not os.path.isfile(EXTRACTPBO_PATH):
         return None
     tmpdir = tempfile.mkdtemp(prefix="extractpbo_")
@@ -325,7 +315,6 @@ def extract_mission_with_extractpbo_if_available(pbo_bytes: bytes, timeout: int 
             f.write(pbo_bytes)
         outdir = os.path.join(tmpdir, "out")
         os.makedirs(outdir, exist_ok=True)
-        # Виклик ExtractPbo; аргументи можуть відрізнятись за версією
         cmd = [EXTRACTPBO_PATH, "-o", outdir, pbo_path]
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
@@ -348,21 +337,14 @@ def extract_mission_with_extractpbo_if_available(pbo_bytes: bytes, timeout: int 
             pass
 
 def extract_mission_fallback(pbo_bytes: bytes) -> str:
-    """
-    Фолбек для Render: zip-розпакування або агресивний rap-декодер.
-    Повертає текст mission.sqm (str).
-    """
-    # 1) Спробувати zip-архів
     zres = extract_mission_from_pbo_bytes_zip(pbo_bytes)
     if zres:
         if is_likely_rap_or_binary(zres):
             return rap_to_text_aggressive(zres)
         enc = detect_encoding_bytes(zres) or "utf-8"
         return zres.decode(enc, errors="replace")
-    # 2) Якщо виглядає як rap/binary — агресивно декодуємо весь файл
     if is_likely_rap_or_binary(pbo_bytes):
         return rap_to_text_aggressive(pbo_bytes)
-    # 3) Інакше пробуємо декодувати як текст
     enc = detect_encoding_bytes(pbo_bytes) or "utf-8"
     return pbo_bytes.decode(enc, errors="replace")
 
@@ -440,26 +422,56 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
         return groups
     return []
 
-# ─── Helpers: normalize/dedupe slots ────────────────────────────────────────
+# ─── Slot normalization + fuzzy dedupe ───────────────────────────────────────
 def normalize_slot_name(s: str) -> str:
     s = s or ""
     s = s.strip()
     s = re.sub(r'\s{2,}', ' ', s)
     s = re.sub(r'\s+([!?.,:;])', r'\1', s)
     s = re.sub(r'([!?.]){2,}', r'\1', s)
+    # remove leading/trailing punctuation
+    s = s.strip(" \t\n\r-–—")
     return s
 
-def dedupe_preserve_order(items: List[str]) -> List[str]:
-    seen = set()
-    out = []
-    for it in items:
-        key = it.lower().strip()
-        if key and key not in seen:
-            seen.add(key)
-            out.append(it)
+def is_template_slot(s: str) -> bool:
+    if not s:
+        return True
+    low = s.lower().strip()
+    if low in ("слот", "-", "—", "n/a", "none", "пусто"):
+        return True
+    # short generic templates
+    if re.fullmatch(r'^[\W_]{1,5}$', low):
+        return True
+    return False
+
+def fuzzy_merge_slots(slots: List[str], threshold: float = 0.86) -> List[str]:
+    """
+    Зберігає порядок, зливає дуже схожі рядки (ratio >= threshold).
+    Повертає список унікальних назв.
+    """
+    out: List[str] = []
+    for s in slots:
+        s_norm = s.strip()
+        if not s_norm:
+            continue
+        merged = False
+        for i, existing in enumerate(out):
+            ratio = difflib.SequenceMatcher(None, existing.lower(), s_norm.lower()).ratio()
+            if ratio >= threshold:
+                # keep the shorter or the one with more Cyrillic characters
+                if len(s_norm) < len(existing):
+                    out[i] = s_norm
+                else:
+                    # prefer the one with higher cyrillic score
+                    if _cyrillic_score(s_norm) > _cyrillic_score(existing):
+                        out[i] = s_norm
+                merged = True
+                break
+        if not merged:
+            out.append(s_norm)
     return out
 
-# ─── Optional: upload to external extractor (if you still want to use it) ───
+# ─── Optional: upload to external extractor (if used) ────────────────────────
 async def upload_to_service(attachment: discord.Attachment, timeout: int = 60) -> Dict[str, Any]:
     if not EXTRACTOR_API_URL:
         return {"status": "no-config", "error": "EXTRACTOR_API_URL not set"}
@@ -499,30 +511,30 @@ async def імпорт_sqm(ctx: commands.Context):
     sqm_text = None
     method = None
 
-    # 1) Якщо EXTRACTOR_API_URL задано — спробуємо зовнішній сервіс (опціонально)
+    # 1) optional external service
     if EXTRACTOR_API_URL:
         try:
             res = await upload_to_service(attachment)
             if res.get("status") == "ok":
-                method = res.get("json") and "external:json" or "external:plain"
                 if res.get("json"):
                     j = res["json"]
                     if isinstance(j, dict) and j.get("decoded_text"):
                         sqm_text = j.get("decoded_text")
+                        method = "external:decoded_text"
                     elif isinstance(j, dict) and j.get("departments"):
-                        # якщо сервіс повернув готові departments — відправимо їх і завершимо
+                        # service returned departments directly
                         departments = j.get("departments")
+                        # publish departments (cleaned) and return
                         sent_count = 0
                         total_slots = 0
                         for d in departments:
                             title = d.get("section") or d.get("name") or "Відділення"
                             slots = d.get("slots") or d.get("units") or []
-                            cleaned = []
-                            for s in slots:
-                                name = s.get("name") if isinstance(s, dict) else s
-                                cleaned.append(normalize_slot_name(clean_slot_value(name)))
-                            cleaned = [c for c in cleaned if c and c.lower() != "слот"]
-                            cleaned = dedupe_preserve_order(cleaned)[:25]
+                            raw_slots = [ s.get("name") if isinstance(s, dict) else s for s in slots ]
+                            cleaned = [ normalize_slot_name(clean_slot_value(x)) for x in raw_slots ]
+                            cleaned = [c for c in cleaned if not is_template_slot(c)]
+                            cleaned = fuzzy_merge_slots(cleaned)
+                            cleaned = cleaned[:25]
                             total_slots += len(cleaned)
                             embed = discord.Embed(title=title, description="\n".join(f"{i+1}. {x}" for i,x in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
                             try:
@@ -537,18 +549,15 @@ async def імпорт_sqm(ctx: commands.Context):
                         sqm_text = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
                     else:
                         sqm_text = re.sub(r'<[^>]+>', ' ', text)
-            else:
-                # сервіс не відповів коректно — продовжимо локально
-                sqm_text = None
+                    method = "external:plain"
         except Exception:
             sqm_text = None
 
-    # 2) Якщо не отримали текст від сервісу — локальна обробка
+    # 2) local processing
     if not sqm_text:
         try:
             raw = await attachment.read()
             if attachment.filename.lower().endswith(".pbo"):
-                # спробуємо ExtractPbo якщо доступний (локально), інакше фолбек
                 sqm_text = extract_mission_with_extractpbo_if_available(raw)
                 if sqm_text:
                     method = "local:ExtractPbo"
@@ -556,7 +565,6 @@ async def імпорт_sqm(ctx: commands.Context):
                     sqm_text = extract_mission_fallback(raw)
                     method = "local:fallback"
             else:
-                # .sqm або інший текстовий файл
                 if is_likely_rap_or_binary(raw):
                     sqm_text = rap_to_text_aggressive(raw)
                     method = "local:rap"
@@ -570,7 +578,7 @@ async def імпорт_sqm(ctx: commands.Context):
     if not sqm_text:
         return await ctx.send("⚠️ Не вдалося отримати текст з файлу.")
 
-    # 3) Парсимо текст у групи
+    # 3) parse groups
     groups = parse_mission_sqm_flexible(sqm_text)
     if not groups:
         units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', sqm_text, flags=re.IGNORECASE | re.DOTALL)
@@ -583,7 +591,7 @@ async def імпорт_sqm(ctx: commands.Context):
         if units:
             groups = [("Відділення", [clean_slot_value(u) for u in units])]
 
-    # 4) Діагностика (коротко)
+    # 4) diagnostics
     dbg_lines = []
     raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', sqm_text, flags=re.IGNORECASE | re.DOTALL)[:5]
     if raw_t_inner:
@@ -597,7 +605,7 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
-    # 5) Якщо не знайшли груп — повернути прев'ю
+    # 5) if no groups -> preview
     if not groups:
         preview = (sqm_text or "")[:2000]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
@@ -612,15 +620,16 @@ async def імпорт_sqm(ctx: commands.Context):
             await ctx.send(embed=emb)
         return
 
-    # 6) Публікація відділень (очищення, dedupe)
+    # 6) publish cleaned groups
     target_ch = bot.get_channel(ADMIN_CHANNEL_ID) if ADMIN_CHANNEL_ID else ctx.channel
     sent_count = 0
     total_slots = 0
     for name, slots in groups:
         raw_slots = [ s.get("name") if isinstance(s, dict) else s for s in slots ]
         cleaned = [ normalize_slot_name(clean_slot_value(x)) for x in raw_slots ]
-        cleaned = [c for c in cleaned if c and c.lower() != "слот"]
-        cleaned = dedupe_preserve_order(cleaned)[:25]
+        cleaned = [c for c in cleaned if not is_template_slot(c)]
+        cleaned = fuzzy_merge_slots(cleaned, threshold=0.86)
+        cleaned = cleaned[:25]
         total_slots += len(cleaned)
         embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{i+1}. {s}" for i,s in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
         try:
