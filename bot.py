@@ -3,7 +3,11 @@ import re
 import subprocess
 import aiohttp
 import datetime
+import io
+import html
+import difflib
 from zoneinfo import ZoneInfo
+from typing import List, Tuple, Optional, Dict, Any
 
 import discord
 from discord.ext import commands, tasks
@@ -61,6 +65,131 @@ def build_embed(sess: dict) -> discord.Embed:
             lines.append(f"{prefix}{text}")
     embed.description = "\n".join(lines)
     return embed
+
+# ─── Допоміжні функції для парсингу/очищення дебінаризованого SQM ─────────────
+def _normalize_whitespace(s: str) -> str:
+    s = re.sub(r'\r\n|\r', '\n', s)
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n[ \t]+', '\n', s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
+
+def extract_structured_text(raw: str) -> str:
+    if not raw:
+        return ""
+    s = html.unescape(raw)
+    # try to extract <t> inner content first
+    chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
+    if chunks:
+        inner = " ".join(chunks)
+        inner = re.sub(r'<[^>]+>', ' ', inner)
+        inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
+        inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
+        return inner
+    # fallback: strip tags
+    s = re.sub(r'<[^>]+>', ' ', s)
+    s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
+    return s
+
+def clean_slot_value(raw: str) -> str:
+    if raw is None:
+        return "Слот"
+    s = extract_structured_text(raw)
+    s = s.replace('\\', '/')
+    s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bhttps?://\S+\b', '', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
+    if not s or s.lower().startswith("<t color") or s in {'"', "'"}:
+        return "Слот"
+    return s or "Слот"
+
+def split_combined_slot(s: str) -> List[str]:
+    """
+    Розбиває склеєні рядки на окремі фрази/речення.
+    Роздільники: '.', '!', '?', '\n', подвійні пробіли.
+    Додатково: розбиває тільки коли після пробілу йде велика літера (щоб не різати абревіатури).
+    """
+    if not s:
+        return []
+    s = s.strip()
+    s = re.sub(r'[\r\t]+', ' ', s)
+    s = re.sub(r'\s{2,}', ' ', s)
+    parts = []
+    for chunk in re.split(r'\n+|\r+|\s{2,}', s):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        subparts = re.split(r'(?<=[\.\!\?])\s+(?=[А-ЯІЇЄҐA-Z])', chunk)
+        for sp in subparts:
+            sp = sp.strip()
+            if not sp:
+                continue
+            if re.search(r'[\.\!\?].*[\.\!\?]', sp):
+                more = re.split(r'(?<=[\.\!\?])\s*', sp)
+                for m in more:
+                    m = m.strip()
+                    if m:
+                        parts.append(m)
+            else:
+                parts.append(sp)
+    cleaned = []
+    for p in parts:
+        p = p.strip()
+        p = re.sub(r'([!?.]){2,}', r'\1', p)
+        p = re.sub(r'\s+([!?.,:;])', r'\1', p)
+        p = p.strip(" \t\n\r")
+        if p:
+            cleaned.append(p)
+    return cleaned
+
+def normalize_slot_name(s: str) -> str:
+    s = s or ""
+    s = s.strip()
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = re.sub(r'\s+([!?.,:;])', r'\1', s)
+    s = re.sub(r'([!?.]){2,}', r'\1', s)
+    s = s.strip(" \t\n\r-–—")
+    return s
+
+def is_template_slot(s: str) -> bool:
+    if not s:
+        return True
+    low = s.lower().strip()
+    if low in ("слот", "-", "—", "n/a", "none", "пусто"):
+        return True
+    if re.fullmatch(r'^[\W_]{1,5}$', low):
+        return True
+    return False
+
+def dedupe_preserve_order(items: List[str], fuzzy_threshold: float = 0.78) -> List[str]:
+    """
+    Зберігає порядок, зливає дуже схожі рядки (fuzzy similarity >= fuzzy_threshold).
+    Пріоритет: більше кирилиці -> довший рядок.
+    """
+    def cyr_score(x: str) -> int:
+        return len(re.findall(r'[\u0400-\u04FF]', x))
+
+    out: List[str] = []
+    for s in items:
+        s_norm = s.strip()
+        if not s_norm:
+            continue
+        merged = False
+        for i, existing in enumerate(out):
+            ratio = difflib.SequenceMatcher(None, existing.lower(), s_norm.lower()).ratio()
+            if ratio >= fuzzy_threshold:
+                if cyr_score(s_norm) > cyr_score(existing):
+                    out[i] = s_norm
+                elif cyr_score(s_norm) == cyr_score(existing):
+                    if len(s_norm) > len(existing):
+                        out[i] = s_norm
+                merged = True
+                break
+        if not merged:
+            out.append(s_norm)
+    return out
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
 class SlotButton(Button):
@@ -417,6 +546,119 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
+# ─── 11. Команда: імпорт вже дебінаризованого mission.sqm ─────────────────────
+@bot.command(name="імпорт_sqm_decoded", aliases=["import_sqm_decoded"])
+async def імпорт_sqm_decoded(ctx: commands.Context):
+    """
+    Приймає прикріплений вже дебінаризований mission.sqm (plain text)
+    і повертає тільки відділення та слоти у plain-text блоці.
+    """
+    if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
+        return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
+    if not ctx.message.attachments:
+        return await ctx.send("❌ Прикріпіть текстовий mission.sqm до повідомлення.")
+    attachment = ctx.message.attachments[0]
+
+    # прочитати як текст (припускаємо, що файл вже дебінаризований)
+    try:
+        raw = await attachment.read()
+        if isinstance(raw, (bytes, bytearray)):
+            try:
+                sqm_text = raw.decode("utf-8")
+            except Exception:
+                sqm_text = raw.decode("cp1251", errors="replace")
+        else:
+            sqm_text = str(raw)
+    except Exception as e:
+        return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
+
+    groups = []
+    txt = sqm_text.replace('\r\n', '\n')
+
+    # знайти блоки class Group/Section/Unit
+    block_pattern = re.compile(r'(class\s+(?:Group|Section|Unit|Side|Faction)\b.*?\{.*?\}\s*;?)', flags=re.IGNORECASE | re.DOTALL)
+    blocks = block_pattern.findall(txt)
+    if blocks:
+        for blk in blocks:
+            mname = re.search(r'(?:name|groupName|title)\s*=\s*(?P<val>"[^"]*"|\'[^\']*\'|[^\s;]+)\s*;', blk, flags=re.IGNORECASE)
+            if mname:
+                raw_name = mname.group('val').strip().strip('"\'')
+                gname = normalize_slot_name(clean_slot_value(raw_name))
+            else:
+                gname = "Відділення"
+
+            slots = []
+            for m in re.finditer(r'(?:unitName|description|text|name)\s*=\s*"(.*?)"\s*;', blk, flags=re.IGNORECASE | re.DOTALL):
+                slots.append(m.group(1))
+            for m in re.finditer(r"(?:unitName|description|text|name)\s*=\s*'(.*?)'\s*;", blk, flags=re.IGNORECASE | re.DOTALL):
+                slots.append(m.group(1))
+            for arr in re.finditer(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL):
+                inner = arr.group(1)
+                items = re.findall(r'[\'"](.+?)[\'"]', inner, flags=re.DOTALL)
+                for it in items:
+                    slots.append(it)
+            for ti in re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', blk, flags=re.IGNORECASE | re.DOTALL):
+                slots.append(ti)
+
+            cleaned_slots = []
+            for s in slots:
+                s_clean = clean_slot_value(s)
+                parts = split_combined_slot(s_clean)
+                for p in parts:
+                    p2 = normalize_slot_name(p)
+                    if p2 and not is_template_slot(p2):
+                        cleaned_slots.append(p2)
+            cleaned_slots = dedupe_preserve_order(cleaned_slots)
+            if cleaned_slots:
+                groups.append((gname, cleaned_slots))
+    else:
+        # глобальний пошук
+        slots_global = []
+        for m in re.finditer(r'(?:unitName|description|text|name)\s*=\s*"(.*?)"\s*;', txt, flags=re.IGNORECASE | re.DOTALL):
+            slots_global.append(m.group(1))
+        for m in re.finditer(r"(?:unitName|description|text|name)\s*=\s*'(.*?)'\s*;", txt, flags=re.IGNORECASE | re.DOTALL):
+            slots_global.append(m.group(1))
+        for ti in re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', txt, flags=re.IGNORECASE | re.DOTALL):
+            slots_global.append(ti)
+        if slots_global:
+            cleaned = []
+            for s in slots_global:
+                s_clean = clean_slot_value(s)
+                for p in split_combined_slot(s_clean):
+                    p2 = normalize_slot_name(p)
+                    if p2 and not is_template_slot(p2):
+                        cleaned.append(p2)
+            cleaned = dedupe_preserve_order(cleaned)
+            groups.append(("Відділення", cleaned))
+
+    if not groups:
+        return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
+
+    # сформувати plain-text вихід (заголовок + нумерований список)
+    outputs = []
+    for title, slots in groups:
+        lines = [re.sub(r'\s{2,}', ' ', title).strip()]
+        for i, s in enumerate(slots, start=1):
+            lines.append(f"{i}. {s}")
+        outputs.append("\n".join(lines))
+
+    # надіслати кожне відділення як окремий кодовий блок
+    for out in outputs:
+        try:
+            await ctx.send(f"```{out}```")
+        except:
+            parts = out.splitlines()
+            chunk = []
+            for i, line in enumerate(parts):
+                chunk.append(line)
+                if (i+1) % 50 == 0:
+                    await ctx.send(f"```{chr(10).join(chunk)}```")
+                    chunk = []
+            if chunk:
+                await ctx.send(f"```{chr(10).join(chunk)}```")
+
+    await ctx.send(f"✅ Готово. Опубліковано відділень: {len(outputs)}.")
+
 # ─── 11. Сервісні команди ───────────────────────────────────────────────────────
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
@@ -434,5 +676,19 @@ async def _статус(ctx: commands.Context):
         f"📊 Sessions: {len(sessions)}\n"
         f"📋 Claims: {sum(len(v) for v in claims.values())}"
     )
+
+@bot.command(name="gitpush")
+async def _gitpush(ctx: commands.Context):
+    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
+    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
+    emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
+    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
+    emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
+    emb.set_footer(text="Після push → !оновити")
+    await ctx.send(embed=emb)
+
 # ─── 12. Запуск бота ─────────────────────────────────────────────────────────────
-bot.run(TOKEN)
+if not TOKEN:
+    print("DISCORD_TOKEN not set in environment")
+else:
+    bot.run(TOKEN)
