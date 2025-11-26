@@ -1,8 +1,5 @@
 # bot.py
-# Повний робочий код бота з надійним імпортом mission.sqm/.pbo, виправленням mojibake,
-# витягом innerText з <t ...> тегів, діагностикою та інтеграцією парсера відділень.
-# Коментарі українською. Заміни свій поточний bot.py на цей файл.
-
+# Повний робочий код бота з додатковим фіксом mojibake та покращеною обробкою .pbo/.sqm
 import os
 import re
 import io
@@ -20,7 +17,7 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# Якщо у тебе є keep_alive.py — залишаємо виклик, інакше ігноруємо
+# Якщо є keep_alive.py — викликаємо, інакше ігноруємо
 try:
     from keep_alive import keep_alive
     keep_alive()
@@ -133,6 +130,11 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
         candidates.append((redecoded, "latin1->cp1251"))
     except Exception:
         pass
+    try:
+        redecoded = initial_text.encode("cp1251", errors="replace").decode("utf-8", errors="replace")
+        candidates.append((redecoded, "cp1251->utf8"))
+    except Exception:
+        pass
 
     def score(item: Tuple[str, str]) -> Tuple[int, float]:
         txt, _ = item
@@ -142,6 +144,53 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
 
     best = max(candidates, key=score)
     return best[0], best[1]
+
+def fix_mojibake_text(text: str) -> str:
+    """
+    Якщо текст містить типові ознаки mojibake (наприклад 'РўРё' або 'Ð¢Ð¸'),
+    спробувати кілька перетворень і повернути найкращий варіант.
+    """
+    if not text:
+        return text
+    # швидка перевірка: чи є в тексті послідовності, що часто зустрічаються у mojibake
+    if not re.search(r'[ÐР]', text):
+        return text  # ймовірно, нормальний текст
+
+    candidates: List[Tuple[str, str]] = []
+    candidates.append((text, "orig"))
+
+    # common fixes
+    try:
+        candidates.append((text.encode("latin-1", errors="replace").decode("utf-8", errors="replace"), "latin1->utf8"))
+    except Exception:
+        pass
+    try:
+        candidates.append((text.encode("cp1251", errors="replace").decode("utf-8", errors="replace"), "cp1251->utf8"))
+    except Exception:
+        pass
+    try:
+        candidates.append((text.encode("utf-8", errors="replace").decode("cp1251", errors="replace"), "utf8->cp1251"))
+    except Exception:
+        pass
+    try:
+        candidates.append((text.encode("latin-1", errors="replace").decode("cp1251", errors="replace"), "latin1->cp1251"))
+    except Exception:
+        pass
+
+    # also try re-encoding via bytes from original utf-8 interpretation
+    try:
+        b = text.encode("utf-8", errors="replace")
+        candidates.append((b.decode("cp1251", errors="replace"), "utf8bytes->cp1251"))
+    except Exception:
+        pass
+
+    # score by cyrillic count and printability
+    def score_item(it: Tuple[str, str]) -> Tuple[int, float]:
+        t = it[0]
+        return (_cyrillic_score(t), sum(1 for ch in t if ch.isprintable()) / max(1, len(t)))
+
+    best = max(candidates, key=score_item)
+    return best[0]
 
 # ─── HTML / тег <t> витяг та очищення ────────────────────────────────────────
 def extract_structured_text(raw: str) -> str:
@@ -160,6 +209,7 @@ def extract_structured_text(raw: str) -> str:
         inner = re.sub(r'<[^>]+>', ' ', inner)
         inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
         inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
+        inner = fix_mojibake_text(inner)
         return inner
     # якщо парних тегів немає — просто видалити теги
     s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
@@ -167,6 +217,7 @@ def extract_structured_text(raw: str) -> str:
     s = re.sub(r'<[^>]+>', ' ', s)
     s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
+    s = fix_mojibake_text(s)
     return s
 
 def clean_slot_value(raw: str) -> str:
@@ -174,11 +225,13 @@ def clean_slot_value(raw: str) -> str:
     Агресивне очищення одного значення слоту:
     - витяг innerText з <t ...>
     - видалення шляхів, довгих хешів, control-символів
+    - застосування fix_mojibake_text
     - якщо результат порожній або шумний — повернути 'Слот'
     """
     if raw is None:
         return "Слот"
     s = extract_structured_text(raw)
+    s = fix_mojibake_text(s)
     s = s.replace('\\', '/')
     s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
@@ -226,6 +279,7 @@ def rap_to_text_aggressive(data: bytes) -> str:
         tried_label = best_enc
 
     text = best_text
+    text = fix_mojibake_text(text)
 
     # видалити control-символи
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', text)
@@ -351,18 +405,27 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
                 candidates.append((t, "latin1->cp1251"))
             except Exception:
                 pass
+            try:
+                t = base_txt.encode("cp1251", errors="replace").decode("utf-8", errors="replace")
+                candidates.append((t, "cp1251->utf8"))
+            except Exception:
+                pass
+        # вибрати найкращий кандидат
         best = max(candidates, key=lambda it: (_cyrillic_score(it[0]), sum(1 for ch in it[0] if ch.isprintable())/max(1,len(it[0]))))
         return best
 
     if filename.endswith(".pbo"):
         sqm_raw = extract_mission_from_pbo_bytes(data)
         if not sqm_raw:
+            # якщо з pbo не витягло mission.sqm — спробувати rap-декодер на всьому pbo
             text = rap_to_text_aggressive(data)
             return text, "pbo-rap-fragments"
+        # якщо витягнутий sqm виглядає як RAP/binary — rap-декодуємо
         if is_likely_rap_or_binary(sqm_raw) or sqm_raw[:3] == b'raP':
             text = rap_to_text_aggressive(sqm_raw)
             return text, "pbo-rap"
         text, enc = try_decode_bytes(sqm_raw)
+        text = fix_mojibake_text(text)
         return text, f"pbo-{enc}"
 
     if filename.endswith(".sqm"):
@@ -370,34 +433,18 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
             text = rap_to_text_aggressive(data)
             return text, "rap"
         text, enc = try_decode_bytes(data)
+        text = fix_mojibake_text(text)
         return text, enc
 
+    # generic fallback
     if is_likely_rap_or_binary(data):
         return rap_to_text_aggressive(data), "rap-raw"
     text, enc = try_decode_bytes(data)
+    text = fix_mojibake_text(text)
     return text, enc
 
 # ─── Інтегрований парсер відділень (користувацький код) ──────────────────────
-def decode_text_simple(raw_bytes: bytes, encoding_hint: Optional[str] = None) -> str:
-    if encoding_hint:
-        try:
-            return raw_bytes.decode(encoding_hint)
-        except Exception:
-            pass
-    for enc in ["utf-8", "cp1251", "windows-1251", "latin1"]:
-        try:
-            return raw_bytes.decode(enc)
-        except Exception:
-            continue
-    return raw_bytes.decode("utf-8", errors="replace")
-
 def parse_section(text: str) -> Dict[str, Any]:
-    """
-    Парсинг секції відділення за прикладом:
-    Альфа 2-1 | 93-тя ОМБр «Холодний Яр» | Механізоване відділення | БМП-2 | [СС]
-    1. Командир відділення  ENG
-    ...
-    """
     header_pattern = re.compile(
         r'^(.*?)\|\s*(.*?)\|\s*(.*?)\|\s*(.*?)\|\s*(\[.*?\])\s*$',
         re.MULTILINE
@@ -429,13 +476,13 @@ def parse_section(text: str) -> Dict[str, Any]:
             m = re.match(r'^\s*(\d+)\.\s*(.*?)\s*(?:\s+(\w{2,})\s*)?$', line)
             if m:
                 number = int(m.group(1))
-                name = m.group(2).strip()
+                name = fix_mojibake_text(m.group(2).strip())
                 abbr = m.group(3)
                 result["slots"].append({"num": number, "name": name, "abbr": abbr})
             else:
                 t = line.strip()
                 if t:
-                    result["slots"].append({"num": None, "name": t, "abbr": None})
+                    result["slots"].append({"num": None, "name": fix_mojibake_text(t), "abbr": None})
     else:
         # Simple processing without header
         slots: List[Dict[str, Any]] = []
@@ -445,11 +492,11 @@ def parse_section(text: str) -> Dict[str, Any]:
             if m:
                 slots.append({
                     "num": int(m.group(1)),
-                    "name": m.group(2).strip(),
+                    "name": fix_mojibake_text(m.group(2).strip()),
                     "abbr": m.group(3)
                 })
         result = {
-            "section": header.strip(),
+            "section": fix_mojibake_text(header.strip()),
             "formation": None,
             "type": None,
             "vehicle": None,
@@ -458,9 +505,6 @@ def parse_section(text: str) -> Dict[str, Any]:
     return result
 
 def extract_departments(text: str) -> List[Dict[str, Any]]:
-    """
-    Розбити текст на блоки по подвійних нових рядках і розпарсити кожен блок.
-    """
     blocks = re.split(r'\n\s*\n', text.strip())
     res: List[Dict[str, Any]] = []
     for block in blocks:
@@ -470,10 +514,6 @@ def extract_departments(text: str) -> List[Dict[str, Any]]:
         if parsed:
             res.append(parsed)
     return res
-
-def process_input_text(input_text: str) -> str:
-    decomp = extract_departments(input_text)
-    return json.dumps(decomp, ensure_ascii=False, indent=2)
 
 # ─── Гнучкий парсер mission.sqm для ембедів ──────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
