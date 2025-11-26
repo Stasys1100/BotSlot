@@ -1,5 +1,5 @@
 # bot.py
-# Discord бот: приймає текстовий mission.sqm (або .txt) і повертає відділення + слоти
+# Discord бот: приймає текстовий mission.sqm (або .txt) і повертає відділення + слоти.
 # .env: DISCORD_TOKEN (обов'язково), ADMIN_CHANNEL_ID (опц.), VTG_CHANNEL_ID (опц.), DEPLOY_HOOK_URL (опц.)
 
 import os
@@ -27,6 +27,8 @@ logger = logging.getLogger("botslot")
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
+VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 0)
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
 
 intents = discord.Intents.default()
 intents.guilds = True
@@ -34,12 +36,9 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 0)
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
 
+# ─── State ──────────────────────────────────────────────────────────────────
 sessions: Dict[int, dict] = {}
-claims: Dict[tuple[int, int], list] = {}
-request_counter = 0
 processed_messages: set[int] = set()
 
 # стоп-флаги
@@ -48,9 +47,9 @@ _stop_sending_by_channel: Dict[int, bool] = {}
 
 DEFAULT_TITLE = "Відділення"
 
-# Debounce для імпорту (захист від дублювання)
+# Debounce для імпорту
 _recent_imports: Dict[str, float] = {}
-_RECENT_IMPORTS_TTL = 60.0  # секунд
+_RECENT_IMPORTS_TTL = 60.0  # сек
 
 # ─── Slot detection ─────────────────────────────────────────────────────────
 SLOT_KEYWORDS = [
@@ -64,6 +63,24 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
+def is_noise(s: str) -> bool:
+    """Відсікає технічний шум: None/NULL/true/false, чисті цифри/капси, rhs_/ _hide / flag_manager / MaleXXENG."""
+    s = (s or "").strip()
+    if not s:
+        return True
+    low = s.lower()
+    if low in {"none", "null", "true", "false"}:
+        return True
+    if re.fullmatch(r'\d+', s):
+        return True
+    if re.fullmatch(r'[A-Z0-9_]+', s):
+        return True
+    if "rhs_" in low or "_hide" in low or "flag_manager" in low:
+        return True
+    if s.startswith("Male") and "ENG" in s:
+        return True
+    return False
+
 def strip_quotes_semicolons(s: str) -> str:
     if not s:
         return ""
@@ -76,14 +93,12 @@ def extract_structured_text(raw: str) -> str:
     if not raw:
         return ""
     s = html.unescape(raw)
-    # зібрати value/description атрибути, якщо вони є
     attrs = [m.group(1) for m in re.finditer(r'(?:value|description)\s*=\s*"([^"]+)"', s, flags=re.IGNORECASE)]
     if attrs:
         combined = " ".join(attrs)
         combined = re.sub(r'<[^>]+>', ' ', combined)
         combined = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', combined)
         return re.sub(r'\s{2,}', ' ', combined).strip(' "\'')
-    # fallback: прибрати тегові конструкції
     s = re.sub(r'<[^>]+>', ' ', s)
     s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
     return re.sub(r'\s{2,}', ' ', s).strip(' "\'')
@@ -120,9 +135,8 @@ def dedupe_preserve_order(items: List[str], fuzzy_threshold: float = 0.78) -> Li
         if not s_norm:
             continue
         merged = False
-        for i, existing in enumerate(out):
-            ratio = difflib.SequenceMatcher(None, existing.lower(), s_norm.lower()).ratio()
-            if ratio >= fuzzy_threshold:
+        for e in out:
+            if difflib.SequenceMatcher(None, s_norm.lower(), e.lower()).ratio() >= fuzzy_threshold:
                 merged = True
                 break
         if not merged:
@@ -139,17 +153,16 @@ def decode_bytes(raw: bytes) -> str:
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     """
     Витягує всі description/value і групує їх у (title, [slots...]).
-    Логіка:
-    - Рядки з '|' або @Альфа/Штаб/бригада/Окрема/відділення -> заголовок.
+    - Рядки з '|' або @Альфа/Штаб/бригада/Окрема/відділення/Піхотне -> заголовок.
     - Рядки з нумерацією або ключовими словами -> слот.
     - Короткі рядки з ENG/MED/технікою -> слот.
-    - Інакше: або заголовок-кандидат, або слот (якщо вже є title).
+    - Технічний шум фільтрується is_noise(...).
     """
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     matches = [(m.start(), html.unescape(m.group(1)).strip())
                for m in re.finditer(r'(?:description|value)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE)]
     if not matches:
-        # інколи дані можуть бути в <t>...</t> блоках
+        # інколи дані можуть бути в <t>...</t>
         t_matches = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)
         matches = [(0, html.unescape(m).strip()) for m in t_matches]
     if not matches:
@@ -163,17 +176,16 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     def flush():
         nonlocal cur_title, cur_slots
         if cur_title or cur_slots:
-            slots = [normalize_slot_name(s) for s in cur_slots if s and not looks_like_code_block(s)]
+            slots = [normalize_slot_name(s) for s in cur_slots if s and not looks_like_code_block(s) and not is_noise(s)]
             slots = dedupe_preserve_order(slots)
             if slots:
                 title_line = re.sub(r'\s{2,}', ' ', (cur_title or DEFAULT_TITLE)).strip()
                 groups.append((title_line, slots))
-        cur_title = None
-        cur_slots = []
+        cur_title, cur_slots = None, []
 
     for _, raw in matches:
         s = re.sub(r'\s{2,}', ' ', raw).strip()
-        if not s:
+        if not s or is_noise(s):
             continue
 
         # Заголовок
@@ -185,18 +197,18 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         # Слот за нумерацією або ключовими словами
         if re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s):
             slot = clean_line_for_slot(s)
-            if slot and not looks_like_code_block(slot):
+            if slot and not looks_like_code_block(slot) and not is_noise(slot):
                 cur_slots.append(slot)
             else:
                 rejected.append(s)
             continue
 
-        # Короткі або технічні токени — трактувати як слот
-        if re.search(r'\b(ENG|MED|M113|ZALA|Mavic|FPV|HIMARS|BMP|T-72|M113A3)\b', s, flags=re.IGNORECASE) or len(s.split()) <= 6:
+        # Короткі або технічні токени — як слот
+        if re.search(r'\b(ENG|MED|M113|M113A3|ZALA|Mavic|FPV|BMP|T-72|T-72Б|HIMARS)\b', s, flags=re.IGNORECASE) or len(s.split()) <= 6:
             cur_slots.append(clean_line_for_slot(s))
             continue
 
-        # Інакше — або додаємо як слот до активного заголовка, або робимо новий заголовок
+        # Інакше — або слот до активного заголовка, або новий заголовок
         if cur_title:
             cur_slots.append(clean_line_for_slot(s))
         else:
@@ -214,13 +226,13 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         cleaned = []
         for s in all_numbered:
             s2 = clean_line_for_slot(s)
-            if s2 and not looks_like_code_block(s2):
+            if s2 and not looks_like_code_block(s2) and not is_noise(s2):
                 cleaned.append(normalize_slot_name(s2))
         cleaned = dedupe_preserve_order(cleaned)
         if cleaned:
             groups = [(DEFAULT_TITLE, cleaned)]
 
-    # Лог відкинутих рядків
+    # Лог відкинутих (для діагностики, якщо треба)
     try:
         if rejected:
             with open("parser_debug.log", "w", encoding="utf-8") as f:
@@ -235,14 +247,21 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 # ─── Reminder (optional) ─────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
-    # За потреби можна додати логіку нагадування
-    return
+    now = datetime.datetime.now(KYIV_TZ)
+    if now.weekday() in (4, 6) and now.hour == 19 and now.minute == 30:
+        if VTG_CHANNEL_ID:
+            ch = bot.get_channel(VTG_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send("||@everyone||\n**Сбор VTG**")
+                except Exception:
+                    logger.exception("vtg_reminder send failed")
 
 # ─── Embed builder для сесій ────────────────────────────────────────────────
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
-    for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
+    for i, (text, owner) in enumerate(zip(sess["lines"], sess.get("owners", [None]*len(sess["lines"])))):
         prefix = f"{i+1}. "
         if owner:
             lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
@@ -268,7 +287,7 @@ class SlotButton(Button):
         if owner is None:
             # уникнути множинних слотів у тій же гілці
             for s in sessions.values():
-                if s["channel_id"] == sess["channel_id"] and user in s["owners"]:
+                if s["channel_id"] == sess["channel_id"] and user in s.get("owners", []):
                     return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
             sess["owners"][self.idx] = user
             return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
@@ -286,18 +305,15 @@ class SlotView(View):
 # ─── Команди ────────────────────────────────────────────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm", "імпорт_sqm_decoded", "import_sqm_decoded"])
 async def імпорт_sqm(ctx: commands.Context):
-    # Обмеження на канал (опціонально)
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
-
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть mission.sqm або mission.txt")
 
     attachment = ctx.message.attachments[0]
-    # Debounce: захист від дублювання
     key = f"{ctx.message.id}:{attachment.id}"
     now = time.time()
-    # очистити старі ключі
+    # cleanup старих записів
     for k, t in list(_recent_imports.items()):
         if now - t > _RECENT_IMPORTS_TTL:
             _recent_imports.pop(k, None)
@@ -307,10 +323,7 @@ async def імпорт_sqm(ctx: commands.Context):
 
     try:
         raw = await attachment.read()
-        if isinstance(raw, (bytes, bytearray)):
-            text = decode_bytes(raw)
-        else:
-            text = str(raw)
+        text = decode_bytes(raw) if isinstance(raw, (bytes, bytearray)) else str(raw)
     except Exception as e:
         _recent_imports.pop(key, None)
         logger.exception("Failed to read attachment")
@@ -328,7 +341,7 @@ async def імпорт_sqm(ctx: commands.Context):
         cleaned = []
         for s in all_numbered:
             s2 = clean_line_for_slot(s)
-            if s2 and not looks_like_code_block(s2):
+            if s2 and not looks_like_code_block(s2) and not is_noise(s2):
                 cleaned.append(normalize_slot_name(s2))
         cleaned = dedupe_preserve_order(cleaned)
         if cleaned:
@@ -349,7 +362,6 @@ async def імпорт_sqm(ctx: commands.Context):
             logger.exception("Failed to write parser_debug.log")
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
-    # Відправка результатів
     sent = 0
     for title, slots in groups:
         if _stop_sending_global or _stop_sending_by_channel.get(ctx.channel.id):
@@ -396,8 +408,11 @@ async def _оновити(ctx: commands.Context):
 
 @bot.command(name="статус", aliases=["status"])
 async def _статус(ctx: commands.Context):
-    commit = subprocess.getoutput("git rev-parse --short HEAD")
-    await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
+    try:
+        commit = subprocess.getoutput("git rev-parse --short HEAD")
+    except Exception:
+        commit = "unknown"
+    await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}")
 
 # ─── on_ready / on_message ──────────────────────────────────────────────────
 @bot.event
@@ -437,7 +452,8 @@ async def on_message(message: discord.Message):
                 owners.append(owner)
             elif header is None:
                 header = txt
-        slots, owners = slots[:25], owners[:len(slots)]
+        slots = slots[:25]
+        owners = owners[:len(slots)]
         sess = {"title": header or DEFAULT_TITLE, "lines": slots, "owners": owners, "channel_id": message.channel.id}
         embed = build_embed(sess)
         sent = await message.channel.send(embed=embed)
