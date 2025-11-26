@@ -4,6 +4,7 @@ import subprocess
 import aiohttp
 import datetime
 from zoneinfo import ZoneInfo
+from typing import List, Tuple, Optional
 
 import discord
 from discord.ext import commands, tasks
@@ -61,6 +62,100 @@ def build_embed(sess: dict) -> discord.Embed:
             lines.append(f"{prefix}{text}")
     embed.description = "\n".join(lines)
     return embed
+
+# ─── 5.1 Генератор Embed для відділень (новий) ──────────────────────────────────
+def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
+    embed = discord.Embed(title=title or "Відділення", color=discord.Color.blurple())
+    if slots:
+        lines = [f"{i+1}. {s}" for i, s in enumerate(slots)]
+        embed.description = "\n".join(lines)
+    else:
+        embed.description = "— слотів не знайдено —"
+    return embed
+
+# ─── 5.2 Парсер mission.sqm (витягує назви відділень та слоти) ────────────────
+def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
+    """
+    Повертає список кортежів (group_name, [slot1, slot2, ...]).
+    Парсер простий, орієнтований на стандартну структуру mission.sqm:
+    - class Group { ... name = "GroupName"; ... class Unit { ... description = "Role"; ... } ... }
+    Він намагається знайти name/groupName/description для групи та description/unitName для юнітів.
+    """
+    groups: List[Tuple[str, List[str]]] = []
+    current_group_name: Optional[str] = None
+    current_slots: List[str] = []
+
+    re_group_start = re.compile(r'^\s*class\s+Group\b', re.IGNORECASE)
+    re_name_line   = re.compile(r'^\s*(name|groupName|description)\s*=\s*"?(?P<val>[^";]+)"?\s*;', re.IGNORECASE)
+    re_unit_start  = re.compile(r'^\s*class\s+Unit\b', re.IGNORECASE)
+    re_slot_desc   = re.compile(r'^\s*(description|unitName)\s*=\s*"?(?P<val>[^";]+)"?\s*;', re.IGNORECASE)
+
+    in_group = False
+    in_unit = False
+
+    for raw in text.splitlines():
+        line = raw.strip()
+
+        # Початок групи
+        if re_group_start.match(line):
+            # зберегти попередню групу
+            if current_group_name is not None:
+                groups.append((current_group_name, current_slots))
+            current_group_name = None
+            current_slots = []
+            in_group = True
+            in_unit = False
+            continue
+
+        # Назва групи (перший знайдений name/groupName/description)
+        if in_group and current_group_name is None:
+            m_name = re_name_line.match(line)
+            if m_name:
+                current_group_name = m_name.group("val").strip()
+                continue
+
+        # Початок юніта (слоту)
+        if re_unit_start.match(line):
+            in_unit = True
+            # додаємо тимчасовий слот
+            current_slots.append("Слот")
+            continue
+
+        # Опис слоту (description або unitName)
+        if in_unit:
+            m_desc = re_slot_desc.match(line)
+            if m_desc:
+                val = m_desc.group("val").strip()
+                if val:
+                    current_slots[-1] = val
+                continue
+
+        # Груба детекція закінчення блоків
+        if line == "};":
+            if in_unit:
+                in_unit = False
+                continue
+            if in_group:
+                # кінець групи
+                in_group = False
+                # якщо група мала назву або слоти — збережемо її
+                if current_group_name is not None or current_slots:
+                    groups.append((current_group_name or "Відділення", current_slots))
+                current_group_name = None
+                current_slots = []
+                continue
+
+    # Якщо файл закінчився всередині групи
+    if current_group_name is not None or current_slots:
+        groups.append((current_group_name or "Відділення", current_slots))
+
+    # Очищення: заміна пустих слотів на "Слот", обрізка пробілів
+    cleaned: List[Tuple[str, List[str]]] = []
+    for gname, gslots in groups:
+        name = gname.strip() if gname else "Відділення"
+        slots = [s.strip() if s and s.strip() else "Слот" for s in gslots]
+        cleaned.append((name, slots))
+    return cleaned
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
 class SlotButton(Button):
@@ -426,7 +521,53 @@ class AssignSlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(AssignSlotButton(sid, idx, uid))
 
-# ─── 10. Події on_ready та on_message ────────────────────────────────────────────
+# ─── 10. Команда імпорту mission.sqm (нова) ────────────────────────────────────
+@bot.command(name="імпорт_sqm")
+async def імпорт_sqm(ctx: commands.Context):
+    # Доступ лише в адміністративному каналі
+    if ctx.channel.id != ADMIN_CHANNEL_ID:
+        return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
+
+    if not ctx.message.attachments:
+        return await ctx.send("❌ Прикріпіть файл mission.sqm до повідомлення.")
+
+    # Знайти attachment, який має назву mission.sqm або закінчується на .sqm
+    attachment = None
+    for a in ctx.message.attachments:
+        if a.filename.lower().endswith("mission.sqm") or a.filename.lower().endswith(".sqm"):
+            attachment = a
+            break
+
+    if not attachment:
+        return await ctx.send("❌ Не знайдено файл mission.sqm серед вкладень.")
+
+    try:
+        data = await attachment.read()
+        text = data.decode("utf-8", errors="ignore")
+    except Exception:
+        return await ctx.send("❌ Не вдалося прочитати mission.sqm (кодування або формат).")
+
+    groups = parse_mission_sqm(text)
+    if not groups:
+        return await ctx.send("ℹ️ Відділення у mission.sqm не знайдено або файл порожній.")
+
+    target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
+    if not target_ch:
+        return await ctx.send("❌ Адмін-канал не знайдено за ID.")
+
+    sent_count = 0
+    for group_name, slot_list in groups:
+        # обмеження: максимум 25 слотів в одному embed; якщо більше — обрізаємо
+        embed = build_group_embed(group_name, slot_list[:25])
+        try:
+            await target_ch.send(embed=embed)
+            sent_count += 1
+        except Exception:
+            pass
+
+    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}.")
+
+# ─── 11. Події on_ready та on_message ────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
@@ -469,7 +610,6 @@ async def on_message(message: discord.Message):
                      if f"<@{u.id}>" in txt or f"<@!{u.id}>" in txt),
                     None
                 )
-                clean = MENTION_RANDOM=''
                 clean = MENTION_RE.sub("", m.group(2)).strip()
                 slots.append(clean)
                 owners.append(owner)
@@ -490,11 +630,11 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# ─── 11. Сервісні команди ───────────────────────────────────────────────────────
+# ─── 12. Сервісні команди ───────────────────────────────────────────────────────
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
+        return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
@@ -513,10 +653,10 @@ async def _gitpush(ctx: commands.Context):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
     emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
     emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
+    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
     emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── 12. Запуск бота ─────────────────────────────────────────────────────────────
+# ─── 13. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
