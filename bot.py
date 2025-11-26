@@ -1,3 +1,4 @@
+```python
 # bot.py
 # Discord бот: приймає дебінаризований mission.sqm і повертає тільки відділення + слоти
 # .env: DISCORD_TOKEN (обов'язково), ADMIN_CHANNEL_ID (опц.), VTG_CHANNEL_ID (опц.), DEPLOY_HOOK_URL (опц.)
@@ -9,6 +10,7 @@ import subprocess
 import datetime
 import html
 import difflib
+import asyncio
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -43,6 +45,10 @@ processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}
 claims: dict[tuple[int,int], list] = {}
 request_counter = 0
+
+# флаг(и) для зупинки відправки відділень
+_stop_sending_global = False
+_stop_sending_by_channel: Dict[int, bool] = {}
 
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
@@ -86,14 +92,17 @@ def extract_structured_text(raw: str) -> str:
     if not raw:
         return ""
     s = html.unescape(raw)
-    # try to extract <t> inner content first
-    chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
-    if chunks:
-        inner = " ".join(chunks)
-        inner = re.sub(r'<[^>]+>', ' ', inner)
-        inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
-        inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
-        return inner
+    # extract value="..." and description="..." and <t> tags first (prefer explicit attributes)
+    attrs = []
+    for m in re.finditer(r'(?:value|description)\s*=\s*"([^"]+)"', s, flags=re.IGNORECASE):
+        attrs.append(m.group(1))
+    t_chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
+    if attrs or t_chunks:
+        combined = " ".join(attrs + t_chunks)
+        combined = re.sub(r'<[^>]+>', ' ', combined)
+        combined = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', combined)
+        combined = re.sub(r'\s{2,}', ' ', combined).strip(' "\'').strip()
+        return combined
     # fallback: strip tags
     s = re.sub(r'<[^>]+>', ' ', s)
     s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
@@ -108,6 +117,9 @@ def clean_slot_value(raw: str) -> str:
     s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\bhttps?://\S+\b', '', s)
+    s = re.sub(r'^\s*value\s*=\s*"', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'^\s*description\s*=\s*"', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'"\s*$', '', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
     return s
 
@@ -121,6 +133,14 @@ def split_combined_slot(s: str) -> List[str]:
     for chunk in re.split(r'\n+|\r+|\s{2,}', s):
         chunk = chunk.strip()
         if not chunk:
+            continue
+        # split by numbered patterns inside a single line: "1. A 2. B"
+        if re.search(r'\d+\.\s*', chunk):
+            found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', chunk)
+            for f in found:
+                f2 = f.strip()
+                if f2:
+                    parts.append(f2)
             continue
         subparts = re.split(r'(?<=[\.\!\?])\s+(?=[А-ЯІЇЄҐA-Z])', chunk)
         for sp in subparts:
@@ -192,7 +212,7 @@ def looks_like_tech_line(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return True
-    if re.search(r'\b(className|addons?|url|preview|version|randomSeed|ScenarioDatas|Datasource|author|classNamer)\b', s, flags=re.IGNORECASE):
+    if re.search(r'\b(className|classNamer|addons?|url|preview|version|randomSeed|ScenarioDatas|Datasource|author|expression)\b', s, flags=re.IGNORECASE):
         return True
     if re.search(r'https?://', s, flags=re.IGNORECASE):
         return True
@@ -202,36 +222,35 @@ def looks_like_tech_line(s: str) -> bool:
     # дуже короткі або лише цифри
     if re.fullmatch(r'[\d\W]{1,4}', s):
         return True
+    # рядки, що містять лише частини коду (крапки, лапки, value=, description=)
+    if re.match(r'^(value|description|expression)\s*=', s, flags=re.IGNORECASE):
+        return True
     return False
 
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     """
     Повертає список (title, [slot1, slot2, ...]) у форматі, готовому для виводу.
     Агресивно фільтрує технічні рядки і addon-списки.
+    Підтримує value="..." та description="..." і рядки з вбудованою нумерацією.
     """
     # розбити на рядки і попередньо очистити
     raw_lines = [ln.strip() for ln in text.replace('\r\n', '\n').splitlines()]
-    # видалити явні control/порожні рядки
     raw_lines = [ln for ln in raw_lines if ln and not re.fullmatch(r'[\x00-\x1f\x7f-\x9f]+', ln)]
 
-    # Якщо файл починається з великого списку addon/class (багато рядків без пробілів або з підкресленнями),
-    # пропустимо перший блок таких рядків — це джерело "мусору".
-    cleaned_lines: List[str] = []
+    # видалити зайві лапки в кінці/початку, та явні шматки коду, що повторюються
+    raw_lines = [re.sub(r'^\s*"?\s*', '', ln).rstrip('"; ') for ln in raw_lines]
+
+    # Пропустити великий початковий блок технічних рядків (addons, className тощо)
     i = 0
     n = len(raw_lines)
-    # пропускаємо початковий блок технічних рядків довжиною >= 5
     tech_block_len = 0
     while i < n and looks_like_tech_line(raw_lines[i]):
         tech_block_len += 1
         i += 1
-    if tech_block_len >= 5:
-        # пропустили великий технічний блок
-        pass
-    else:
-        # якщо блок короткий — не пропускаємо
-        i = 0
+    if tech_block_len < 5:
+        i = 0  # не пропускаємо, якщо блок малий
 
-    # з i починаємо збирати релевантні рядки
+    cleaned_lines: List[str] = []
     while i < n:
         ln = raw_lines[i]
         # якщо рядок явно технічний — пропускаємо
@@ -241,14 +260,20 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         cleaned_lines.append(ln)
         i += 1
 
+    # Додатково: витягнути value="..." та description="..." з усього тексту як окремі рядки
+    for m in re.finditer(r'(?:value|description)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE):
+        v = m.group(1).strip()
+        if v and not looks_like_tech_line(v):
+            cleaned_lines.append(v)
+
     # Тепер з cleaned_lines шукаємо заголовки і їхні нумеровані слоти
     groups: List[Tuple[str, List[str]]] = []
     i = 0
     m = len(cleaned_lines)
     while i < m:
         ln = cleaned_lines[i]
-        # Якщо рядок виглядає як заголовок (містить '|' або '@' або слово "відділення" або довгий опис) — беремо як title
-        if '|' in ln or '@' in ln or re.search(r'\b(відділен|відділ|бригада|екіпаж|crew|командир)\b', ln, flags=re.IGNORECASE):
+        # Якщо рядок виглядає як заголовок (містить '|' або '@' або слово "відділен" тощо) — беремо як title
+        if '|' in ln or '@' in ln or re.search(r'\b(відділен|відділ|бригада|екіпаж|crew|командир|пехотн|піхотн|пехотное)\b', ln, flags=re.IGNORECASE):
             title = ln
             # збираємо наступні нумеровані слоти
             slots: List[str] = []
@@ -258,7 +283,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 if slot and not looks_like_tech_line(slot):
                     slots.append(slot)
                 j += 1
-            # якщо після заголовка немає нумерованих слотів, можливо слоти йдуть в одному рядку або через коми — спробуємо знайти наступні 10 рядків з нумерацією в середині
+            # якщо після заголовка немає нумерованих слотів, спробуємо знайти вбудовані "N. text" у наступних кількох рядках
             if not slots:
                 k = i + 1
                 while k < m and len(slots) < 25:
@@ -270,7 +295,9 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                                 slots.append(f2)
                     k += 1
             if slots:
-                groups.append((title.strip(), [normalize_slot_name(s) for s in slots]))
+                slots = [normalize_slot_name(s) for s in slots if s and not is_template_slot(s)]
+                slots = dedupe_preserve_order(slots)
+                groups.append((title.strip(), slots))
                 i = j
                 continue
             else:
@@ -286,10 +313,11 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                     slots.append(normalize_slot_name(slot))
                 i += 1
             if slots:
+                slots = dedupe_preserve_order([s for s in slots if not is_template_slot(s)])
                 groups.append(("Відділення", slots))
             continue
 
-        # Інакше — можливо це одиночний рядок, який містить заголовок і слоти в одному рядку (через крапки або коми)
+        # Інакше — можливо це рядок з title|1. ... в одному рядку
         if '|' in ln and re.search(r'\d+\.', ln):
             parts = ln.split('|', 1)
             title = parts[0].strip()
@@ -297,6 +325,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', rest)
             slots = [normalize_slot_name(f.strip()) for f in found if f.strip() and not looks_like_tech_line(f.strip())]
             if slots:
+                slots = dedupe_preserve_order([s for s in slots if not is_template_slot(s)])
                 groups.append((title, slots))
                 i += 1
                 continue
@@ -318,14 +347,30 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             final.append((re.sub(r'\s{2,}', ' ', title).strip(), cleaned_slots))
     return final
 
-# ─── Оновлена команда: імпорт_sqm_decoded (без попереднього "не знайдено") ─────
+# ─── Команда: зупинити відправку ───────────────────────────────────────────────
+@bot.command(name="стоп", aliases=["stop"])
+async def стоп(ctx: commands.Context):
+    global _stop_sending_global, _stop_sending_by_channel
+    # дозволити зупиняти лише в адмін-каналі або адміністратору
+    if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
+        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
+    _stop_sending_global = True
+    _stop_sending_by_channel[ctx.channel.id] = True
+    await ctx.send("⏹️ Зупиняю відправку відділень...")
+
+# ─── Команда: імпорт_sqm_decoded з перевіркою стоп-флагів ─────────────────────
 @bot.command(name="імпорт_sqm_decoded", aliases=["import_sqm", "import_sqm_decoded", "імпорт_sqm"])
 async def імпорт_sqm_decoded(ctx: commands.Context):
+    global _stop_sending_global, _stop_sending_by_channel
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть текстовий mission.sqm до повідомлення.")
     attachment = ctx.message.attachments[0]
+
+    # скинути стоп-флаг для цього каналу перед початком
+    _stop_sending_by_channel[ctx.channel.id] = False
+    _stop_sending_global = False
 
     try:
         raw = await attachment.read()
@@ -341,11 +386,21 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
 
     groups = extract_units_and_slots(sqm_text)
 
+    # якщо нічого не знайдено — агресивний fallback: знайти всі value/description або всі нумеровані рядки
     if not groups:
-        # Якщо нічого не знайшлося — спробуємо ще агресивно витягнути всі рядки з нумерацією і повернути їх як одне відділення
-        all_numbered = re.findall(r'^\s*\d+\.\s*(.+)$', sqm_text, flags=re.MULTILINE)
-        cleaned = [normalize_slot_name(clean_slot_value(s)) for s in all_numbered if s and not looks_like_tech_line(s)]
-        cleaned = [s for s in cleaned if s]
+        all_values = re.findall(r'(?:value|description)\s*=\s*"([^"]+)"', sqm_text, flags=re.IGNORECASE)
+        cleaned = []
+        for v in all_values:
+            v2 = clean_slot_value(v)
+            if v2 and not looks_like_tech_line(v2):
+                cleaned.append(v2)
+        if not cleaned:
+            all_numbered = re.findall(r'^\s*\d+\.\s*(.+)$', sqm_text, flags=re.MULTILINE)
+            for s in all_numbered:
+                s2 = clean_slot_value(s)
+                if s2 and not looks_like_tech_line(s2):
+                    cleaned.append(s2)
+        cleaned = [normalize_slot_name(s) for s in cleaned if s and not is_template_slot(s)]
         cleaned = dedupe_preserve_order(cleaned)
         if cleaned:
             groups = [("Відділення", cleaned)]
@@ -353,25 +408,44 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
     if not groups:
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
-    # Формат виводу: заголовок у першому рядку, потім слоти (без нумерації), як просив
+    # Відправляємо групи по черзі, перевіряючи стоп-флаг
+    sent = 0
     for title, slots in groups:
+        # перевірка глобального стопу або стопу по каналу
+        if _stop_sending_global or _stop_sending_by_channel.get(ctx.channel.id):
+            await ctx.send("⏹️ Відправка зупинена.")
+            break
+
         title_line = re.sub(r'\s{2,}', ' ', title).strip()
+        # формат: заголовок у першому рядку, потім слоти (без нумерації)
         lines = [title_line] + slots
         out_text = "\n".join(lines)
         try:
             await ctx.send(f"```{out_text}```")
+            sent += 1
         except Exception:
+            # fallback: розбити на частини
             parts = out_text.splitlines()
             chunk = []
             for i, line in enumerate(parts):
                 chunk.append(line)
                 if (i + 1) % 40 == 0:
+                    if _stop_sending_global or _stop_sending_by_channel.get(ctx.channel.id):
+                        break
                     await ctx.send(f"```{chr(10).join(chunk)}```")
                     chunk = []
-            if chunk:
+                    await asyncio.sleep(0)  # yield
+            if chunk and not (_stop_sending_global or _stop_sending_by_channel.get(ctx.channel.id)):
                 await ctx.send(f"```{chr(10).join(chunk)}```")
+                sent += 1
+        # невелика пауза, щоб не спамити і дати можливість зупинити
+        await asyncio.sleep(0.15)
 
-    await ctx.send(f"✅ Готово. Опубліковано відділень: {len(groups)}.")
+    # після завершення очистити стоп-флаг для цього каналу
+    _stop_sending_by_channel[ctx.channel.id] = False
+    _stop_sending_global = False
+
+    await ctx.send(f"✅ Готово. Опубліковано відділень: {sent}.")
 
 # ─── on_ready / on_message / session UI (existing logic preserved) ───────────
 @bot.event
@@ -448,3 +522,4 @@ if not TOKEN:
     print("DISCORD_TOKEN not set in environment")
 else:
     bot.run(TOKEN)
+```
