@@ -1,6 +1,5 @@
 # bot.py
-# Discord бот: імпорт mission.sqm та публікація відділень/слотів, із фільтрами та UI.
-# .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID (опц.), VTG_CHANNEL_ID (опц.), DEPLOY_HOOK_URL (опц.)
+# Discord бот: імпорт mission.sqm, фільтрація, вибір відділень по індексу, UI для слотів, статус/деплой/нагадування.
 
 import os
 import re
@@ -56,7 +55,7 @@ SLOT_KEYWORDS = [
     r'командир', r'командир відділен', r'командир сторони', r'командир екіпаж',
     r'пілот', r'оператор', r'наводчик', r'санитар', r'медик',
     r'гренадер', r'гранатометник', r'кулеметник', r'стрілець',
-    r'старший стрілець', r'механик-вод', r'снайпер', r'корегувальник'
+    r'старший стрілець', r'снайпер', r'корегувальник', r'механик-вод'
 ]
 SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', flags=re.IGNORECASE)
 
@@ -75,7 +74,7 @@ def is_noise(s: str) -> bool:
         "none","null","true","false",
         "army","default","platoon","standard","nochange",
         "uk","ukr","honor","capture_1","defaultred","standardred",
-        "відділення","ввідділення"
+        "відділення","ввідділення","everyone"
     }
     if low in noise_literals:
         return True
@@ -91,10 +90,6 @@ def is_noise(s: str) -> bool:
         return True
 
     if s.startswith("Male") and ("ENG" in s or "PER" in s or "RUS" in s):
-        return True
-
-    single_tech = {"mavicblue1","mavicred1","m113","m113a3","bmp","bmp-2","бмп-2","mt-лб","gaz-66","tigр","tigr"}
-    if low in single_tech:
         return True
 
     return False
@@ -127,7 +122,7 @@ def looks_like_code_block(s: str) -> bool:
         return True
     if re.search(r'\\n|\\r|\\t', s):
         return True
-    if re.search(r'[{}()\[\];=<>!|&\\]', s) and len(re.findall(r'[A-Za-zА-Яа-яЁёЇїІіЄєҐґ]', s)) < 5:
+    if re.search(r'[{}()\[\];=<>!|&\\]', s) and len(re.findall(r'[A-Za-zА-Яа-ЯЁёЇїІіЄєҐґ]', s)) < 5:
         return True
     return False
 
@@ -154,9 +149,6 @@ def dedupe_preserve_order(items: List[str], fuzzy_threshold: float = 0.78) -> Li
         merged = False
         for i, e in enumerate(out):
             if difflib.SequenceMatcher(None, s_norm.lower(), e.lower()).ratio() >= fuzzy_threshold:
-                def cyr(x): return len(re.findall(r'[\u0400-\u04FF]', x))
-                if cyr(s_norm) > cyr(e) or (cyr(s_norm) == cyr(e) and len(s_norm) > len(e)):
-                    out[i] = s_norm
                 merged = True
                 break
         if not merged:
@@ -222,13 +214,24 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             cur_slots.append(clean_line_for_slot(s))
 
     flush()
-    return groups
+
+    # прибрати дублікати заголовків
+    seen_titles = set()
+    unique_groups: List[Tuple[str, List[str]]] = []
+    for title, slots in groups:
+        t_norm = re.sub(r'\s{2,}', ' ', title).strip()
+        if t_norm in seen_titles:
+            continue
+        seen_titles.add(t_norm)
+        unique_groups.append((t_norm, slots))
+    return unique_groups
 
 # ─── UI helpers ─────────────────────────────────────────────────────────────
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
-    for i, (text, owner) in enumerate(zip(sess["lines"], sess.get("owners", [None]*len(sess["lines"])))):
+    owners = sess.get("owners", [None] * len(sess["lines"]))
+    for i, (text, owner) in enumerate(zip(sess["lines"], owners)):
         prefix = f"{i+1}. "
         if owner:
             lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
@@ -268,55 +271,6 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
-# ─── Claim flow (optional) ──────────────────────────────────────────────────
-class RemoveSlotModal(Modal):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(title="Причина звільнення")
-        self.sid, self.idx = sid, idx
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
-        self.add_item(self.reason)
-
-    async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
-        owner = sess["owners"][self.idx]
-        reason = self.reason.value
-        if not owner:
-            return await inter.response.send_message(f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True)
-        sess["owners"][self.idx] = None
-        ch = bot.get_channel(sess["channel_id"])
-        if ch:
-            try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except: pass
-        try:
-            await owner.send(f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
-        except: pass
-        await inter.response.send_message(f"✅ Слот #{self.idx+1} звільнено.", ephemeral=True)
-
-class RemoveSlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(label=str(idx+1), style=discord.ButtonStyle.danger, custom_id=f"remove-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        await inter.response.send_modal(RemoveSlotModal(self.sid, self.idx))
-
-class RemoveSlotView(View):
-    def __init__(self, sid: int):
-        super().__init__(timeout=None)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(RemoveSlotButton(sid, idx))
-
-@bot.command(name="зняти")
-async def зняти(ctx: commands.Context, session_msg_id: int):
-    if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
-    session = sessions.get(session_msg_id)
-    if not session:
-        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
-    await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
-
 # ─── Commands ───────────────────────────────────────────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context, filter_id: str = None):
@@ -353,10 +307,21 @@ async def імпорт_sqm(ctx: commands.Context, filter_id: str = None):
         logger.exception("Parser crashed")
         groups = []
 
-    # Якщо задано фільтр — відбираємо всі збіги по індексу (як окремий токен)
+    # Якщо задано фільтр — відбираємо всі збіги по індексу (як окремий токен) і прибираємо дублікати
     if filter_id:
         pattern = re.compile(rf'\b{re.escape(filter_id)}\b')
-        groups = [g for g in groups if pattern.search(g[0] or "")]
+        groups = [(t, s) for (t, s) in groups if pattern.search(t or "")]
+        # Прибрати дублікати ще раз (на випадок дрібних різниць)
+        seen = set()
+        filtered_unique = []
+        for title, slots in groups:
+            t_norm = re.sub(r'\s{2,}', ' ', title).strip()
+            if t_norm in seen:
+                continue
+            seen.add(t_norm)
+            filtered_unique.append((t_norm, slots))
+        groups = filtered_unique
+
         if not groups:
             _recent_imports.pop(key, None)
             return await ctx.send(f"⚠️ Не знайдено відділень з індексом {filter_id}.")
