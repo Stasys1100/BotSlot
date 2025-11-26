@@ -1,3 +1,4 @@
+# bot.py
 import os
 import re
 import subprocess
@@ -6,7 +7,7 @@ import datetime
 import io
 import zipfile
 from zoneinfo import ZoneInfo
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import discord
 from discord.ext import commands, tasks
@@ -34,13 +35,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─── 3. Конфігурація ────────────────────────────────────────────────────────────
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-VTG_CHANNEL_ID = 1160843618433630228
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or "1395065909185478769")
+VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 1160843618433630228)
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 1395065909185478769)
 
 processed_messages: set[int] = set()
-sessions: dict[int, dict] = {}
-claims: dict[tuple[int,int], list] = {}
-request_counter = 0
+sessions: dict[int, dict] = {}            # message_id → { title, lines, owners, channel_id }
+claims: dict[tuple[int,int], list] = {}   # (message_id, idx) → [User, ...]
+request_counter = 0                       # лічильник заявок
 
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
@@ -58,7 +59,7 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── 5. Генератор Embed для слотів ─────────────────────────────────────────────
+# ─── 5. Embed генератори ───────────────────────────────────────────────────────
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
@@ -80,192 +81,172 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
         embed.description = "— слотів не знайдено —"
     return embed
 
-# ─── 5.2 ПОКРАЩЕНИЙ RAP → текст декодер ────────────────────────────────────────
-def rap_to_text(data: bytes) -> str:
-    """
-    Покращений RAP декодер з кращою нормалізацією для парсингу.
-    """
-    text = data.decode("latin-1", errors="ignore")
+# ─── 6. Покращений RAP декодер ─────────────────────────────────────────────────
+def _normalize_whitespace(s: str) -> str:
+    s = re.sub(r'\r\n|\r', '\n', s)
+    s = re.sub(r'[ \t]+', ' ', s)
+    s = re.sub(r'\n[ \t]+', '\n', s)
+    s = re.sub(r'\n{3,}', '\n\n', s)
+    return s.strip()
 
-    def is_readable(ch: str) -> bool:
+def _clean_token(tok: str) -> str:
+    tok = tok.strip()
+    # видалити залишки байтових артефактів
+    tok = tok.replace('\x00', '').replace('\ufffd', '')
+    # замінити weird quotes
+    tok = tok.replace('“', '"').replace('”', '"').replace("’", "'").replace("‘", "'")
+    # видалити зайві символи, що часто з'являються у RAP
+    tok = re.sub(r'[\x01-\x1f\x7f-\x9f]', '', tok)
+    tok = tok.strip()
+    return tok
+
+def rap_to_text_aggressive(data: bytes) -> str:
+    """
+    Агресивний RAP → текст декодер:
+    - декодує як latin-1, utf-8 fallback
+    - фільтрує нечитаємі символи
+    - збирає великі фрагменти навколо ключових слів
+    - нормалізує синтаксис для парсера
+    """
+    # 1) Спроба utf-8, потім latin-1
+    try:
+        raw = data.decode('utf-8')
+        used = 'utf-8'
+    except Exception:
+        raw = data.decode('latin-1', errors='ignore')
+        used = 'latin-1'
+
+    # 2) Замінити непотрібні control-символи на пробіли
+    raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', raw)
+
+    # 3) Фільтрація: залишаємо читабельні блоки (ASCII, кирилиця, базова пунктуація)
+    def keep(ch):
         o = ord(ch)
-        return (32 <= o <= 126) or (0x00A0 <= o <= 0x04FF)
+        return (32 <= o <= 126) or (0x0400 <= o <= 0x04FF) or ch in '\n\r\t{}=;"\'.,:-_()[]/\\'
+    filtered = ''.join(ch if keep(ch) else ' ' for ch in raw)
 
-    # Фільтрація нечитаємих символів
-    filtered = "".join(ch if is_readable(ch) else " " for ch in text)
+    # 4) Знайти індекси ключових слів і збирати вікна
+    keywords = ['class Group', 'class Unit', 'groupName', 'unitName', 'description', 'name', 'title']
+    indices = []
+    for kw in keywords:
+        start = 0
+        while True:
+            idx = filtered.lower().find(kw.lower(), start)
+            if idx == -1:
+                break
+            indices.append(idx)
+            start = idx + len(kw)
 
-    # Агресивна нормалізація для покращення парсингу
-    normalized = filtered
-    
-    # Додаємо переноси рядків перед ключовими словами
-    normalized = re.sub(r'(\s+)(class\s+Group)', r'\n\2', normalized, flags=re.IGNORECASE)
-    normalized = re.sub(r'(\s+)(class\s+Unit)', r'\n\2', normalized, flags=re.IGNORECASE)
-    
-    # Нормалізуємо дужки
-    normalized = normalized.replace("};", "};\n")
-    normalized = normalized.replace("{", "{\n")
-    normalized = normalized.replace("}", "\n}")
-    
-    # Нормалізуємо крапку з комою
-    normalized = re.sub(r';(\s*[a-zA-Z])', r';\n\1', normalized)
-    
-    # Видаляємо множинні пробіли
-    normalized = re.sub(r'[ \t]+', ' ', normalized)
-    
-    # Видаляємо множинні порожні рядки
-    normalized = re.sub(r'\n\s*\n\s*\n+', '\n\n', normalized)
-    
-    return normalized
+    if indices:
+        window = 4000
+        frags = []
+        for idx in sorted(set(indices)):
+            s = max(0, idx - 300)
+            e = min(len(filtered), idx + window)
+            frags.append(filtered[s:e])
+        candidate = '\n'.join(frags)
+    else:
+        # якщо ключових слів немає — беремо весь фільтрований текст, але скорочуємо
+        candidate = filtered[:200000]
 
-# ─── 5.3 ПОКРАЩЕНИЙ парсер mission.sqm ─────────────────────────────────────────
-def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
+    # 5) Нормалізація синтаксису: перенос рядків після ; і };
+    candidate = candidate.replace('};', '};\n')
+    candidate = re.sub(r';\s*', ';\n', candidate)
+    candidate = re.sub(r'\{\s*', '{\n', candidate)
+    candidate = re.sub(r'\s*\}\s*', '\n}\n', candidate)
+
+    # 6) Очищення токенів
+    lines = [_clean_token(l) for l in candidate.splitlines()]
+    candidate = '\n'.join([l for l in lines if l.strip()])
+
+    # 7) Додаткові спрощення: замінити подвійні пробіли, нормалізувати лапки
+    candidate = _normalize_whitespace(candidate)
+    candidate = candidate.replace("= '", '="').replace("= '", '="').replace("= \"", '="')
+    candidate = candidate.replace("'", '"')
+
+    # 8) Додати заголовок, щоб парсер мав контекст
+    return f"// rap_decoded (encoding={used})\n{candidate}"
+
+# ─── 7. Гнучкий парсер mission.sqm ─────────────────────────────────────────────
+def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     """
-    Покращений парсер з більш гнучкими regex та фолбек-логікою.
-    """
-    groups: List[Tuple[str, List[str]]] = []
-    
-    # Спроба 1: Структурований парсинг
-    try:
-        groups = _structured_parse(text)
-        if groups:
-            return groups
-    except Exception:
-        pass
-    
-    # Спроба 2: Агресивний пошук фрагментів
-    try:
-        groups = _aggressive_parse(text)
-        if groups:
-            return groups
-    except Exception:
-        pass
-    
-    return groups
-
-def _structured_parse(text: str) -> List[Tuple[str, List[str]]]:
-    """
-    Структурований парсинг з гнучкими regex.
+    Гнучкий парсер:
+    - шукає повні блоки class Group { ... };
+    - якщо немає — шукає groupName/name/title і збирає unit-блоки поруч;
+    - фолбек — збирає всі unitName/description у тексті і групує по найближчому маркеру групи.
+    Повертає список (group_name, [slot1, slot2, ...]).
     """
     groups: List[Tuple[str, List[str]]] = []
-    current_group_name: Optional[str] = None
-    current_slots: List[str] = []
-    
-    # Більш гнучкі regex
-    re_group_start = re.compile(r'class\s+Group', re.IGNORECASE)
-    re_group_name = re.compile(
-        r'(name|groupName|description|title)\s*=\s*["\']?([^";\'}\n]+)["\']?\s*;',
-        re.IGNORECASE
-    )
-    re_unit_start = re.compile(r'class\s+Unit', re.IGNORECASE)
-    re_slot_desc = re.compile(
-        r'(description|unitName|text)\s*=\s*["\']?([^";\'}\n]+)["\']?\s*;',
-        re.IGNORECASE
-    )
-    
-    in_group = False
-    in_unit = False
-    brace_depth = 0
-    
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        
-        # Відстеження глибини дужок
-        brace_depth += stripped.count('{') - stripped.count('}')
-        
-        # Початок групи
-        if re_group_start.search(stripped):
-            if current_group_name is not None or current_slots:
-                groups.append((current_group_name or "Відділення", current_slots))
-            current_group_name = None
-            current_slots = []
-            in_group = True
-            in_unit = False
-            continue
-        
-        # Назва групи
-        if in_group and current_group_name is None:
-            m = re_group_name.search(stripped)
-            if m:
-                current_group_name = m.group(2).strip()
-                continue
-        
-        # Початок юніта
-        if re_unit_start.search(stripped):
-            in_unit = True
-            current_slots.append("Слот")
-            continue
-        
-        # Опис слота
-        if in_unit:
-            m = re_slot_desc.search(stripped)
-            if m:
-                val = m.group(2).strip()
-                if val and current_slots:
-                    current_slots[-1] = val
-                continue
-        
-        # Закриття блоку
-        if '};' in stripped or ('}' in stripped and brace_depth <= 0):
-            if in_unit:
-                in_unit = False
-            elif in_group:
-                in_group = False
-                if current_group_name is not None or current_slots:
-                    groups.append((current_group_name or "Відділення", current_slots))
-                current_group_name = None
-                current_slots = []
-    
-    # Додаємо останню групу
-    if current_group_name is not None or current_slots:
-        groups.append((current_group_name or "Відділення", current_slots))
-    
-    return groups
 
-def _aggressive_parse(text: str) -> List[Tuple[str, List[str]]]:
-    """
-    Агресивний пошук груп та слотів без строгої структури.
-    """
-    groups: List[Tuple[str, List[str]]] = []
-    
-    # Шукаємо всі можливі назви груп
-    group_names = []
-    for m in re.finditer(
-        r'(?:name|groupName|title)\s*=\s*["\']?([^";\'}\n]+)["\']?',
-        text,
-        flags=re.IGNORECASE
-    ):
-        name = m.group(1).strip()
-        if name and len(name) > 2:
-            group_names.append((m.start(), name))
-    
-    # Для кожної назви групи шукаємо слоти в околиці
-    for idx, (pos, gname) in enumerate(group_names):
-        # Визначаємо вікно пошуку (до наступної групи або 5000 символів)
-        end_pos = group_names[idx + 1][0] if idx + 1 < len(group_names) else pos + 5000
-        window = text[pos:min(end_pos, len(text))]
-        
-        # Шукаємо описи слотів
-        slots = []
-        for m in re.finditer(
-            r'(?:description|unitName|text)\s*=\s*["\']?([^";\'}\n]+)["\']?',
-            window,
-            flags=re.IGNORECASE
-        ):
-            slot_text = m.group(1).strip()
-            if slot_text and len(slot_text) > 1:
-                slots.append(slot_text)
-        
-        if slots:
-            groups.append((gname, slots[:25]))  # Обмежуємо 25 слотами
-    
-    return groups
+    # Нормалізувати лапки і пробіли
+    txt = text.replace('\r\n', '\n')
 
-# ─── 5.4 Витяг з PBO та читання вкладень ───────────────────────────────────────
+    # 1) Повні блоки class Group { ... };
+    group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
+    if group_blocks:
+        for blk in group_blocks:
+            # знайти назву групи
+            mname = re.search(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', blk, flags=re.IGNORECASE)
+            gname = mname.group("v").strip() if mname else "Відділення"
+            # знайти unit-блоки
+            units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
+            slots = []
+            for u in units:
+                mslot = re.search(r'(?:description|unitName|text)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
+                if mslot:
+                    slots.append(mslot.group("v").strip())
+                else:
+                    # інколи роль вказана як name = "..."
+                    mslot2 = re.search(r'(?:name)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
+                    slots.append(mslot2.group("v").strip() if mslot2 else "Слот")
+            groups.append((gname, slots))
+        return groups
+
+    # 2) Якщо немає блоків — шукати groupName/name/title і брати unitName/description поруч
+    for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', txt, flags=re.IGNORECASE):
+        gname = m.group("v").strip()
+        start = m.end()
+        frag = txt[start:start + 30000]  # вікно 30k символів
+        units = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', frag, flags=re.IGNORECASE)
+        if units:
+            groups.append((gname, [u.strip() for u in units]))
+
+    if groups:
+        return groups
+
+    # 3) Фолбек: знайти всі unitName/description у тексті і згрупувати
+    unit_matches = [(m.start(), m.group("v").strip()) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', txt, flags=re.IGNORECASE)]
+    group_markers = [(m.start(), m.group(0)) for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)', txt, flags=re.IGNORECASE)]
+    if unit_matches:
+        if not group_markers:
+            return [("Відділення", [u for _, u in unit_matches])]
+        # групуємо по найближчому попередньому маркеру
+        grouped: Dict[int, List[str]] = {}
+        marker_positions = [pos for pos, _ in group_markers]
+        for pos, uname in unit_matches:
+            # знайти останній маркер перед pos
+            prev_positions = [p for p in marker_positions if p <= pos]
+            key = max(prev_positions) if prev_positions else -1
+            grouped.setdefault(key, []).append(uname)
+        for key, slots in grouped.items():
+            if key == -1:
+                gname = "Відділення"
+            else:
+                # знайти ім'я групи в околі ключа
+                snippet = txt[key:key+200]
+                mname = re.search(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', snippet, flags=re.IGNORECASE)
+                gname = mname.group("v").strip() if mname else "Відділення"
+            groups.append((gname, slots))
+        return groups
+
+    # 4) Нічого не знайдено
+    return []
+
+# ─── 8. Витяг з PBO та читання вкладень ───────────────────────────────────────
 def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
     """
     Повертає raw bytes mission.sqm з PBO або None.
+    Використовує пакет pbo якщо встановлено, інакше zip-фолбек.
     """
     if pbo:
         try:
@@ -288,22 +269,25 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
 
 async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Повертає (text, method).
+    Повертає (text, method):
+    - Якщо .pbo → бере mission.sqm (raw bytes) і декодує;
+    - Якщо .sqm → визначає RAP або текст і повертає текст для парсингу.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
-    # .pbo: витягнути mission.sqm
+    # .pbo: витягнути mission.sqm (raw bytes)
     if filename.endswith(".pbo"):
         sqm_raw = extract_mission_from_pbo_bytes(data)
         if not sqm_raw:
-            text = rap_to_text(data)
+            # Якщо не знайшли явно — пробуємо декодувати як RAP фрагменти з самого PBO
+            text = rap_to_text_aggressive(data)
             return text, "pbo-rap-fragments"
-        
+        # Якщо знайдено raw mission.sqm — визначаємо формат
         if sqm_raw[:3] == b'raP':
-            text = rap_to_text(sqm_raw)
+            text = rap_to_text_aggressive(sqm_raw)
             return text, "pbo-rap"
-        
+        # Інакше — пробуємо стандартні кодування
         for enc in ("utf-8", "cp1251", "latin-1"):
             try:
                 return sqm_raw.decode(enc), f"pbo-{enc}"
@@ -314,7 +298,7 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
     # .sqm: визначити RAP чи текст
     if filename.endswith(".sqm"):
         if data[:3] == b'raP':
-            text = rap_to_text(data)
+            text = rap_to_text_aggressive(data)
             return text, "rap"
         for enc in ("utf-8", "cp1251", "latin-1"):
             try:
@@ -323,9 +307,9 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
                 continue
         return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
-    # інші файли
+    # інші файли: фолбек
     if data[:3] == b'raP':
-        return rap_to_text(data), "rap-raw"
+        return rap_to_text_aggressive(data), "rap-raw"
     for enc in ("utf-8", "cp1251", "latin-1"):
         try:
             return data.decode(enc), enc
@@ -333,7 +317,7 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
             continue
     return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
-# ─── 6-7. SlotButton, SlotView, Claim система (без змін) ───────────────────────
+# ─── 9. SlotButton та SlotView ─────────────────────────────────────────────────
 class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
         owner = sessions[sid]["owners"][idx]
@@ -378,6 +362,7 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
+# ─── 10. Інші UI класи та команди (Claim, Assign, Remove) — без змін ──────────
 class ClaimSlotButton(Button):
     def __init__(self, sid: int, idx: int):
         super().__init__(
@@ -548,71 +533,108 @@ class ClaimDecisionView(View):
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, True))
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, False))
 
-# ─── 8. ПОКРАЩЕНА команда імпорту mission.sqm / .pbo ───────────────────────────
+# ─── 11. Команда імпорту mission.sqm / .pbo з діагностикою ────────────────────
 @bot.command(name="імпорт_sqm")
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
-
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
 
     attachment = ctx.message.attachments[0]
-    
-    await ctx.send("⏳ Обробка файлу...")
-
     try:
         text, method = await read_attachment_sqm_text(attachment)
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # Зберігаємо декодований текст для діагностики
-    debug_path = f"/tmp/decoded_{attachment.filename}.txt"
-    try:
-        with open(debug_path, "w", encoding="utf-8") as f:
-            f.write(text)
-        await ctx.send(f"🔍 Декодований текст збережено: `{debug_path}` (метод: **{method}**)")
-    except Exception:
-        pass
+    # 1) Основний парсер
+    groups = parse_mission_sqm_flexible(text)
 
-    groups = parse_mission_sqm(text)
-    
+    # 2) Якщо нічого — додаткові фолбеки: простий пошук по ключовим словам
+    diagnostics = {
+        "method": method,
+        "found_groups": 0,
+        "found_unit_tokens": 0,
+        "sample_fragments": []
+    }
+
     if not groups:
-        preview = "\n".join(text.splitlines()[:50])[:2000]
-        await ctx.send(
-            f"⚠️ Відділення у mission.sqm не знайдено.\n"
-            f"Метод обробки: **{method}**\n"
-            f"Розмір тексту: {len(text)} символів\n"
-            f"Рядків: {len(text.splitlines())}\n\n"
-            f"Прев'ю початку файлу:"
-        )
-        await ctx.send(f"```\n{preview}\n```")
+        # знайти всі unitName/description/text
+        unit_tokens = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', text, flags=re.IGNORECASE)
+        diagnostics["found_unit_tokens"] = len(unit_tokens)
+        # знайти маркери груп
+        group_markers = re.findall(r'(?:class\s+Group\b|groupName|name|title)', text, flags=re.IGNORECASE)
+        # простий фолбек: якщо є groupName і unit_tokens — агрегувати
+        if group_markers and unit_tokens:
+            # знайти перші 10 groupName occurrences and take following unit tokens windows
+            groups = []
+            for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', text, flags=re.IGNORECASE):
+                gname = m.group("v").strip()
+                frag = text[m.end(): m.end() + 20000]
+                units = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', frag, flags=re.IGNORECASE)
+                if units:
+                    groups.append((gname, [u.strip() for u in units]))
+            diagnostics["found_groups"] = len(groups)
+        else:
+            # агресивний фрагментний пошук: зібрати фрагменти навколо ключових слів для діагностики
+            for kw in ["class Group", "class Unit", "groupName", "unitName", "description", "name"]:
+                idx = text.lower().find(kw.lower())
+                if idx != -1:
+                    s = max(0, idx - 200)
+                    e = min(len(text), idx + 800)
+                    diagnostics["sample_fragments"].append(text[s:e])
+            # якщо unit_tokens є — повернути їх як одна група
+            if unit_tokens:
+                groups = [("Відділення", [u.strip() for u in unit_tokens])]
+                diagnostics["found_groups"] = 1
+
+    else:
+        diagnostics["found_groups"] = len(groups)
+        # підрахувати unit tokens
+        diagnostics["found_unit_tokens"] = sum(len(slots) for _, slots in groups)
+
+    # 3) Якщо все ще нічого — повернути діагностику
+    if not groups:
+        preview = "\n".join(text.splitlines()[:60])[:1900]
+        emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.orange())
+        emb.add_field(name="Метод обробки", value=diagnostics["method"], inline=False)
+        emb.add_field(name="Знайдено unit tokens", value=str(diagnostics["found_unit_tokens"]), inline=True)
+        emb.add_field(name="Знайдено груп (фолбек)", value=str(diagnostics["found_groups"]), inline=True)
+        if diagnostics["sample_fragments"]:
+            emb.add_field(name="Приклади фрагментів", value=diagnostics["sample_fragments"][0][:1000], inline=False)
+        emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
+        await ctx.send(embed=emb)
         return
 
+    # 4) Відправити знайдені групи як embed-и
     target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
     if not target_ch:
         return await ctx.send("❌ Адмін-канал не знайдено за ID.")
 
     sent_count = 0
-    total_slots = 0
-    
     for group_name, slot_list in groups:
-        embed = build_group_embed(group_name, slot_list[:25])
+        # очистити слоти від артефактів
+        cleaned_slots = []
+        for s in slot_list:
+            s2 = _clean_token(s)
+            # якщо рядок містить шлях до файлу або клас юніта — спробувати спростити
+            s2 = re.sub(r'\\+', '/', s2)
+            s2 = re.sub(r'\.sqf\b', '', s2, flags=re.IGNORECASE)
+            s2 = s2.strip()
+            if not s2:
+                s2 = "Слот"
+            cleaned_slots.append(s2)
+        embed = build_group_embed(group_name, cleaned_slots[:25])
         try:
             await target_ch.send(embed=embed)
             sent_count += 1
-            total_slots += len(slot_list[:25])
-        except Exception as e:
-            await ctx.send(f"⚠️ Помилка відправки групи '{group_name}': {e}")
+        except Exception:
+            pass
 
-    await ctx.send(
-        f"✅ Імпорт завершено!\n"
-        f"📊 Знайдено відділень: **{sent_count}**\n"
-        f"🎯 Всього слотів: **{total_slots}**\n"
-        f"🔧 Метод обробки: **{method}**"
-    )
+    # 5) Відправити коротку діагностику в канал виклику
+    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод обробки: `{method}`. Знайдено слотів: {sum(len(slots) for _, slots in groups)}.")
 
-# ─── 9. Події on_ready та on_message ────────────────────────────────────────────
+# ─── 12. on_ready та on_message ────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
@@ -675,7 +697,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# ─── 10. Сервісні команди ───────────────────────────────────────────────────────
+# ─── 13. Сервісні команди ───────────────────────────────────────────────────────
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
@@ -698,10 +720,10 @@ async def _gitpush(ctx: commands.Context):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
     emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
     emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
+    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
     emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── 11. Запуск бота ─────────────────────────────────────────────────────────────
+# ─── 14. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
