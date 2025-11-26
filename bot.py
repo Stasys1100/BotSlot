@@ -22,6 +22,16 @@ try:
 except Exception:
     pass
 
+# Optional encoding detector libraries
+try:
+    from charset_normalizer import from_bytes as cn_from_bytes  # pip install charset-normalizer
+except Exception:
+    cn_from_bytes = None
+try:
+    import chardet  # pip install chardet
+except Exception:
+    chardet = None
+
 # ─── ENV / INIT ───────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -57,7 +67,7 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── Helpers: whitespace, mojibake fix, structured text extraction, cleaning ──
+# ─── Utilities: whitespace, encoding detection, mojibake fixes, structured text ─
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
@@ -65,87 +75,104 @@ def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\n{3,}', '\n\n', s)
     return s.strip()
 
-def _try_fix_mojibake_from_bytes(original_bytes: bytes, decoded_text: str) -> Tuple[str, str]:
+def detect_encoding_bytes(b: bytes) -> Optional[str]:
     """
-    Якщо decoded_text містить ознаки mojibake (символи 'Ð' або 'Р' або 'Ã'),
-    спробувати повторно декодувати original_bytes іншими енкодингами (cp1251, utf-8),
-    і повернути найкращий варіант разом з позначкою енкодингу.
-    Повертає (best_text, encoding_used).
+    Try to detect encoding using charset_normalizer or chardet.
+    Returns encoding name or None.
     """
-    if not decoded_text:
-        candidates = []
+    if cn_from_bytes:
         try:
-            t = original_bytes.decode('cp1251', errors='replace')
-            candidates.append(('cp1251', t))
-        except:
+            results = cn_from_bytes(b)
+            if results:
+                best = results.best()
+                if best and best.encoding:
+                    return best.encoding.lower()
+        except Exception:
             pass
+    if chardet:
         try:
-            t = original_bytes.decode('utf-8', errors='replace')
-            candidates.append(('utf-8', t))
-        except:
+            res = chardet.detect(b)
+            enc = res.get('encoding')
+            if enc:
+                return enc.lower()
+        except Exception:
             pass
-        return (candidates[0][1], candidates[0][0]) if candidates else (decoded_text, 'unknown')
+    return None
 
-    # швидка перевірка на ознаки mojibake
-    if 'Ð' not in decoded_text and 'Р' not in decoded_text and 'Ã' not in decoded_text:
-        return decoded_text, 'as-decoded'
+def _cyrillic_score(s: str) -> int:
+    return len(re.findall(r'[\u0400-\u04FF]', s))
 
-    candidates = [('as-decoded', decoded_text)]
+def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[str, str]:
+    """
+    Given original bytes and an initial decoded text, try multiple decoding strategies
+    and return the best candidate (text, encoding_label) based on cyrillic score.
+    Strategies include:
+      - initial as-decoded
+      - decode bytes as cp1251, koi8-r, utf-8, latin-1
+      - re-encode initial as latin-1 then decode as utf-8 (common mojibake fix)
+    """
+    candidates: List[Tuple[str, str]] = []
+    if initial_text is not None:
+        candidates.append((initial_text, "as-decoded"))
+
+    tried_encs = ["utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"]
+    for enc in tried_encs:
+        try:
+            txt = original_bytes.decode(enc, errors="replace")
+            candidates.append((txt, enc))
+        except Exception:
+            pass
+
+    # mojibake pattern: initial_text was decoded with wrong encoding -> re-encode/ decode
     try:
-        t = original_bytes.decode('cp1251', errors='replace')
-        candidates.append(('cp1251', t))
-    except:
+        redecoded = initial_text.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
+        candidates.append((redecoded, "latin1->utf8"))
+    except Exception:
         pass
     try:
-        t = original_bytes.decode('utf-8', errors='replace')
-        candidates.append(('utf-8', t))
-    except:
-        pass
-    try:
-        t = decoded_text.encode('latin-1', errors='replace').decode('utf-8', errors='replace')
-        candidates.append(('latin1->utf8', t))
-    except:
+        redecoded = initial_text.encode("latin-1", errors="replace").decode("cp1251", errors="replace")
+        candidates.append((redecoded, "latin1->cp1251"))
+    except Exception:
         pass
 
-    def cyr_score(x: str) -> int:
-        return len(re.findall(r'[\u0400-\u04FF]', x))
+    # scoring: prefer candidate with most Cyrillic letters and reasonable printable ratio
+    def score(item: Tuple[str, str]) -> Tuple[int, float]:
+        txt, _ = item
+        cyr = _cyrillic_score(txt)
+        printable = sum(1 for ch in txt if ch.isprintable()) / max(1, len(txt))
+        return (cyr, printable)
 
-    best_enc, best_text = max(candidates, key=lambda it: cyr_score(it[1]))
-    return best_text, best_enc
+    best = max(candidates, key=score)
+    return best[0], best[1]
 
 def extract_structured_text(raw: str) -> str:
     """
-    Витягує inner text з <t ...>...</t> (усі вхождення), декодує HTML-ентіті,
-    видаляє інші теги і control-символи. Якщо парних тегів немає — прибирає відкривальні теги.
+    Extract inner text from <t ...>...</t> tags (all occurrences), decode HTML entities,
+    remove other tags and control characters. If no paired tags exist, remove opening tags.
     """
     if not raw:
         return ""
     s = html.unescape(raw)
-    # знайти всі парні теги <t ...>...</t> і склеїти їхній innerText
     chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
     if chunks:
         inner = " ".join(chunks)
         inner = re.sub(r'<[^>]+>', ' ', inner)
         inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
         inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
-        # можливо тут ще mojibake — спробуємо виправити, але без байтів
-        inner_fixed, _ = _try_fix_mojibake_from_bytes(inner.encode('latin-1', errors='replace'), inner)
-        return inner_fixed
-    # якщо парних тегів немає — видалити відкривальні/закривальні теги як шум
+        return inner
     s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'</\s*t\s*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'<[^>]+>', ' ', s)
     s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
-    s_fixed, _ = _try_fix_mojibake_from_bytes(s.encode('latin-1', errors='replace'), s)
-    return s_fixed
+    return s
 
 def clean_slot_value(raw: str) -> str:
     """
-    Агресивне очищення одного токена:
-    - витягує inner text з тегів;
-    - прибирає шляхи, .sqf/.pbo, довгі аддон-шляхи, control-символи;
-    - якщо результат порожній або очевидно шумний — повертає 'Слот'.
+    Aggressive cleaning of a single token:
+    - extract inner text from <t ...> tags
+    - remove paths, .sqf/.pbo, long addon paths, control chars
+    - if result is empty or obviously noisy, return 'Слот'
     """
     if raw is None:
         return "Слот"
@@ -154,43 +181,55 @@ def clean_slot_value(raw: str) -> str:
     s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\bhttps?://\S+\b', '', s)
-    s = re.sub(r'\b[A-Za-z0-9_\\/:.-]{40,}\b', ' ', s)  # довгі шляхи/рядки
+    s = re.sub(r'\b[A-Za-z0-9_\\/:.-]{40,}\b', ' ', s)  # long paths/strings
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
     if not s or s.lower().startswith("<t color") or s in {'"', "'"}:
         return "Слот"
     return s or "Слот"
 
-# ─── RAP decoder (агресивний, з підтримкою cp1251 та mojibake-fix) ──────────
+# ─── RAP decoder with robust encoding handling ─────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
     """
-    Heuristic RAP decoder:
-    - пробує utf-8, cp1251, latin-1 (в такому порядку);
-    - якщо після декодування є mojibake — пробує інші декоди на оригінальних байтах;
-    - нормалізує результат для парсера.
-    Повертає рядок з префіксом, який вказує обраний encoding.
+    Decode RAP-like bytes into text with robust encoding heuristics:
+    - try detector (charset_normalizer/chardet) first
+    - try utf-8, cp1251, latin-1, koi8-r
+    - apply re-decode mojibake fixes and pick best candidate by Cyrillic score
+    - normalize and return text prefixed with chosen encoding label
     """
-    tried = None
-    text = None
-    for enc in ("utf-8", "cp1251", "latin-1"):
+    detected = detect_encoding_bytes(data)
+    initial_text = None
+    tried_label = "unknown"
+
+    # If detector suggests encoding, try it first
+    if detected:
         try:
-            text = data.decode(enc)
-            tried = enc
-            break
+            initial_text = data.decode(detected, errors="replace")
+            tried_label = detected
         except Exception:
-            continue
-    if text is None:
-        text = data.decode("latin-1", errors="ignore")
-        tried = "latin-1"
+            initial_text = None
 
-    fixed_text, fixed_enc = _try_fix_mojibake_from_bytes(data, text)
-    if fixed_enc and fixed_enc != 'as-decoded':
-        tried = fixed_enc
-        text = fixed_text
-    else:
-        text = fixed_text
+    # If detector failed, try common encodings in order
+    if initial_text is None:
+        for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
+            try:
+                initial_text = data.decode(enc, errors="replace")
+                tried_label = enc
+                break
+            except Exception:
+                continue
+    if initial_text is None:
+        initial_text = data.decode("latin-1", errors="replace")
+        tried_label = "latin-1-fallback"
 
+    # Try re-decode strategies and pick best
+    best_text, best_enc = _try_redecode_candidates(data, initial_text)
+    if best_enc and best_enc != "as-decoded":
+        tried_label = best_enc
+
+    text = best_text
+
+    # sanitize control characters and normalize
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', text)
-
     def keep(ch):
         o = ord(ch)
         return (32 <= o <= 126) or (0x0400 <= o <= 0x04FF) or ch in '\n\r\t{}=;"\'.,:-_()[]/\\<>|'
@@ -229,20 +268,14 @@ def rap_to_text_aggressive(data: bytes) -> str:
     candidate = '\n'.join(lines)
     candidate = _normalize_whitespace(candidate)
     candidate = candidate.replace("'", '"')
-    return f"// rap_decoded (encoding={tried})\n{candidate}"
+    return f"// rap_decoded (encoding={tried_label})\n{candidate}"
 
 # ─── Flexible parser with DOTALL and fallbacks ────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
-    """
-    Повертає список (group_name, [slot1, slot2, ...])
-    1) шукає повні 'class Group { ... };' блоки (DOTALL)
-    2) інакше — groupName/name/title + вікно unit-токенів (DOTALL)
-    3) фолбек — всі unitName/description/text згруповані по маркерах
-    """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
 
-    # 1) Повні блоки class Group
+    # 1) full class Group blocks
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -295,7 +328,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     if groups:
         return groups
 
-    # 3) Фолбек: зібрати всі unit-токени і згрупувати по маркерах
+    # 3) fallback: collect all unit tokens and group by markers
     unit_matches = [(m.start(), clean_slot_value(m.group(1))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
     group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)\s*=', txt, flags=re.IGNORECASE)]
     if unit_matches:
@@ -320,9 +353,8 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
 
     return []
 
-# ─── PBO extraction & attachment reading ───────────────────────────────────────
+# ─── PBO extraction & attachment reading with robust encoding heuristics ─────
 def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
-    # optional pbo library support; fallback to zip
     try:
         import pbo as pbo_lib
     except Exception:
@@ -346,26 +378,45 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
 
 async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Читає вкладення (.pbo або .sqm) і повертає (text, method).
-    Спроби декодування: utf-8 -> cp1251 -> latin-1.
-    Якщо після декодування є ознаки mojibake — пробує інші декоди на оригінальних байтах.
+    Read attachment (.pbo or .sqm) and return (text, method).
+    Uses detector and multiple decode strategies, picks best candidate by Cyrillic score.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
-    def try_decodes_from_bytes(b: bytes) -> Tuple[str, str]:
-        for enc in ("utf-8", "cp1251", "latin-1"):
+    def try_decode_bytes(b: bytes) -> Tuple[str, str]:
+        # detector suggestion
+        detected = detect_encoding_bytes(b)
+        candidates: List[Tuple[str, str]] = []
+        if detected:
             try:
-                txt = b.decode(enc)
-                fixed_txt, fixed_enc = _try_fix_mojibake_from_bytes(b, txt)
-                if fixed_enc != 'as-decoded':
-                    return fixed_txt, fixed_enc
-                return txt, enc
+                txt = b.decode(detected, errors="replace")
+                candidates.append((txt, detected))
             except Exception:
-                continue
-        txt = b.decode("latin-1", errors="ignore")
-        fixed_txt, fixed_enc = _try_fix_mojibake_from_bytes(b, txt)
-        return (fixed_txt, fixed_enc if fixed_enc != 'as-decoded' else "latin-1-fallback")
+                pass
+        # try common encodings
+        for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
+            try:
+                txt = b.decode(enc, errors="replace")
+                candidates.append((txt, enc))
+            except Exception:
+                pass
+        # try mojibake fixes from first candidate if exists
+        if candidates:
+            base_txt = candidates[0][0]
+            try:
+                t = base_txt.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
+                candidates.append((t, "latin1->utf8"))
+            except Exception:
+                pass
+            try:
+                t = base_txt.encode("latin-1", errors="replace").decode("cp1251", errors="replace")
+                candidates.append((t, "latin1->cp1251"))
+            except Exception:
+                pass
+        # score and pick best
+        best = max(candidates, key=lambda it: (_cyrillic_score(it[0]), sum(1 for ch in it[0] if ch.isprintable())/max(1,len(it[0]))))
+        return best
 
     if filename.endswith(".pbo"):
         sqm_raw = extract_mission_from_pbo_bytes(data)
@@ -375,19 +426,19 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
         if sqm_raw[:3] == b'raP':
             text = rap_to_text_aggressive(sqm_raw)
             return text, "pbo-rap"
-        text, enc = try_decodes_from_bytes(sqm_raw)
+        text, enc = try_decode_bytes(sqm_raw)
         return text, f"pbo-{enc}"
 
     if filename.endswith(".sqm"):
         if data[:3] == b'raP':
             text = rap_to_text_aggressive(data)
             return text, "rap"
-        text, enc = try_decodes_from_bytes(data)
+        text, enc = try_decode_bytes(data)
         return text, enc
 
     if data[:3] == b'raP':
         return rap_to_text_aggressive(data), "rap-raw"
-    text, enc = try_decodes_from_bytes(data)
+    text, enc = try_decode_bytes(data)
     return text, enc
 
 # ─── Import command with extended diagnostics ──────────────────────────────────
@@ -404,7 +455,7 @@ async def імпорт_sqm(ctx: commands.Context):
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # --- ДІАГНОСТИКА: перші raw-захоплення різними regex-ами ---
+    # Diagnostics: capture examples
     raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
@@ -450,10 +501,10 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
-    # --- основний парсинг ---
+    # Parse
     groups = parse_mission_sqm_flexible(text)
 
-    # фолбек: зібрати всі unit-токени
+    # fallback: collect all unit tokens
     if not groups:
         units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
         if not units:
@@ -747,7 +798,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
+        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
