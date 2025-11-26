@@ -6,6 +6,7 @@ import aiohttp
 import datetime
 import io
 import zipfile
+import html
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Dict
 
@@ -13,31 +14,30 @@ import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
-# keep_alive is optional; if you use it, keep it. Otherwise remove.
+
+# Optional keep-alive (remove if unused)
 try:
     from keep_alive import keep_alive
     keep_alive()
 except Exception:
     pass
 
-# Optional PBO library (if installed on host). If not installed — pbo = None
+# Optional PBO library (if installed). If not — pbo = None
 try:
     import pbo
 except Exception:
     pbo = None
 
-# ─── ENV ───────────────────────────────────────────────────────────────────────
+# ─── ENV / INIT ───────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 
-# ─── Bot init ──────────────────────────────────────────────────────────────────
 intents = discord.Intents.default()
 intents.guilds = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ─── Config ───────────────────────────────────────────────────────────────────
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 1160843618433630228)
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 1395065909185478769)
@@ -51,7 +51,7 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
-# ─── Reminder ─────────────────────────────────────────────────────────────────
+# ─── Reminder ────────────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
@@ -64,18 +64,6 @@ async def vtg_reminder():
                 pass
 
 # ─── Embeds ───────────────────────────────────────────────────────────────────
-def build_embed(sess: dict) -> discord.Embed:
-    embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
-    lines = []
-    for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-        prefix = f"{i+1}. "
-        if owner:
-            lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
-        else:
-            lines.append(f"{prefix}{text}")
-    embed.description = "\n".join(lines)
-    return embed
-
 def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
     embed = discord.Embed(title=title or "Відділення", color=discord.Color.blurple())
     if slots:
@@ -85,7 +73,7 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
         embed.description = "— слотів не знайдено —"
     return embed
 
-# ─── Utilities: cleaning & normalization ────────────────────────────────────────
+# ─── Utilities: cleaning, HTML stripping, normalization ────────────────────────
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
@@ -93,35 +81,53 @@ def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\n{3,}', '\n\n', s)
     return s.strip()
 
+def _strip_html_tags(s: str) -> str:
+    # remove tags like <t color='#fff'>text</t> or <t color=...> and keep inner text
+    s = re.sub(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', r'\1', s, flags=re.IGNORECASE | re.DOTALL)
+    # remove any remaining tags
+    s = re.sub(r'<[^>]+>', ' ', s)
+    return s
+
 def _clean_token(tok: str) -> str:
+    if not tok:
+        return "Слот"
     tok = tok.strip()
-    tok = tok.replace('\x00', '').replace('\ufffd', '')
-    tok = tok.replace('“', '"').replace('”', '"').replace("’", "'").replace("‘", "'")
-    tok = re.sub(r'[\x01-\x1f\x7f-\x9f]', '', tok)
-    tok = tok.strip()
-    # remove common file suffixes and paths
-    tok = re.sub(r'\\+', '/', tok)
+    # decode HTML entities
+    tok = html.unescape(tok)
+    # strip HTML tags and attributes
+    tok = _strip_html_tags(tok)
+    # remove control chars
+    tok = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', tok)
+    # normalize slashes and remove file suffixes
+    tok = tok.replace('\\', '/')
     tok = re.sub(r'\.sqf\b', '', tok, flags=re.IGNORECASE)
     tok = re.sub(r'\.pbo\b', '', tok, flags=re.IGNORECASE)
-    tok = re.sub(r'\bhttps?://\S+\b', '', tok)
+    # remove long addon paths or repeated commas
+    tok = re.sub(r'\b[A-Za-z0-9_\\/:.-]{30,}\b', '', tok)
     tok = re.sub(r'\s{2,}', ' ', tok)
-    return tok.strip() or "Слот"
+    tok = tok.strip(' "\'')
+    # if token looks like a class name (B_Soldier_AR_F) — keep as-is but replace underscores with spaces optionally
+    # keep original class names but make them readable
+    if re.match(r'^[A-Za-z0-9_]+$', tok) and '_' in tok:
+        tok = tok.replace('_', ' ')
+    return tok or "Слот"
 
-# ─── Aggressive RAP decoder ───────────────────────────────────────────────────
+# ─── Aggressive RAP -> text decoder ───────────────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
     """
-    Aggressive RAP -> text heuristic:
-    - try utf-8, fallback to latin-1
-    - remove control chars, keep readable set
+    Heuristic RAP decoder:
+    - try utf-8 then latin-1
+    - remove control chars
+    - keep readable characters
     - collect windows around keywords
-    - normalize syntax for parser
+    - normalize separators for parser
     """
     try:
         raw = data.decode('utf-8')
-        used = 'utf-8'
+        enc = 'utf-8'
     except Exception:
         raw = data.decode('latin-1', errors='ignore')
-        used = 'latin-1'
+        enc = 'latin-1'
 
     raw = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', raw)
 
@@ -131,8 +137,8 @@ def rap_to_text_aggressive(data: bytes) -> str:
     filtered = ''.join(ch if keep(ch) else ' ' for ch in raw)
 
     keywords = ['class Group', 'class Unit', 'groupName', 'unitName', 'description', 'name', 'title']
-    indices = []
     low = filtered.lower()
+    indices = []
     for kw in keywords:
         start = 0
         k = kw.lower()
@@ -159,20 +165,27 @@ def rap_to_text_aggressive(data: bytes) -> str:
     candidate = re.sub(r'\{\s*', '{\n', candidate)
     candidate = re.sub(r'\s*\}\s*', '\n}\n', candidate)
 
-    lines = [_clean_token(l) for l in candidate.splitlines()]
-    candidate = '\n'.join([l for l in lines if l.strip()])
-
+    # clean lines and tokens
+    lines = [line.strip() for line in candidate.splitlines()]
+    lines = [re.sub(r'\s{2,}', ' ', l) for l in lines if l.strip()]
+    candidate = '\n'.join(lines)
     candidate = _normalize_whitespace(candidate)
     candidate = candidate.replace("'", '"')
+    return f"// rap_decoded (encoding={enc})\n{candidate}"
 
-    return f"// rap_decoded (encoding={used})\n{candidate}"
-
-# ─── Flexible parser ──────────────────────────────────────────────────────────
+# ─── Flexible parser with tolerant regexes and HTML cleanup ──────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
+    """
+    Returns list of (group_name, [slot1, slot2, ...])
+    Steps:
+    1) try to find full 'class Group { ... };' blocks
+    2) if none, find groupName/name/title and collect unit tokens in a window
+    3) fallback: collect all unitName/description/text tokens and group by nearest group marker
+    """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
 
-    # 1) full class Group blocks
+    # 1) full class Group blocks (DOTALL)
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -181,12 +194,22 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
             slots = []
             for u in units:
+                # try description/unitName/text first
                 mslot = re.search(r'(?:description|unitName|text)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
                 if mslot:
                     slots.append(_clean_token(mslot.group("v")))
+                    continue
+                # fallback: name inside unit
+                mslot2 = re.search(r'(?:name)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
+                if mslot2:
+                    slots.append(_clean_token(mslot2.group("v")))
+                    continue
+                # last resort: try to extract any quoted text
+                q = re.search(r'"([^"]{2,200})"', u)
+                if q:
+                    slots.append(_clean_token(q.group(1)))
                 else:
-                    mslot2 = re.search(r'(?:name)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
-                    slots.append(_clean_token(mslot2.group("v")) if mslot2 else "Слот")
+                    slots.append("Слот")
             groups.append((gname, slots))
         return groups
 
@@ -283,140 +306,7 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
             continue
     return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
-# ─── UI: Slot buttons and views ────────────────────────────────────────────────
-class SlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        owner = sessions[sid]["owners"][idx]
-        free = owner is None
-        label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
-        style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
-        super().__init__(label=label, style=style, custom_id=f"slot-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        owner = sess["owners"][self.idx]
-        ch_id = sess["channel_id"]
-
-        if owner is None:
-            for s in sessions.values():
-                if s["channel_id"] == ch_id and user in s["owners"]:
-                    return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
-            sess["owners"][self.idx] = user
-            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
-
-        if owner == user:
-            sess["owners"][self.idx] = None
-            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
-
-        return await inter.response.send_message(f"⚠️ Цей слот зайнято {owner.mention}.", view=ClaimSlotView(self.sid, self.idx), ephemeral=True)
-
-class SlotView(View):
-    def __init__(self, sid: int):
-        super().__init__(timeout=None)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(SlotButton(sid, idx))
-
-# ─── Claim/Assign/Remove UI (kept concise) ────────────────────────────────────
-class ClaimSlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(label="❗ Претендувати", style=discord.ButtonStyle.primary, custom_id=f"claim-slot-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        for s in sessions.values():
-            if s["channel_id"] == sess["channel_id"] and user in s["owners"]:
-                return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
-        key = (self.sid, self.idx)
-        lst = claims.setdefault(key, [])
-        if user in lst:
-            return await inter.response.send_message("ℹ️ Ви вже подали заявку.", ephemeral=True)
-        lst.append(user)
-        await inter.response.send_message("✅ Заявка прийнята.", ephemeral=True)
-        global request_counter
-        request_counter += 1
-        embed = discord.Embed(title=f"📝 Заявка #{request_counter}", description=sess["title"], color=discord.Color.orange())
-        embed.add_field(name="Слот #", value=str(self.idx+1), inline=True)
-        embed.add_field(name="Власник", value=(sess["owners"][self.idx].mention if sess["owners"][self.idx] else "Вільний"), inline=True)
-        embed.add_field(name="Кандидат", value=user.mention, inline=False)
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-        if admin_ch:
-            msg = await admin_ch.send(embed=embed)
-            await msg.edit(view=ClaimDecisionView(self.sid, self.idx, user.id, msg.id))
-
-class ClaimSlotView(View):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(timeout=None)
-        self.add_item(ClaimSlotButton(sid, idx))
-
-class DecisionModal(Modal):
-    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
-        title = "Причина призначення" if accept else "Причина відмови"
-        super().__init__(title=title)
-        self.sid = sid; self.idx = idx; self.claimant_id = claimant_id; self.admin_msg_id = admin_msg_id; self.accept = accept
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
-        self.add_item(self.reason)
-
-    async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
-        key = (self.sid, self.idx)
-        claimant = await bot.fetch_user(self.claimant_id)
-        old_owner = sess["owners"][self.idx]
-        reason = self.reason.value
-        if self.accept:
-            sess["owners"][self.idx] = claimant
-            claims.pop(key, None)
-        else:
-            lst = claims.get(key, [])
-            if claimant in lst:
-                lst.remove(claimant)
-        ch = bot.get_channel(sess["channel_id"])
-        if ch:
-            try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except:
-                pass
-        try:
-            if self.accept:
-                await claimant.send(f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
-                if old_owner and old_owner != claimant:
-                    await old_owner.send(f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention}.\nПричина: {reason}")
-            else:
-                await claimant.send(f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\nПричина: {reason}")
-        except:
-            pass
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-        if admin_ch:
-            try:
-                admin_msg = await admin_ch.fetch_message(self.admin_msg_id)
-                await admin_msg.delete()
-            except:
-                pass
-        await inter.response.send_message("✔️ Готово.", ephemeral=True)
-
-class ClaimDecisionButton(Button):
-    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
-        label = "✅ Призначити" if accept else "❌ Відхилити"
-        style = discord.ButtonStyle.success if accept else discord.ButtonStyle.danger
-        tag = "accept" if accept else "deny"
-        super().__init__(label=label, style=style, custom_id=f"dec-{tag}-{sid}-{idx}-{claimant_id}-{admin_msg_id}")
-        self.sid = sid; self.idx = idx; self.claimant_id = claimant_id; self.admin_msg_id = admin_msg_id; self.accept = accept
-
-    async def callback(self, inter: discord.Interaction):
-        modal = DecisionModal(self.sid, self.idx, self.claimant_id, self.admin_msg_id, self.accept)
-        await inter.response.send_modal(modal)
-
-class ClaimDecisionView(View):
-    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int):
-        super().__init__(timeout=None)
-        self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, True))
-        self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, False))
-
-# ─── Import command with diagnostics and robust fallbacks ──────────────────────
+# ─── Import command: robust parsing, cleaning, diagnostics ────────────────────
 @bot.command(name="імпорт_sqm")
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -462,7 +352,7 @@ async def імпорт_sqm(ctx: commands.Context):
         diagnostics["found_unit_tokens"] = sum(len(slots) for _, slots in groups)
 
     if not groups:
-        preview = "\n".join(text.splitlines()[:80])[:1900]
+        preview = "\n".join(text.splitlines()[:200])[:1900]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.orange())
         emb.add_field(name="Метод обробки", value=diagnostics["method"], inline=False)
         emb.add_field(name="Знайдено unit tokens", value=str(diagnostics["found_unit_tokens"]), inline=True)
@@ -470,7 +360,14 @@ async def імпорт_sqm(ctx: commands.Context):
         if diagnostics["sample_fragments"]:
             emb.add_field(name="Приклад фрагмента", value=diagnostics["sample_fragments"][0][:1000], inline=False)
         emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
-        await ctx.send(embed=emb)
+        # також прикріпимо повний декодований текст як файл для діагностики
+        try:
+            buf = io.BytesIO(text.encode('utf-8'))
+            buf.seek(0)
+            file = discord.File(fp=buf, filename="decoded_mission_sqm.txt")
+            await ctx.send(embed=emb, file=file)
+        except Exception:
+            await ctx.send(embed=emb)
         return
 
     target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
@@ -533,39 +430,55 @@ async def on_message(message: discord.Message):
 
         slots, owners = slots[:25], owners[:len(slots)]
         sess = {"title": header or DEFAULT_TITLE, "lines": slots, "owners": owners, "channel_id": message.channel.id}
-        embed = build_embed(sess)
+        embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
+        lines = []
+        for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
+            prefix = f"{i+1}. "
+            if owner:
+                lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
+            else:
+                lines.append(f"{prefix}{text}")
+        embed.description = "\n".join(lines)
         sent  = await message.channel.send(embed=embed)
         sessions[sent.id] = sess
         await sent.edit(view=SlotView(sent.id))
 
     await bot.process_commands(message)
 
-# ─── Service commands ────────────────────────────────────────────────────────
-@bot.command(name="оновити", aliases=["update"])
-async def _оновити(ctx: commands.Context):
-    if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
-    async with aiohttp.ClientSession() as sess:
-        await sess.post(DEPLOY_HOOK_URL)
-    await ctx.send("🔄 Деплой тригерено!")
+# ─── Minimal UI classes for slots (kept for compatibility) ────────────────────
+class SlotButton(Button):
+    def __init__(self, sid: int, idx: int):
+        owner = sessions[sid]["owners"][idx]
+        free = owner is None
+        label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
+        style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
+        super().__init__(label=label, style=style, custom_id=f"slot-{sid}-{idx}")
+        self.sid, self.idx = sid, idx
 
-@bot.command(name="статус", aliases=["status"])
-async def _статус(ctx: commands.Context):
-    try:
-        commit = subprocess.getoutput("git rev-parse --short HEAD")
-    except Exception:
-        commit = "unknown"
-    await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
+    async def callback(self, inter: discord.Interaction):
+        user = inter.user
+        sess = sessions[self.sid]
+        owner = sess["owners"][self.idx]
+        ch_id = sess["channel_id"]
 
-@bot.command(name="gitpush")
-async def _gitpush(ctx: commands.Context):
-    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
-    emb.add_field(name="2. git add", value="`git add .`", inline=False)
-    emb.add_field(name="3. git commit", value='`git commit -m "Оновлення слота"`', inline=False)
-    emb.add_field(name="4. git push", value="`git push origin main`", inline=False)
-    emb.set_footer(text="Після push → !оновити")
-    await ctx.send(embed=emb)
+        if owner is None:
+            for s in sessions.values():
+                if s["channel_id"] == ch_id and user in s["owners"]:
+                    return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
+            sess["owners"][self.idx] = user
+            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
+
+        if owner == user:
+            sess["owners"][self.idx] = None
+            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
+
+        return await inter.response.send_message(f"⚠️ Цей слот зайнято {owner.mention}.", ephemeral=True)
+
+class SlotView(View):
+    def __init__(self, sid: int):
+        super().__init__(timeout=None)
+        for idx in range(len(sessions[sid]["lines"])):
+            self.add_item(SlotButton(sid, idx))
 
 # ─── Run ─────────────────────────────────────────────────────────────────────
 if not TOKEN:
