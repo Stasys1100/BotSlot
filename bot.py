@@ -14,20 +14,20 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# ─── Optional keep-alive (remove if unused) ────────────────────────────────────
+# ─── Optional keep-alive (видали, якщо не використовуєш) ─────────────────────
 try:
     from keep_alive import keep_alive
     keep_alive()
 except Exception:
     pass
 
-# ─── Optional PBO library (if installed). If not — pbo = None ─────────────────
+# ─── Optional PBO library ─────────────────────────────────────────────────────
 try:
     import pbo
 except Exception:
     pbo = None
 
-# ─── ENV / INIT ────────────────────────────────────────────────────────────────
+# ─── ENV / INIT ───────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
@@ -50,7 +50,7 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
-# ─── Reminder ──────────────────────────────────────────────────────────────────
+# ─── Reminder ─────────────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
@@ -62,7 +62,7 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── Helpers: cleaning, HTML stripping, normalization ─────────────────────────
+# ─── Helpers: cleaning, HTML structured text extraction ───────────────────────
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
@@ -70,34 +70,54 @@ def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\n{3,}', '\n\n', s)
     return s.strip()
 
-def _strip_html_t_tags(s: str) -> str:
-    # keep inner text of <t ...>...</t>, remove tag entirely
-    s = re.sub(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', r'\1', s, flags=re.IGNORECASE | re.DOTALL)
-    # remove standalone <t ...> if not closed properly
+def extract_structured_text(raw: str) -> str:
+    """
+    Витягує читабельний текст із Eden Structured Text:
+    - якщо є <t ...>...</t> — повертає внутрішній текст (склеює кілька тегів);
+    - якщо є лише відкривальні/закривальні — прибирає їх як шум;
+    - у фіналі чистить HTML та control-символи.
+    """
+    s = html.unescape(raw or "")
+    chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
+    if chunks:
+        txt = " ".join(chunks)
+        txt = re.sub(r'<[^>]+>', ' ', txt)
+        txt = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', txt)
+        txt = re.sub(r'\s{2,}', ' ', txt).strip(' "\'').strip()
+        return txt
+
     s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'</\s*t\s*>', ' ', s, flags=re.IGNORECASE)
+    s = re.sub(r'<[^>]+>', ' ', s)
+    s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
     return s
 
-def _strip_all_tags(s: str) -> str:
-    return re.sub(r'<[^>]+>', ' ', s)
-
 def _clean_token(tok: str) -> str:
+    """
+    Агресивне очищення одиничного токена слота:
+    - витягує текст із структурованих тегів <t ...>...</t>;
+    - прибирає шляхи, розширення, HTML та шум;
+    - фільтрує маркери типу <t color= та пусті лапки.
+    """
     if not tok:
         return "Слот"
-    tok = html.unescape(tok.strip())
-    tok = _strip_html_t_tags(tok)
-    tok = _strip_all_tags(tok)
-    tok = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', tok)
-    tok = tok.replace('\\', '/')
-    tok = re.sub(r'\.sqf\b', '', tok, flags=re.IGNORECASE)
-    tok = re.sub(r'\.pbo\b', '', tok, flags=re.IGNORECASE)
-    tok = re.sub(r'\bhttps?://\S+\b', '', tok)
-    tok = re.sub(r'\s{2,}', ' ', tok)
-    tok = tok.strip(' "\'')
-    # collapse repeated punctuation
-    tok = re.sub(r'[,;]{2,}', ',', tok)
-    # if token looks empty after cleanup
-    return tok.strip() or "Слот"
+    s = extract_structured_text(tok)
+    s = s.replace('\\', '/')
+    s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\bhttps?://\S+\b', '', s)
+    s = re.sub(r'\b[A-Za-z0-9_\\/:.-]{40,}\b', ' ', s)  # довгі шляхи/рядки
+    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
+
+    if not s or s.lower().startswith("<t color") or s in {'"', "'"}:
+        return "Слот"
+
+    # якщо це виглядає як сирий клас (одне слово) — залишаємо як є
+    if re.fullmatch(r'[A-Za-z0-9_]+', s):
+        return s
+
+    return s or "Слот"
 
 # ─── Aggressive RAP -> text decoder ────────────────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
@@ -150,6 +170,7 @@ def rap_to_text_aggressive(data: bytes) -> str:
     candidate = re.sub(r';\s*', ';\n', candidate)
     candidate = re.sub(r'\{\s*', '{\n', candidate)
     candidate = re.sub(r'\s*\}\s*', '\n}\n', candidate)
+
     lines = [l.strip() for l in candidate.splitlines() if l.strip()]
     candidate = '\n'.join(lines)
     candidate = _normalize_whitespace(candidate)
@@ -159,16 +180,15 @@ def rap_to_text_aggressive(data: bytes) -> str:
 # ─── Flexible parser with tolerant regexes & fallbacks ─────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     """
-    Returns list of (group_name, [slot1, slot2, ...])
-    Steps:
-    1) try to find full 'class Group { ... };' blocks
-    2) else find groupName/name/title and collect unit tokens in a window
-    3) fallback: collect all unitName/description/text tokens and group by nearest group marker
+    Повертає список (group_name, [slot1, slot2, ...])
+    1) шукає повні 'class Group { ... };' блоки;
+    2) інакше — groupName/name/title + вікно unit-токенів;
+    3) фолбек — всі unitName/description/text згруповані по маркерах.
     """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
 
-    # 1) full class Group blocks
+    # 1) Повні блоки class Group
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -177,23 +197,21 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
             slots = []
             for u in units:
-                # prefer description/unitName/text
                 mslot = re.search(r'(?:description|unitName|text)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
                 if mslot:
-                    slots.append(_clean_token(mslot.group("v")))
+                    rawv = mslot.group("v")
+                    slots.append(_clean_token(rawv))
                     continue
-                # fallback: name inside unit
                 mslot2 = re.search(r'(?:name)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
                 if mslot2:
                     slots.append(_clean_token(mslot2.group("v")))
                     continue
-                # last resort: any quoted text in unit body
                 q = re.search(r'"([^"]{2,200})"', u)
                 slots.append(_clean_token(q.group(1)) if q else "Слот")
             groups.append((gname, slots))
         return groups
 
-    # 2) groupName/name/title then unit tokens in following window
+    # 2) groupName/name/title + вікно unit-токенів
     for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', txt, flags=re.IGNORECASE):
         gname = _clean_token(m.group("v"))
         start = m.end()
@@ -205,7 +223,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     if groups:
         return groups
 
-    # 3) fallback: collect all unit tokens and group by nearest group marker
+    # 3) Фолбек: зібрати всі unit-токени і згрупувати по найближчому маркеру
     unit_matches = [(m.start(), _clean_token(m.group("v"))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', txt, flags=re.IGNORECASE)]
     group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)', txt, flags=re.IGNORECASE)]
     if unit_matches:
@@ -302,20 +320,17 @@ async def імпорт_sqm(ctx: commands.Context):
 
     groups = parse_mission_sqm_flexible(text)
 
-    diagnostics = {"method": method, "found_groups": 0, "found_unit_tokens": 0}
+    # Якщо нічого не знайшли — спроба фолбеку: зібрати всі unit-токени
     if not groups:
         unit_tokens = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', text, flags=re.IGNORECASE)
-        diagnostics["found_unit_tokens"] = len(unit_tokens)
         if unit_tokens:
             groups = [("Відділення", [_clean_token(u) for u in unit_tokens])]
-            diagnostics["found_groups"] = 1
 
-    # if still nothing — send file with decoded text for manual inspection
+    # Якщо все ще нічого — відправити діагностику і повний декодований текст
     if not groups:
         preview = "\n".join(text.splitlines()[:150])[:1900]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.orange())
-        emb.add_field(name="Метод обробки", value=diagnostics["method"], inline=False)
-        emb.add_field(name="Знайдено unit tokens", value=str(diagnostics["found_unit_tokens"]), inline=True)
+        emb.add_field(name="Метод обробки", value=method, inline=False)
         emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
         try:
             buf = io.BytesIO(text.encode('utf-8'))
@@ -333,10 +348,13 @@ async def імпорт_sqm(ctx: commands.Context):
     sent_count = 0
     total_slots = 0
     for group_name, slot_list in groups:
-        cleaned_slots = [_clean_token(s) for s in slot_list]
-        # filter obvious noise like empty quotes or color markers left
-        cleaned_slots = [s for s in cleaned_slots if s and s.lower() != '<t color=' and s != '"']
-        cleaned_slots = cleaned_slots[:25]
+        cleaned_slots = []
+        for s in slot_list:
+            s2 = _clean_token(s)
+            if not s2 or s2.lower().startswith("<t color") or s2 in {'"', "'"}:
+                s2 = "Слот"
+            cleaned_slots.append(s2)
+        cleaned_slots = [x for x in cleaned_slots if x][:25]
         total_slots += len(cleaned_slots)
 
         embed = discord.Embed(title=group_name or "Відділення", color=discord.Color.blurple())
@@ -399,7 +417,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# ─── Minimal UI classes for slots (kept for compatibility) ─────────────────────
+# ─── Minimal UI classes for slots (сумісність зі старими сесіями) ─────────────
 class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
         owner = sessions[sid]["owners"][idx]
