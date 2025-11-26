@@ -1,12 +1,11 @@
 # bot.py
 import os
 import re
-import subprocess
-import aiohttp
-import datetime
 import io
 import zipfile
 import html
+import subprocess
+import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Dict
 
@@ -15,20 +14,20 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# Optional keep-alive (remove if unused)
+# ─── Optional keep-alive (remove if unused) ────────────────────────────────────
 try:
     from keep_alive import keep_alive
     keep_alive()
 except Exception:
     pass
 
-# Optional PBO library (if installed). If not — pbo = None
+# ─── Optional PBO library (if installed). If not — pbo = None ─────────────────
 try:
     import pbo
 except Exception:
     pbo = None
 
-# ─── ENV / INIT ───────────────────────────────────────────────────────────────
+# ─── ENV / INIT ────────────────────────────────────────────────────────────────
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
@@ -51,7 +50,7 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
-# ─── Reminder ────────────────────────────────────────────────────────────────
+# ─── Reminder ──────────────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
@@ -63,17 +62,7 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── Embeds ───────────────────────────────────────────────────────────────────
-def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
-    embed = discord.Embed(title=title or "Відділення", color=discord.Color.blurple())
-    if slots:
-        lines = [f"{i+1}. {s}" for i, s in enumerate(slots)]
-        embed.description = "\n".join(lines)
-    else:
-        embed.description = "— слотів не знайдено —"
-    return embed
-
-# ─── Utilities: cleaning, HTML stripping, normalization ────────────────────────
+# ─── Helpers: cleaning, HTML stripping, normalization ─────────────────────────
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
@@ -81,44 +70,41 @@ def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\n{3,}', '\n\n', s)
     return s.strip()
 
-def _strip_html_tags(s: str) -> str:
-    # remove tags like <t color='#fff'>text</t> or <t color=...> and keep inner text
+def _strip_html_t_tags(s: str) -> str:
+    # keep inner text of <t ...>...</t>, remove tag entirely
     s = re.sub(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', r'\1', s, flags=re.IGNORECASE | re.DOTALL)
-    # remove any remaining tags
-    s = re.sub(r'<[^>]+>', ' ', s)
+    # remove standalone <t ...> if not closed properly
+    s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
+    s = re.sub(r'</\s*t\s*>', ' ', s, flags=re.IGNORECASE)
     return s
+
+def _strip_all_tags(s: str) -> str:
+    return re.sub(r'<[^>]+>', ' ', s)
 
 def _clean_token(tok: str) -> str:
     if not tok:
         return "Слот"
-    tok = tok.strip()
-    # decode HTML entities
-    tok = html.unescape(tok)
-    # strip HTML tags and attributes
-    tok = _strip_html_tags(tok)
-    # remove control chars
+    tok = html.unescape(tok.strip())
+    tok = _strip_html_t_tags(tok)
+    tok = _strip_all_tags(tok)
     tok = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', tok)
-    # normalize slashes and remove file suffixes
     tok = tok.replace('\\', '/')
     tok = re.sub(r'\.sqf\b', '', tok, flags=re.IGNORECASE)
     tok = re.sub(r'\.pbo\b', '', tok, flags=re.IGNORECASE)
-    # remove long addon paths or repeated commas
-    tok = re.sub(r'\b[A-Za-z0-9_\\/:.-]{30,}\b', '', tok)
+    tok = re.sub(r'\bhttps?://\S+\b', '', tok)
     tok = re.sub(r'\s{2,}', ' ', tok)
     tok = tok.strip(' "\'')
-    # if token looks like a class name (B_Soldier_AR_F) — keep as-is but replace underscores with spaces optionally
-    # keep original class names but make them readable
-    if re.match(r'^[A-Za-z0-9_]+$', tok) and '_' in tok:
-        tok = tok.replace('_', ' ')
-    return tok or "Слот"
+    # collapse repeated punctuation
+    tok = re.sub(r'[,;]{2,}', ',', tok)
+    # if token looks empty after cleanup
+    return tok.strip() or "Слот"
 
-# ─── Aggressive RAP -> text decoder ───────────────────────────────────────────
+# ─── Aggressive RAP -> text decoder ────────────────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
     """
     Heuristic RAP decoder:
-    - try utf-8 then latin-1
+    - try utf-8, fallback to latin-1
     - remove control chars
-    - keep readable characters
     - collect windows around keywords
     - normalize separators for parser
     """
@@ -150,42 +136,39 @@ def rap_to_text_aggressive(data: bytes) -> str:
             start = idx + len(k)
 
     if indices:
-        window = 4000
+        window = 5000
         frags = []
         for idx in sorted(set(indices)):
-            s = max(0, idx - 300)
+            s = max(0, idx - 400)
             e = min(len(filtered), idx + window)
             frags.append(filtered[s:e])
         candidate = '\n'.join(frags)
     else:
-        candidate = filtered[:200000]
+        candidate = filtered[:300000]
 
     candidate = candidate.replace('};', '};\n')
     candidate = re.sub(r';\s*', ';\n', candidate)
     candidate = re.sub(r'\{\s*', '{\n', candidate)
     candidate = re.sub(r'\s*\}\s*', '\n}\n', candidate)
-
-    # clean lines and tokens
-    lines = [line.strip() for line in candidate.splitlines()]
-    lines = [re.sub(r'\s{2,}', ' ', l) for l in lines if l.strip()]
+    lines = [l.strip() for l in candidate.splitlines() if l.strip()]
     candidate = '\n'.join(lines)
     candidate = _normalize_whitespace(candidate)
     candidate = candidate.replace("'", '"')
     return f"// rap_decoded (encoding={enc})\n{candidate}"
 
-# ─── Flexible parser with tolerant regexes and HTML cleanup ──────────────────
+# ─── Flexible parser with tolerant regexes & fallbacks ─────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     """
     Returns list of (group_name, [slot1, slot2, ...])
     Steps:
     1) try to find full 'class Group { ... };' blocks
-    2) if none, find groupName/name/title and collect unit tokens in a window
+    2) else find groupName/name/title and collect unit tokens in a window
     3) fallback: collect all unitName/description/text tokens and group by nearest group marker
     """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
 
-    # 1) full class Group blocks (DOTALL)
+    # 1) full class Group blocks
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -194,7 +177,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
             slots = []
             for u in units:
-                # try description/unitName/text first
+                # prefer description/unitName/text
                 mslot = re.search(r'(?:description|unitName|text)\s*=\s*"?(?P<v>[^";\n]+)"?', u, flags=re.IGNORECASE)
                 if mslot:
                     slots.append(_clean_token(mslot.group("v")))
@@ -204,16 +187,13 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
                 if mslot2:
                     slots.append(_clean_token(mslot2.group("v")))
                     continue
-                # last resort: try to extract any quoted text
+                # last resort: any quoted text in unit body
                 q = re.search(r'"([^"]{2,200})"', u)
-                if q:
-                    slots.append(_clean_token(q.group(1)))
-                else:
-                    slots.append("Слот")
+                slots.append(_clean_token(q.group(1)) if q else "Слот")
             groups.append((gname, slots))
         return groups
 
-    # 2) groupName/name/title then unit tokens in window
+    # 2) groupName/name/title then unit tokens in following window
     for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', txt, flags=re.IGNORECASE):
         gname = _clean_token(m.group("v"))
         start = m.end()
@@ -240,7 +220,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             if key == -1:
                 gname = "Відділення"
             else:
-                snippet = txt[key:key+200]
+                snippet = txt[key:key+240]
                 mname = re.search(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', snippet, flags=re.IGNORECASE)
                 gname = _clean_token(mname.group("v")) if mname else "Відділення"
             groups.append((gname, slots))
@@ -306,8 +286,8 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
             continue
     return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
-# ─── Import command: robust parsing, cleaning, diagnostics ────────────────────
-@bot.command(name="імпорт_sqm")
+# ─── Import command: robust parsing, cleaning, diagnostics ─────────────────────
+@bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
@@ -322,45 +302,21 @@ async def імпорт_sqm(ctx: commands.Context):
 
     groups = parse_mission_sqm_flexible(text)
 
-    diagnostics = {"method": method, "found_groups": 0, "found_unit_tokens": 0, "sample_fragments": []}
-
+    diagnostics = {"method": method, "found_groups": 0, "found_unit_tokens": 0}
     if not groups:
         unit_tokens = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', text, flags=re.IGNORECASE)
         diagnostics["found_unit_tokens"] = len(unit_tokens)
-        group_markers = re.findall(r'(?:class\s+Group\b|groupName|name|title)', text, flags=re.IGNORECASE)
-        if group_markers and unit_tokens:
-            groups = []
-            for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";\n]+)"?', text, flags=re.IGNORECASE):
-                gname = _clean_token(m.group("v"))
-                frag = text[m.end(): m.end() + 20000]
-                units = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";\n]+)"?', frag, flags=re.IGNORECASE)
-                if units:
-                    groups.append((gname, [_clean_token(u) for u in units]))
-            diagnostics["found_groups"] = len(groups)
-        else:
-            for kw in ["class Group", "class Unit", "groupName", "unitName", "description", "name"]:
-                idx = text.lower().find(kw.lower())
-                if idx != -1:
-                    s = max(0, idx - 200)
-                    e = min(len(text), idx + 800)
-                    diagnostics["sample_fragments"].append(text[s:e])
-            if unit_tokens:
-                groups = [("Відділення", [_clean_token(u) for u in unit_tokens])]
-                diagnostics["found_groups"] = 1
-    else:
-        diagnostics["found_groups"] = len(groups)
-        diagnostics["found_unit_tokens"] = sum(len(slots) for _, slots in groups)
+        if unit_tokens:
+            groups = [("Відділення", [_clean_token(u) for u in unit_tokens])]
+            diagnostics["found_groups"] = 1
 
+    # if still nothing — send file with decoded text for manual inspection
     if not groups:
-        preview = "\n".join(text.splitlines()[:200])[:1900]
+        preview = "\n".join(text.splitlines()[:150])[:1900]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.orange())
         emb.add_field(name="Метод обробки", value=diagnostics["method"], inline=False)
         emb.add_field(name="Знайдено unit tokens", value=str(diagnostics["found_unit_tokens"]), inline=True)
-        emb.add_field(name="Знайдено груп (фолбек)", value=str(diagnostics["found_groups"]), inline=True)
-        if diagnostics["sample_fragments"]:
-            emb.add_field(name="Приклад фрагмента", value=diagnostics["sample_fragments"][0][:1000], inline=False)
         emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
-        # також прикріпимо повний декодований текст як файл для діагностики
         try:
             buf = io.BytesIO(text.encode('utf-8'))
             buf.seek(0)
@@ -377,9 +333,14 @@ async def імпорт_sqm(ctx: commands.Context):
     sent_count = 0
     total_slots = 0
     for group_name, slot_list in groups:
-        cleaned_slots = [_clean_token(s) for s in slot_list][:25]
+        cleaned_slots = [_clean_token(s) for s in slot_list]
+        # filter obvious noise like empty quotes or color markers left
+        cleaned_slots = [s for s in cleaned_slots if s and s.lower() != '<t color=' and s != '"']
+        cleaned_slots = cleaned_slots[:25]
         total_slots += len(cleaned_slots)
-        embed = build_group_embed(group_name, cleaned_slots)
+
+        embed = discord.Embed(title=group_name or "Відділення", color=discord.Color.blurple())
+        embed.description = "\n".join(f"{i+1}. {s}" for i, s in enumerate(cleaned_slots)) if cleaned_slots else "— слотів не знайдено —"
         try:
             await target_ch.send(embed=embed)
             sent_count += 1
@@ -388,7 +349,7 @@ async def імпорт_sqm(ctx: commands.Context):
 
     await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method}`. Знайдено слотів: {total_slots}.")
 
-# ─── on_ready / on_message ────────────────────────────────────────────────────
+# ─── on_ready / on_message ─────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
@@ -431,21 +392,14 @@ async def on_message(message: discord.Message):
         slots, owners = slots[:25], owners[:len(slots)]
         sess = {"title": header or DEFAULT_TITLE, "lines": slots, "owners": owners, "channel_id": message.channel.id}
         embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
-        lines = []
-        for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-            prefix = f"{i+1}. "
-            if owner:
-                lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
-            else:
-                lines.append(f"{prefix}{text}")
-        embed.description = "\n".join(lines)
+        embed.description = "\n".join(f"{i+1}. {t}"+(f" – Зайнято {o.mention}" if o else "") for i, (t, o) in enumerate(zip(sess["lines"], sess["owners"])))
         sent  = await message.channel.send(embed=embed)
         sessions[sent.id] = sess
         await sent.edit(view=SlotView(sent.id))
 
     await bot.process_commands(message)
 
-# ─── Minimal UI classes for slots (kept for compatibility) ────────────────────
+# ─── Minimal UI classes for slots (kept for compatibility) ─────────────────────
 class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
         owner = sessions[sid]["owners"][idx]
@@ -466,11 +420,15 @@ class SlotButton(Button):
                 if s["channel_id"] == ch_id and user in s["owners"]:
                     return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
             sess["owners"][self.idx] = user
-            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
+            embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
+            embed.description = "\n".join(f"{i+1}. {t}"+(f" – Зайнято {o.mention}" if o else "") for i, (t, o) in enumerate(zip(sess["lines"], sess["owners"])))
+            return await inter.response.edit_message(embed=embed, view=SlotView(self.sid))
 
         if owner == user:
             sess["owners"][self.idx] = None
-            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
+            embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
+            embed.description = "\n".join(f"{i+1}. {t}"+(f" – Зайнято {o.mention}" if o else "") for i, (t, o) in enumerate(zip(sess["lines"], sess["owners"])))
+            return await inter.response.edit_message(embed=embed, view=SlotView(self.sid))
 
         return await inter.response.send_message(f"⚠️ Цей слот зайнято {owner.mention}.", ephemeral=True)
 
@@ -480,7 +438,7 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
-# ─── Run ─────────────────────────────────────────────────────────────────────
+# ─── Run ───────────────────────────────────────────────────────────────────────
 if not TOKEN:
     print("DISCORD_TOKEN not set in environment")
 else:
