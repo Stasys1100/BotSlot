@@ -37,7 +37,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
-# ─── State ──────────────────────────────────────────────────────────────────
 sessions: Dict[int, dict] = {}
 processed_messages: set[int] = set()
 
@@ -64,12 +63,12 @@ MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 
 # ─── Helpers ────────────────────────────────────────────────────────────────
 def is_noise(s: str) -> bool:
-    """Відсікає технічний шум: None/NULL/true/false, чисті цифри/капси, rhs_/ _hide / flag_manager / MaleXXENG."""
+    """Відсікає технічний шум: None/NULL/true/false, чисті цифри/капси, rhs_/ _hide / flag_manager / MaleXXENG/PER."""
     s = (s or "").strip()
     if not s:
         return True
     low = s.lower()
-    if low in {"none", "null", "true", "false"}:
+    if low in {"none","null","true","false","army","default","platoon","standard","nochange","uk","honor"}:
         return True
     if re.fullmatch(r'\d+', s):
         return True
@@ -77,7 +76,7 @@ def is_noise(s: str) -> bool:
         return True
     if "rhs_" in low or "_hide" in low or "flag_manager" in low:
         return True
-    if s.startswith("Male") and "ENG" in s:
+    if s.startswith("Male") and ("ENG" in s or "PER" in s):
         return True
     return False
 
@@ -153,25 +152,20 @@ def decode_bytes(raw: bytes) -> str:
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     """
     Витягує всі description/value і групує їх у (title, [slots...]).
-    - Рядки з '|' або @Альфа/Штаб/бригада/Окрема/відділення/Піхотне -> заголовок.
-    - Рядки з нумерацією або ключовими словами -> слот.
-    - Короткі рядки з ENG/MED/технікою -> слот.
-    - Технічний шум фільтрується is_noise(...).
+    Заголовок: містить '|' або @Альфа/Штаб/бригада/Окрема/відділення/Піхотне.
+    Слот: нумерація або початок на ключові слова (Командир/Медик/Оператор/…).
+    Короткі токени з технікою/ENG/MED теж зараховуються як слоти.
+    Технічний шум фільтрується is_noise(...).
     """
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     matches = [(m.start(), html.unescape(m.group(1)).strip())
                for m in re.finditer(r'(?:description|value)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE)]
-    if not matches:
-        # інколи дані можуть бути в <t>...</t>
-        t_matches = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)
-        matches = [(0, html.unescape(m).strip()) for m in t_matches]
     if not matches:
         return []
 
     groups: List[Tuple[str, List[str]]] = []
     cur_title: str | None = None
     cur_slots: List[str] = []
-    rejected: List[str] = []
 
     def flush():
         nonlocal cur_title, cur_slots
@@ -187,28 +181,22 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         s = re.sub(r'\s{2,}', ' ', raw).strip()
         if not s or is_noise(s):
             continue
-
         # Заголовок
         if '|' in s or re.search(r'@Альфа|Штаб|бригада|Окрема|відділення|Піхотне', s, flags=re.IGNORECASE):
             flush()
             cur_title = s
             continue
-
-        # Слот за нумерацією або ключовими словами
+        # Слот
         if re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s):
             slot = clean_line_for_slot(s)
             if slot and not looks_like_code_block(slot) and not is_noise(slot):
                 cur_slots.append(slot)
-            else:
-                rejected.append(s)
             continue
-
-        # Короткі або технічні токени — як слот
-        if re.search(r'\b(ENG|MED|M113|M113A3|ZALA|Mavic|FPV|BMP|T-72|T-72Б|HIMARS)\b', s, flags=re.IGNORECASE) or len(s.split()) <= 6:
+        # Короткі/техніка → слот
+        if re.search(r'\b(ENG|MED|M113|M113A3|ZALA|Mavic|FPV|BMP|T-72|T-80|GAZ|ScanEagle)\b', s, flags=re.IGNORECASE) or len(s.split()) <= 6:
             cur_slots.append(clean_line_for_slot(s))
             continue
-
-        # Інакше — або слот до активного заголовка, або новий заголовок
+        # Інакше додати в поточну групу, або створити заголовок
         if cur_title:
             cur_slots.append(clean_line_for_slot(s))
         else:
@@ -219,49 +207,20 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 cur_slots.append(clean_line_for_slot(s))
 
     flush()
-
-    # Фолбек: якщо не знайшли груп, спробувати всі нумеровані рядки
-    if not groups:
-        all_numbered = re.findall(r'^\s*\d+\.\s*(.+)$', text, flags=re.MULTILINE)
-        cleaned = []
-        for s in all_numbered:
-            s2 = clean_line_for_slot(s)
-            if s2 and not looks_like_code_block(s2) and not is_noise(s2):
-                cleaned.append(normalize_slot_name(s2))
-        cleaned = dedupe_preserve_order(cleaned)
-        if cleaned:
-            groups = [(DEFAULT_TITLE, cleaned)]
-
-    # Лог відкинутих (для діагностики, якщо треба)
-    try:
-        if rejected:
-            with open("parser_debug.log", "w", encoding="utf-8") as f:
-                f.write("=== Rejected lines (first 200) ===\n")
-                for r in rejected[:200]:
-                    f.write(r.replace("\n", " ") + "\n")
-    except Exception:
-        logger.exception("Failed to write parser_debug.log")
-
     return groups
 
 # ─── Reminder (optional) ─────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
-    now = datetime.datetime.now(KYIV_TZ)
-    if now.weekday() in (4, 6) and now.hour == 19 and now.minute == 30:
-        if VTG_CHANNEL_ID:
-            ch = bot.get_channel(VTG_CHANNEL_ID)
-            if ch:
-                try:
-                    await ch.send("||@everyone||\n**Сбор VTG**")
-                except Exception:
-                    logger.exception("vtg_reminder send failed")
+    # Можна налаштувати нагадування, якщо потрібно
+    return
 
 # ─── Embed builder для сесій ────────────────────────────────────────────────
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
-    for i, (text, owner) in enumerate(zip(sess["lines"], sess.get("owners", [None]*len(sess["lines"])))):
+    owners = sess.get("owners", [None] * len(sess["lines"]))
+    for i, (text, owner) in enumerate(zip(sess["lines"], owners)):
         prefix = f"{i+1}. "
         if owner:
             lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
@@ -350,16 +309,6 @@ async def імпорт_sqm(ctx: commands.Context):
     if not groups:
         _recent_imports.pop(key, None)
         logger.info("No groups found in attachment %s (message %s)", attachment.filename, ctx.message.id)
-        # дебаг-лог
-        try:
-            with open("parser_debug.log", "w", encoding="utf-8") as f:
-                f.write("No groups found. First 200 description/value occurrences:\n")
-                for i, m in enumerate(re.finditer(r'(?:description|value)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE)):
-                    if i >= 200:
-                        break
-                    f.write(m.group(1).replace("\n", " ") + "\n")
-        except Exception:
-            logger.exception("Failed to write parser_debug.log")
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
     sent = 0
@@ -415,6 +364,11 @@ async def _статус(ctx: commands.Context):
     await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}")
 
 # ─── on_ready / on_message ──────────────────────────────────────────────────
+@tasks.loop(minutes=1)
+async def vtg_reminder():
+    # Опційно: логіка нагадувань
+    return
+
 @bot.event
 async def on_ready():
     logger.info("Bot ready: %s", bot.user)
