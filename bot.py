@@ -14,7 +14,7 @@ from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 from keep_alive import keep_alive
 
-# Optional PBO library (if installed on host). If не встановлено — pbo = None
+# Optional PBO library (if installed on host). If not installed — pbo = None
 try:
     import pbo
 except Exception:
@@ -35,7 +35,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ─── 3. Конфігурація ────────────────────────────────────────────────────────────
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID = 1160843618433630228
-# Читаємо ADMIN_CHANNEL_ID з ENV; якщо не встановлено — можна підставити значення за замовчуванням
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or "1395065909185478769")
 
 processed_messages: set[int] = set()
@@ -86,8 +85,6 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
 def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     """
     Повертає список кортежів (group_name, [slot1, slot2, ...]).
-    Парсер орієнтований на стандартну структуру mission.sqm:
-    - class Group { ... name = "GroupName"; ... class Unit { ... description = "Role"; ... } ... }
     Підтримує різні поля: name, groupName, description, unitName, text.
     """
     groups: List[Tuple[str, List[str]]] = []
@@ -104,9 +101,10 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
 
     for raw in text.splitlines():
         line = raw.strip()
+        if not line:
+            continue
 
         if re_group_start.match(line):
-            # зберегти попередню групу
             if current_group_name is not None or current_slots:
                 groups.append((current_group_name or "Відділення", current_slots))
             current_group_name = None
@@ -134,7 +132,6 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
                     current_slots[-1] = val
                 continue
 
-        # груба детекція закінчення блоків
         if line == "};":
             if in_unit:
                 in_unit = False
@@ -147,11 +144,9 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
                 current_slots = []
                 continue
 
-    # кінець файлу
     if current_group_name is not None or current_slots:
         groups.append((current_group_name or "Відділення", current_slots))
 
-    # очищення
     cleaned: List[Tuple[str, List[str]]] = []
     for gname, gslots in groups:
         name = gname.strip() if gname else "Відділення"
@@ -167,7 +162,6 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
     - інакше пробуємо відкрити як zip (фолбек).
     Повертає текст або None.
     """
-    # Спроба через pbo (якщо встановлено)
     if pbo:
         try:
             archive = pbo.PBO(io.BytesIO(pbo_bytes))
@@ -178,7 +172,6 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
         except Exception:
             pass
 
-    # Фолбек: zip-like
     try:
         z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
         for name in z.namelist():
@@ -189,31 +182,63 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
 
     return None
 
+def extract_text_fragments_from_bytes(data: bytes, min_fragment_len: int = 40) -> str:
+    """
+    Декодує байти як latin-1 і витягує фрагменти навколо ключових слів
+    (class Group, class Unit, name =, description =), щоб "виловити" текст з бінарного SQM/PBO.
+    """
+    text = data.decode("latin-1", errors="ignore")
+    keywords = ["class Group", "class Unit", "name =", "description =", "unitName"]
+    indices = []
+    for kw in keywords:
+        start = 0
+        while True:
+            idx = text.find(kw, start)
+            if idx == -1:
+                break
+            indices.append(idx)
+            start = idx + len(kw)
+    if not indices:
+        return text
+
+    fragments = []
+    window = 2000
+    for idx in sorted(set(indices)):
+        s = max(0, idx - 200)
+        e = min(len(text), idx + window)
+        frag = text[s:e]
+        if len(frag) >= min_fragment_len:
+            fragments.append(frag)
+    return "\n".join(fragments)
+
 async def read_attachment_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Пробує декодувати attachment різними кодуваннями.
-    Повертає (text, used_encoding).
-    Якщо attachment — .pbo, намагається витягти mission.sqm.
+    Повертає (text, used_encoding_or_method).
+    Підтримує: .pbo (витяг), .sqm (декодування), або бінарні файли (фрагменти).
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
-    # Якщо .pbo — спробувати витягти
     if filename.endswith(".pbo"):
         extracted = extract_mission_from_pbo_bytes(data)
-        if extracted is not None:
+        if extracted:
             return extracted, "extracted-from-pbo"
-        # якщо не вдалося — продовжимо пробувати декодування байтів
 
-    # Спроби декодування
     for enc in ("utf-8", "cp1251", "latin-1"):
         try:
             text = data.decode(enc)
-            return text, enc
+            if "class Group" in text or "class Unit" in text or "class Side" in text:
+                return text, enc
+            readable_ratio = sum(1 for ch in text if 32 <= ord(ch) <= 126) / max(1, len(text))
+            if readable_ratio > 0.2:
+                return text, enc
         except Exception:
             continue
 
-    # Фолбек: latin-1 з ignore
+    frag_text = extract_text_fragments_from_bytes(data)
+    if "class Group" in frag_text or "class Unit" in frag_text:
+        return frag_text, "extracted-fragments"
+
     return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
@@ -232,7 +257,6 @@ class SlotButton(Button):
         owner = sess["owners"][self.idx]
         ch_id = sess["channel_id"]
 
-        # 6.1) Вільний слот → зайняти
         if owner is None:
             for s in sessions.values():
                 if s["channel_id"] == ch_id and user in s["owners"]:
@@ -244,14 +268,12 @@ class SlotButton(Button):
                 embed=build_embed(sess), view=SlotView(self.sid)
             )
 
-        # 6.2) Свій слот → звільнити
         if owner == user:
             sess["owners"][self.idx] = None
             return await inter.response.edit_message(
                 embed=build_embed(sess), view=SlotView(self.sid)
             )
 
-        # 6.3) Чужий слот → пропонуємо претендувати
         return await inter.response.send_message(
             f"⚠️ Цей слот зайнято {owner.mention}.",
             view=ClaimSlotView(self.sid, self.idx),
@@ -354,7 +376,6 @@ class DecisionModal(Modal):
             if claimant in lst:
                 lst.remove(claimant)
 
-        # Оновлюємо головне повідомлення
         ch = bot.get_channel(sess["channel_id"])
         if ch:
             try:
@@ -363,7 +384,6 @@ class DecisionModal(Modal):
             except:
                 pass
 
-        # DM користувачам
         try:
             if self.accept:
                 await claimant.send(
@@ -383,7 +403,6 @@ class DecisionModal(Modal):
         except:
             pass
 
-        # Видаляємо адмін-повідомлення
         admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
         if admin_ch:
             try:
@@ -590,7 +609,6 @@ async def імпорт_sqm(ctx: commands.Context):
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть файл mission.sqm або .pbo до повідомлення.")
 
-    # Знайти attachment (перший)
     attachment = ctx.message.attachments[0]
 
     try:
@@ -709,7 +727,7 @@ async def _gitpush(ctx: commands.Context):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
     emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
     emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
+    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
     emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
