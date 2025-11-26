@@ -55,9 +55,9 @@ DEFAULT_TITLE = "Відділення"
 # Ключові слова, що позначають початок списку слотів
 SLOT_START_KEYWORDS = [
     r'командир відділен', r'командир сторони', r'командир екіпаж', r'командир',
-    r'пілот', r'пілот', r'оператор', r'оператор-навідник', r'наводник', r'санитар',
+    r'пілот', r'оператор', r'оператор-навідник', r'наводник', r'санитар',
     r'медик', r'гренадер', r'гранатометник', r'кулеметник', r'стрілець',
-    r'механик', r'механік', r'оператор бпла', r'оператор бплa', r'оператор бпла'
+    r'механик', r'механік', r'оператор бпла'
 ]
 SLOT_START_RE = re.compile(r'^\s*(?:' + r'|'.join(SLOT_START_KEYWORDS) + r')\b', flags=re.IGNORECASE)
 
@@ -181,129 +181,91 @@ def dedupe_preserve_order(items: List[str], fuzzy_threshold: float = 0.78) -> Li
             out.append(s_norm)
     return out
 
-# ─── Core parser ─────────────────────────────────────────────────────────────
+# ─── Core parser (менш агресивний) ──────────────────────────────────────────
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
+    """
+    Менш агресивний парсер: зберігає addon/class блоки, але витягує відділення і слоти.
+    Повертає список (title, [slot1, slot2, ...]).
+    """
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    raw_lines = [ln.rstrip() for ln in text.splitlines()]
-    raw_lines = [ln for ln in raw_lines if ln and not re.fullmatch(r'[\x00-\x1f\x7f-\x9f]+', ln)]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # Нормалізуємо лапки/крапки з комою
+    norm_lines = [re.sub(r'[\'"]+$', '', re.sub(r'^[\'"]+', '', ln)).rstrip(';') for ln in lines]
+
+    groups: List[Tuple[str, List[str]]] = []
     i = 0
-    n = len(raw_lines)
-    tech_count = 0
-    while i < n and (len(raw_lines[i].split()) == 1 and re.search(r'[_A-Za-z0-9]', raw_lines[i])):
-        tech_count += 1
-        i += 1
-    if tech_count >= 6:
-        raw_lines = raw_lines[i:]
-    collapsed: List[str] = []
-    prev = None
-    for ln in raw_lines:
-        ln_stripped = ln.strip()
-        if looks_like_code_block(ln_stripped):
-            m = re.search(r'(?:value|description)\s*=\s*"([^"]+)"', ln_stripped, flags=re.IGNORECASE)
-            if m:
-                candidate = m.group(1).strip()
-                if not looks_like_code_block(candidate):
-                    collapsed.append(candidate)
-            continue
-        ln_clean = strip_quotes_semicolons(ln_stripped)
-        if ln_clean == prev:
-            continue
-        collapsed.append(ln_clean)
-        prev = ln_clean
-    for m in re.finditer(r'(?:value|description)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE):
-        v = m.group(1).strip()
-        if v and not looks_like_code_block(v):
-            collapsed.append(v)
-    lines = [l for l in collapsed if l and not looks_like_code_block(l)]
-    groups_map: Dict[str, List[str]] = {}
-    current_title = None
-    idx = 0
-    L = len(lines)
-    while idx < L:
-        ln = lines[idx].strip()
-        if '|' in ln or '@' in ln or re.search(r'\b(відділен|відділ|бригада|екіпаж|командир|пехотн|піхотн|пехотное|штаб)\b', ln, flags=re.IGNORECASE):
-            current_title = normalize_slot_name(strip_quotes_semicolons(ln))
-            groups_map.setdefault(current_title, [])
-            j = idx + 1
-            slots = []
-            while j < L and (re.match(r'^\s*\d+\.\s*', lines[j]) or looks_like_slot_start(lines[j])):
-                slot = re.sub(r'^\s*\d+\.\s*', '', lines[j]).strip()
-                slot = clean_line_for_slot(slot)
-                if slot and not looks_like_code_block(slot):
-                    slots.append(slot)
+    L = len(norm_lines)
+
+    title_hint_re = re.compile(r'\|')  # рядки з '|' часто — заголовки
+    numbered_re = re.compile(r'^\s*\d+\.\s*')
+    slot_start_re = re.compile(r'^\s*(?:командир|командир відділен|командир сторони|командир екіпаж|пілот|оператор|медик|санитар|гренадер|гранатометник|кулеметник|стрілець|механик|механік)', flags=re.IGNORECASE)
+
+    while i < L:
+        ln = norm_lines[i]
+
+        # Якщо рядок виглядає як заголовок (має '|', або містить @Альфа, або 'Штаб', 'бригада' тощо)
+        if title_hint_re.search(ln) or re.search(r'@Альфа|Штаб|бригада|ОМБр|ЧВК|РСЗВ', ln, flags=re.IGNORECASE):
+            title = ln
+            slots: List[str] = []
+            j = i + 1
+            # збираємо наступні нумеровані або явні слот-рядки
+            while j < L and (numbered_re.match(norm_lines[j]) or slot_start_re.match(norm_lines[j]) or re.search(r'\b(ENG|MED|CC|СС)\b', norm_lines[j], flags=re.IGNORECASE)):
+                s = numbered_re.sub('', norm_lines[j]).strip()
+                s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
+                s = re.sub(r'[";]+$', '', s).strip()
+                if s:
+                    slots.append(s)
                 j += 1
+            # якщо не знайшли слоти безпосередньо — спробуємо знайти value/description в наступних 6 рядках
             if not slots:
-                k = idx + 1
-                while k < min(L, idx + 6):
-                    if re.search(r'\d+\.', lines[k]):
-                        found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', lines[k])
-                        for f in found:
-                            f2 = f.strip()
-                            if f2 and not looks_like_code_block(f2):
-                                slots.append(f2)
+                k = i + 1
+                while k < min(L, i + 7):
+                    m = re.search(r'(?:value|description)\s*=\s*"([^"]+)"', norm_lines[k], flags=re.IGNORECASE)
+                    if m:
+                        candidate = m.group(1).strip()
+                        if candidate:
+                            slots.append(candidate)
                     k += 1
             if slots:
-                slots = [normalize_slot_name(s) for s in slots if s and s.strip()]
-                slots = dedupe_preserve_order(slots)
-                groups_map[current_title].extend(slots)
-                idx = j
+                groups.append((title.strip(), [re.sub(r'\s{2,}', ' ', s).strip() for s in slots]))
+                i = j
                 continue
             else:
-                idx += 1
+                i += 1
                 continue
-        if re.match(r'^\s*\d+\.\s*', ln):
-            if current_title is None:
-                current_title = "Відділення"
-                groups_map.setdefault(current_title, [])
-            while idx < L and re.match(r'^\s*\d+\.\s*', lines[idx]):
-                slot = re.sub(r'^\s*\d+\.\s*', '', lines[idx]).strip()
-                if slot and not looks_like_code_block(slot):
-                    groups_map[current_title].append(normalize_slot_name(slot))
-                idx += 1
-            continue
-        if '|' in ln and re.search(r'\d+\.', ln):
-            parts = ln.split('|', 1)
-            title = normalize_slot_name(strip_quotes_semicolons(parts[0]))
-            rest = parts[1]
-            found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', rest)
-            slots = [normalize_slot_name(f.strip()) for f in found if f.strip() and not looks_like_code_block(f.strip())]
+
+        # Якщо рядок починається з нумерації або виглядає як слот — зібрати послідовність і створити заголовок "Відділення"
+        if numbered_re.match(ln) or slot_start_re.match(ln):
+            slots = []
+            while i < L and (numbered_re.match(norm_lines[i]) or slot_start_re.match(norm_lines[i]) or re.search(r'\b(ENG|MED|CC|СС)\b', norm_lines[i], flags=re.IGNORECASE)):
+                s = numbered_re.sub('', norm_lines[i]).strip()
+                s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
+                s = re.sub(r'[";]+$', '', s).strip()
+                if s:
+                    slots.append(s)
+                i += 1
             if slots:
-                groups_map.setdefault(title, []).extend(slots)
-            idx += 1
+                groups.append(("Відділення", [re.sub(r'\s{2,}', ' ', s).strip() for s in slots]))
             continue
-        if re.search(r'[А-Яа-яЁёЇїІіЄєҐґA-Za-z]', ln) and len(ln.split()) >= 1 and not looks_like_code_block(ln):
-            if current_title is None:
-                current_title = "Відділення"
-                groups_map.setdefault(current_title, [])
-            if len(ln) > 2 and not re.fullmatch(r'[_A-Za-z0-9\-]+', ln):
-                groups_map[current_title].append(normalize_slot_name(ln))
-        idx += 1
-    final: List[Tuple[str, List[str]]] = []
-    for title, slots in groups_map.items():
+
+        # Інакше — просто рухаємось далі
+        i += 1
+
+    # очистка: видалити дублікати в кожній групі
+    final = []
+    for title, slots in groups:
         seen = set()
-        cleaned_slots = []
+        cleaned = []
         for s in slots:
-            s2 = normalize_slot_name(s)
-            if not s2:
-                continue
-            key = s2.lower()
+            key = s.lower().strip()
             if key in seen:
                 continue
             seen.add(key)
-            cleaned_slots.append(s2)
-        if cleaned_slots:
-            final.append((re.sub(r'\s{2,}', ' ', title).strip(), cleaned_slots))
-    merged: Dict[str, List[str]] = {}
-    for title, slots in final:
-        key = title.lower()
-        merged.setdefault(key, {"title": title, "slots": []})
-        merged[key]["slots"].extend(slots)
-    result: List[Tuple[str, List[str]]] = []
-    for k, v in merged.items():
-        slots = dedupe_preserve_order([s for s in v["slots"] if s and not re.fullmatch(r'^[\W_]{1,5}$', s)])
-        if slots:
-            result.append((v["title"], slots))
-    return result
+            cleaned.append(s)
+        if cleaned:
+            final.append((title, cleaned))
+    return final
 
 # ─── Команда: стоп ───────────────────────────────────────────────────────────
 @bot.command(name="стоп", aliases=["stop"])
