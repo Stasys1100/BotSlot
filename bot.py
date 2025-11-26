@@ -52,6 +52,27 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Відділення"
 
+# Ключові слова, що позначають початок списку слотів
+SLOT_START_KEYWORDS = [
+    r'командир відділен', r'командир сторони', r'командир екіпаж', r'командир',
+    r'пілот', r'пілот', r'оператор', r'оператор-навідник', r'наводник', r'санитар',
+    r'медик', r'гренадер', r'гранатометник', r'кулеметник', r'стрілець',
+    r'механик', r'механік', r'оператор бпла', r'оператор бплa', r'оператор бпла'
+]
+SLOT_START_RE = re.compile(r'^\s*(?:' + r'|'.join(SLOT_START_KEYWORDS) + r')\b', flags=re.IGNORECASE)
+
+def looks_like_slot_start(line: str) -> bool:
+    if not line:
+        return False
+    line = line.strip()
+    if re.match(r'^\s*\d+\.\s*', line):
+        return True
+    if SLOT_START_RE.search(line):
+        return True
+    if re.search(r'\b(ENG|MED|CC|SS|СС)\b', line, flags=re.IGNORECASE):
+        return True
+    return False
+
 # ─── Reminder (optional) ──────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
@@ -83,7 +104,6 @@ def strip_quotes_semicolons(s: str) -> str:
     if s is None:
         return ""
     s = s.strip()
-    # remove leading/trailing quotes and trailing semicolons and stray double quotes
     s = re.sub(r'^[\'"]+', '', s)
     s = re.sub(r'[\'"]+$', '', s)
     s = re.sub(r';+$', '', s)
@@ -94,7 +114,6 @@ def extract_structured_text(raw: str) -> str:
     if not raw:
         return ""
     s = html.unescape(raw)
-    # prefer explicit attributes value/description and <t> tags
     attrs = []
     for m in re.finditer(r'(?:value|description)\s*=\s*"([^"]+)"', s, flags=re.IGNORECASE):
         attrs.append(m.group(1))
@@ -105,23 +124,19 @@ def extract_structured_text(raw: str) -> str:
         combined = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', combined)
         combined = re.sub(r'\s{2,}', ' ', combined).strip(' "\'').strip()
         return combined
-    # fallback: strip tags and control chars
     s = re.sub(r'<[^>]+>', ' ', s)
     s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
     return s
 
 def looks_like_code_block(s: str) -> bool:
-    # рядки, що явно містять код/умови/ініціалізацію — відкидаємо
     if not s:
         return True
     if re.search(r'\b(condition|expression|init|compile|preprocessfilelinenumbers|thislist|playerSide|vehicle player)\b', s, flags=re.IGNORECASE):
         return True
     if re.search(r'\\n|\\r|\\t|"\s*\n', s):
         return True
-    # якщо рядок містить багато символів коду (скобки, ==, ||, &&) — це код
     if re.search(r'[{}()\[\];=<>!|&\\]', s):
-        # але якщо є багато букв і пробілів — можливо це текст з кодом, залишимо для подальшої перевірки
         if len(re.findall(r'[A-Za-zА-Яа-яЁёЇїІіЄєҐґ]', s)) < 5:
             return True
     return False
@@ -130,9 +145,7 @@ def clean_line_for_slot(s: str) -> str:
     s = strip_quotes_semicolons(s)
     s = extract_structured_text(s)
     s = re.sub(r'\s{2,}', ' ', s).strip()
-    # remove leading numbering like '1.' if present
     s = re.sub(r'^\s*\d+\.\s*', '', s)
-    # remove stray 'value=' or 'description=' prefixes left
     s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
     s = s.strip(' "\'')
     return s
@@ -170,18 +183,9 @@ def dedupe_preserve_order(items: List[str], fuzzy_threshold: float = 0.78) -> Li
 
 # ─── Core parser ─────────────────────────────────────────────────────────────
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
-    """
-    Агресивний парсер: повертає список (title, [slot1, slot2, ...]).
-    Фокус: відкинути код/умови, витягнути людські заголовки і їхні слоти.
-    """
-    # normalize newlines
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     raw_lines = [ln.rstrip() for ln in text.splitlines()]
-
-    # quick cleanup: remove empty and pure-control lines
     raw_lines = [ln for ln in raw_lines if ln and not re.fullmatch(r'[\x00-\x1f\x7f-\x9f]+', ln)]
-
-    # remove long initial addon/class block if present (many lines without spaces or with underscores)
     i = 0
     n = len(raw_lines)
     tech_count = 0
@@ -189,97 +193,74 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         tech_count += 1
         i += 1
     if tech_count >= 6:
-        # skip that initial block
         raw_lines = raw_lines[i:]
-
-    # collapse repeated code blocks (like many lines of condition=" ... " repeated)
     collapsed: List[str] = []
     prev = None
     for ln in raw_lines:
         ln_stripped = ln.strip()
-        # if line looks like code, skip it
         if looks_like_code_block(ln_stripped):
-            # but if it contains human text inside quotes, extract that
             m = re.search(r'(?:value|description)\s*=\s*"([^"]+)"', ln_stripped, flags=re.IGNORECASE)
             if m:
                 candidate = m.group(1).strip()
                 if not looks_like_code_block(candidate):
                     collapsed.append(candidate)
             continue
-        # remove trailing '";' or stray quotes
         ln_clean = strip_quotes_semicolons(ln_stripped)
-        # avoid adding exact duplicates in a row
         if ln_clean == prev:
             continue
         collapsed.append(ln_clean)
         prev = ln_clean
-
-    # also extract any value/description attributes anywhere
     for m in re.finditer(r'(?:value|description)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE):
         v = m.group(1).strip()
         if v and not looks_like_code_block(v):
             collapsed.append(v)
-
-    # now cleaned lines to analyze
     lines = [l for l in collapsed if l and not looks_like_code_block(l)]
-
-    # group detection
-    groups_map: Dict[str, List[str]] = {}  # title -> slots
+    groups_map: Dict[str, List[str]] = {}
     current_title = None
-
     idx = 0
     L = len(lines)
     while idx < L:
         ln = lines[idx].strip()
-        # if line looks like a title: contains '|' or '@' or keywords
         if '|' in ln or '@' in ln or re.search(r'\b(відділен|відділ|бригада|екіпаж|командир|пехотн|піхотн|пехотное|штаб)\b', ln, flags=re.IGNORECASE):
             current_title = normalize_slot_name(strip_quotes_semicolons(ln))
-            if current_title not in groups_map:
-                groups_map[current_title] = []
-            # collect following numbered slots
+            groups_map.setdefault(current_title, [])
             j = idx + 1
-            while j < L and re.match(r'^\s*\d+\.\s*', lines[j]):
-                slot = clean_line_for_slot(lines[j])
+            slots = []
+            while j < L and (re.match(r'^\s*\d+\.\s*', lines[j]) or looks_like_slot_start(lines[j])):
+                slot = re.sub(r'^\s*\d+\.\s*', '', lines[j]).strip()
+                slot = clean_line_for_slot(slot)
                 if slot and not looks_like_code_block(slot):
-                    groups_map[current_title].append(normalize_slot_name(slot))
+                    slots.append(slot)
                 j += 1
-            # if none found, try to parse inline numbered items in the same line or next few lines
-            if not groups_map[current_title]:
-                # inline in same line after title
-                inline_found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', ln)
-                for f in inline_found:
-                    f2 = normalize_slot_name(f.strip())
-                    if f2 and not looks_like_code_block(f2):
-                        groups_map[current_title].append(f2)
-                # look ahead few lines for numbered patterns
+            if not slots:
                 k = idx + 1
                 while k < min(L, idx + 6):
                     if re.search(r'\d+\.', lines[k]):
                         found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', lines[k])
                         for f in found:
-                            f2 = normalize_slot_name(f.strip())
+                            f2 = f.strip()
                             if f2 and not looks_like_code_block(f2):
-                                groups_map[current_title].append(f2)
+                                slots.append(f2)
                     k += 1
-            idx += 1
-            continue
-
-        # if line starts with numbering -> group under generic title
+            if slots:
+                slots = [normalize_slot_name(s) for s in slots if s and s.strip()]
+                slots = dedupe_preserve_order(slots)
+                groups_map[current_title].extend(slots)
+                idx = j
+                continue
+            else:
+                idx += 1
+                continue
         if re.match(r'^\s*\d+\.\s*', ln):
-            # create generic title if none
             if current_title is None:
                 current_title = "Відділення"
-                if current_title not in groups_map:
-                    groups_map[current_title] = []
-            # collect consecutive numbered slots
+                groups_map.setdefault(current_title, [])
             while idx < L and re.match(r'^\s*\d+\.\s*', lines[idx]):
-                slot = clean_line_for_slot(lines[idx])
+                slot = re.sub(r'^\s*\d+\.\s*', '', lines[idx]).strip()
                 if slot and not looks_like_code_block(slot):
                     groups_map[current_title].append(normalize_slot_name(slot))
                 idx += 1
             continue
-
-        # if line contains both title and numbered items in one line (title | 1. A 2. B)
         if '|' in ln and re.search(r'\d+\.', ln):
             parts = ln.split('|', 1)
             title = normalize_slot_name(strip_quotes_semicolons(parts[0]))
@@ -290,23 +271,17 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 groups_map.setdefault(title, []).extend(slots)
             idx += 1
             continue
-
-        # otherwise: maybe a standalone slot-like line (contains Cyrillic words and not too short)
         if re.search(r'[А-Яа-яЁёЇїІіЄєҐґA-Za-z]', ln) and len(ln.split()) >= 1 and not looks_like_code_block(ln):
-            # if current_title exists, append as slot; else create generic title
             if current_title is None:
                 current_title = "Відділення"
                 groups_map.setdefault(current_title, [])
-            # avoid adding lines that look like single tokens (technical)
             if len(ln) > 2 and not re.fullmatch(r'[_A-Za-z0-9\-]+', ln):
                 groups_map[current_title].append(normalize_slot_name(ln))
         idx += 1
-
-    # postprocess: dedupe slots per title and merge identical titles
     final: List[Tuple[str, List[str]]] = []
     for title, slots in groups_map.items():
-        cleaned = []
         seen = set()
+        cleaned_slots = []
         for s in slots:
             s2 = normalize_slot_name(s)
             if not s2:
@@ -315,11 +290,9 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             if key in seen:
                 continue
             seen.add(key)
-            cleaned.append(s2)
-        if cleaned:
-            final.append((re.sub(r'\s{2,}', ' ', title).strip(), cleaned))
-
-    # merge groups with same normalized title (case-insensitive)
+            cleaned_slots.append(s2)
+        if cleaned_slots:
+            final.append((re.sub(r'\s{2,}', ' ', title).strip(), cleaned_slots))
     merged: Dict[str, List[str]] = {}
     for title, slots in final:
         key = title.lower()
@@ -327,7 +300,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         merged[key]["slots"].extend(slots)
     result: List[Tuple[str, List[str]]] = []
     for k, v in merged.items():
-        slots = dedupe_preserve_order([s for s in v["slots"] if s and not is_template_slot(s)])
+        slots = dedupe_preserve_order([s for s in v["slots"] if s and not re.fullmatch(r'^[\W_]{1,5}$', s)])
         if slots:
             result.append((v["title"], slots))
     return result
@@ -351,11 +324,8 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть текстовий mission.sqm до повідомлення.")
     attachment = ctx.message.attachments[0]
-
-    # reset stop flags for this channel
     _stop_sending_by_channel[ctx.channel.id] = False
     _stop_sending_global = False
-
     try:
         raw = await attachment.read()
         if isinstance(raw, (bytes, bytearray)):
@@ -367,10 +337,7 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
             sqm_text = str(raw)
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
-
     groups = extract_units_and_slots(sqm_text)
-
-    # fallback: if nothing found, try to extract all numbered lines
     if not groups:
         all_numbered = re.findall(r'^\s*\d+\.\s*(.+)$', sqm_text, flags=re.MULTILINE)
         cleaned = []
@@ -378,14 +345,11 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
             s2 = clean_line_for_slot(s)
             if s2 and not looks_like_code_block(s2):
                 cleaned.append(normalize_slot_name(s2))
-        cleaned = dedupe_preserve_order([c for c in cleaned if c and not is_template_slot(c)])
+        cleaned = dedupe_preserve_order([c for c in cleaned if c and not re.fullmatch(r'^[\W_]{1,5}$', c)])
         if cleaned:
             groups = [("Відділення", cleaned)]
-
     if not groups:
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
-
-    # send groups sequentially, check stop flags
     sent = 0
     for title, slots in groups:
         if _stop_sending_global or _stop_sending_by_channel.get(ctx.channel.id):
@@ -398,7 +362,6 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
             await ctx.send(f"```{out_text}```")
             sent += 1
         except Exception:
-            # chunk fallback
             parts = out_text.splitlines()
             chunk = []
             for i, line in enumerate(parts):
@@ -413,14 +376,11 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
                 await ctx.send(f"```{chr(10).join(chunk)}```")
                 sent += 1
         await asyncio.sleep(0.12)
-
-    # reset stop flags
     _stop_sending_by_channel[ctx.channel.id] = False
     _stop_sending_global = False
-
     await ctx.send(f"✅ Готово. Опубліковано відділень: {sent}.")
 
-# ─── UI: slot buttons and claim flow (kept from previous implementation) ─────
+# ─── UI: slot buttons and claim flow (kept) ─────────────────────────────────
 class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
         owner = sessions[sid]["owners"][idx]
