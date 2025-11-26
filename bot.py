@@ -1,7 +1,9 @@
 # bot.py
-# Discord бот: локальний витяг mission.sqm з .pbo через ExtractPbo (Mikero),
-# очищення тексту, парсинг відділень і публікація слотів.
-# .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, VTG_CHANNEL_ID (опц.), EXTRACTPBO_PATH
+# Discord бот для імпорту mission.sqm / .pbo
+# - Працює на Render (Linux) без необхідності запускати Windows .exe
+# - Якщо EXTRACTPBO_PATH вказано і доступний (локально на Windows), бот спробує його викликати
+# - Інакше використовує zip-фолбек та агресивний rap-декодер (rap_to_text_aggressive)
+# .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, VTG_CHANNEL_ID (опц.), EXTRACTPBO_PATH (опц.), EXTRACTOR_API_URL (опц.), EXTRACTOR_API_KEY (опц.)
 
 import os
 import re
@@ -22,7 +24,7 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# keep_alive optional
+# optional keep_alive for some hosts; safe to ignore if not present
 try:
     from keep_alive import keep_alive
     keep_alive()
@@ -50,11 +52,15 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 1160843618433630228)
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 1395065909185478769)
+VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 0)
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
 
-# ExtractPbo path from .env (full path to ExtractPbo.exe)
-EXTRACTPBO_PATH = os.getenv("EXTRACTPBO_PATH", "ExtractPbo")
+# Optional: path to ExtractPbo (Windows). On Render (Linux) this will usually be unset.
+EXTRACTPBO_PATH = os.getenv("EXTRACTPBO_PATH", "").strip()
+
+# Optional external extractor service
+EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL", "").strip()
+EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY", "").strip()
 
 processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}
@@ -65,17 +71,18 @@ TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
-# ─── Reminder ─────────────────────────────────────────────────────────────────
+# ─── Reminder (optional) ─────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
     if now.weekday() in (4, 6) and now.hour == 19 and now.minute == 30:
-        ch = bot.get_channel(VTG_CHANNEL_ID)
-        if ch:
-            try:
-                await ch.send("||@everyone||\n**Сбор VTG**")
-            except:
-                pass
+        if VTG_CHANNEL_ID:
+            ch = bot.get_channel(VTG_CHANNEL_ID)
+            if ch:
+                try:
+                    await ch.send("||@everyone||\n**Сбор VTG**")
+                except:
+                    pass
 
 # ─── Utilities: encoding, mojibake fixes ──────────────────────────────────────
 def _normalize_whitespace(s: str) -> str:
@@ -289,7 +296,7 @@ def is_likely_rap_or_binary(b: bytes) -> bool:
     ratio = printable / max(1, len(b))
     return ratio < 0.6
 
-# ─── PBO extraction helpers ──────────────────────────────────────────────────
+# ─── PBO extraction helpers (zip fallback + optional ExtractPbo) ────────────
 def extract_mission_from_pbo_bytes_zip(pbo_bytes: bytes) -> Optional[bytes]:
     try:
         z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
@@ -300,11 +307,17 @@ def extract_mission_from_pbo_bytes_zip(pbo_bytes: bytes) -> Optional[bytes]:
         pass
     return None
 
-def extract_mission_with_extractpbo(pbo_bytes: bytes, timeout: int = 60) -> str:
+def extract_mission_with_extractpbo_if_available(pbo_bytes: bytes, timeout: int = 60) -> Optional[str]:
     """
-    Використовує ExtractPbo (EXTRACTPBO_PATH) для витягу mission.sqm з .pbo байтів.
-    Повертає текст mission.sqm (str) або викидає помилку.
+    Якщо EXTRACTPBO_PATH вказано і доступний (локально), викликаємо його.
+    Повертає текст mission.sqm або None якщо не вдалося.
+    На Render (Linux) зазвичай поверне None і буде використано zip/rap фолбек.
     """
+    if not EXTRACTPBO_PATH:
+        return None
+    # перевірка доступності файлу
+    if not os.path.isfile(EXTRACTPBO_PATH):
+        return None
     tmpdir = tempfile.mkdtemp(prefix="extractpbo_")
     try:
         pbo_path = os.path.join(tmpdir, "upload.pbo")
@@ -312,41 +325,46 @@ def extract_mission_with_extractpbo(pbo_bytes: bytes, timeout: int = 60) -> str:
             f.write(pbo_bytes)
         outdir = os.path.join(tmpdir, "out")
         os.makedirs(outdir, exist_ok=True)
-
-        # Команда: підлаштуй аргументи під версію ExtractPbo, якщо потрібно
+        # Виклик ExtractPbo; аргументи можуть відрізнятись за версією
         cmd = [EXTRACTPBO_PATH, "-o", outdir, pbo_path]
-
-        # Виконання без shell
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
-
-        # Пошук mission.sqm
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+        except Exception:
+            return None
         for root, _, files in os.walk(outdir):
             for name in files:
                 if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
                     with open(os.path.join(root, name), "rb") as sf:
                         raw = sf.read()
-                        # якщо файл виглядає бінарним — застосуємо агресивний декодер
                         if is_likely_rap_or_binary(raw):
                             return rap_to_text_aggressive(raw)
-                        # спробуємо декодувати виявленим кодуванням або utf-8
                         enc = detect_encoding_bytes(raw) or "utf-8"
-                        try:
-                            return raw.decode(enc, errors="replace")
-                        except Exception:
-                            return raw.decode("utf-8", errors="replace")
-        # фолбек: спробувати zip-витяг (якщо ExtractPbo не знайшов)
-        zres = extract_mission_from_pbo_bytes_zip(pbo_bytes)
-        if zres:
-            if is_likely_rap_or_binary(zres):
-                return rap_to_text_aggressive(zres)
-            enc = detect_encoding_bytes(zres) or "utf-8"
-            return zres.decode(enc, errors="replace")
-        raise FileNotFoundError("mission.sqm not found after ExtractPbo extraction")
+                        return raw.decode(enc, errors="replace")
+        return None
     finally:
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
+
+def extract_mission_fallback(pbo_bytes: bytes) -> str:
+    """
+    Фолбек для Render: zip-розпакування або агресивний rap-декодер.
+    Повертає текст mission.sqm (str).
+    """
+    # 1) Спробувати zip-архів
+    zres = extract_mission_from_pbo_bytes_zip(pbo_bytes)
+    if zres:
+        if is_likely_rap_or_binary(zres):
+            return rap_to_text_aggressive(zres)
+        enc = detect_encoding_bytes(zres) or "utf-8"
+        return zres.decode(enc, errors="replace")
+    # 2) Якщо виглядає як rap/binary — агресивно декодуємо весь файл
+    if is_likely_rap_or_binary(pbo_bytes):
+        return rap_to_text_aggressive(pbo_bytes)
+    # 3) Інакше пробуємо декодувати як текст
+    enc = detect_encoding_bytes(pbo_bytes) or "utf-8"
+    return pbo_bytes.decode(enc, errors="replace")
 
 # ─── Parser for mission.sqm (flexible) ───────────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
@@ -422,10 +440,56 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
         return groups
     return []
 
-# ─── Command: import_sqm (uses ExtractPbo for .pbo) ──────────────────────────
+# ─── Helpers: normalize/dedupe slots ────────────────────────────────────────
+def normalize_slot_name(s: str) -> str:
+    s = s or ""
+    s = s.strip()
+    s = re.sub(r'\s{2,}', ' ', s)
+    s = re.sub(r'\s+([!?.,:;])', r'\1', s)
+    s = re.sub(r'([!?.]){2,}', r'\1', s)
+    return s
+
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for it in items:
+        key = it.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(it)
+    return out
+
+# ─── Optional: upload to external extractor (if you still want to use it) ───
+async def upload_to_service(attachment: discord.Attachment, timeout: int = 60) -> Dict[str, Any]:
+    if not EXTRACTOR_API_URL:
+        return {"status": "no-config", "error": "EXTRACTOR_API_URL not set"}
+    headers = {}
+    if EXTRACTOR_API_KEY:
+        headers["Authorization"] = f"Bearer {EXTRACTOR_API_KEY}"
+    file_bytes = await attachment.read()
+    data = aiohttp.FormData()
+    data.add_field("file", file_bytes, filename=attachment.filename, content_type="application/octet-stream")
+    async with aiohttp.ClientSession() as sess:
+        try:
+            async with sess.post(EXTRACTOR_API_URL, data=data, headers=headers, timeout=timeout) as resp:
+                text = await resp.text()
+                ctype = resp.headers.get("Content-Type", "")
+                if resp.status not in (200, 201):
+                    return {"status": "error", "error": f"{resp.status} {text[:400]}"}
+                if "application/json" in ctype or text.strip().startswith("{") or text.strip().startswith("["):
+                    try:
+                        j = json.loads(text)
+                        return {"status": "ok", "json": j}
+                    except Exception:
+                        return {"status": "ok", "text": text}
+                return {"status": "ok", "text": text}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+# ─── Command: import_sqm ────────────────────────────────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context):
-    if ctx.channel.id != ADMIN_CHANNEL_ID:
+    if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
@@ -435,38 +499,80 @@ async def імпорт_sqm(ctx: commands.Context):
     sqm_text = None
     method = None
 
-    try:
-        if attachment.filename.lower().endswith(".pbo"):
-            raw = await attachment.read()
-            try:
-                sqm_text = extract_mission_with_extractpbo(raw)
-                method = "local:ExtractPbo"
-            except subprocess.CalledProcessError as e:
-                return await ctx.send(f"❌ ExtractPbo помилка: {e}")
-            except FileNotFoundError:
-                return await ctx.send("❌ Не знайдено mission.sqm у PBO після витягу.")
-            except Exception as e:
-                return await ctx.send(f"❌ Помилка при витягу PBO: {e}")
-        else:
-            # .sqm or other plain text
-            data = await attachment.read()
-            if is_likely_rap_or_binary(data):
-                sqm_text = rap_to_text_aggressive(data)
-                method = "local:rap"
+    # 1) Якщо EXTRACTOR_API_URL задано — спробуємо зовнішній сервіс (опціонально)
+    if EXTRACTOR_API_URL:
+        try:
+            res = await upload_to_service(attachment)
+            if res.get("status") == "ok":
+                method = res.get("json") and "external:json" or "external:plain"
+                if res.get("json"):
+                    j = res["json"]
+                    if isinstance(j, dict) and j.get("decoded_text"):
+                        sqm_text = j.get("decoded_text")
+                    elif isinstance(j, dict) and j.get("departments"):
+                        # якщо сервіс повернув готові departments — відправимо їх і завершимо
+                        departments = j.get("departments")
+                        sent_count = 0
+                        total_slots = 0
+                        for d in departments:
+                            title = d.get("section") or d.get("name") or "Відділення"
+                            slots = d.get("slots") or d.get("units") or []
+                            cleaned = []
+                            for s in slots:
+                                name = s.get("name") if isinstance(s, dict) else s
+                                cleaned.append(normalize_slot_name(clean_slot_value(name)))
+                            cleaned = [c for c in cleaned if c and c.lower() != "слот"]
+                            cleaned = dedupe_preserve_order(cleaned)[:25]
+                            total_slots += len(cleaned)
+                            embed = discord.Embed(title=title, description="\n".join(f"{i+1}. {x}" for i,x in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
+                            try:
+                                await ctx.send(embed=embed)
+                                sent_count += 1
+                            except: pass
+                        return await ctx.send(f"✅ Очищення завершено. Опубліковано відділень: {sent_count}. Знайдено слотів: {total_slots}. Метод: external")
+                elif res.get("text"):
+                    text = res["text"]
+                    m = re.search(r'<pre[^>]*>(.*?)</pre>', text, flags=re.DOTALL | re.IGNORECASE)
+                    if m:
+                        sqm_text = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
+                    else:
+                        sqm_text = re.sub(r'<[^>]+>', ' ', text)
             else:
-                enc = detect_encoding_bytes(data) or "utf-8"
-                sqm_text = data.decode(enc, errors="replace")
-                method = enc
-    except Exception as e:
-        return await ctx.send(f"❌ Помилка читання вкладення: {e}")
+                # сервіс не відповів коректно — продовжимо локально
+                sqm_text = None
+        except Exception:
+            sqm_text = None
 
-    # парсимо отриманий текст
+    # 2) Якщо не отримали текст від сервісу — локальна обробка
+    if not sqm_text:
+        try:
+            raw = await attachment.read()
+            if attachment.filename.lower().endswith(".pbo"):
+                # спробуємо ExtractPbo якщо доступний (локально), інакше фолбек
+                sqm_text = extract_mission_with_extractpbo_if_available(raw)
+                if sqm_text:
+                    method = "local:ExtractPbo"
+                else:
+                    sqm_text = extract_mission_fallback(raw)
+                    method = "local:fallback"
+            else:
+                # .sqm або інший текстовий файл
+                if is_likely_rap_or_binary(raw):
+                    sqm_text = rap_to_text_aggressive(raw)
+                    method = "local:rap"
+                else:
+                    enc = detect_encoding_bytes(raw) or "utf-8"
+                    sqm_text = raw.decode(enc, errors="replace")
+                    method = enc
+        except Exception as e:
+            return await ctx.send(f"❌ Помилка читання вкладення: {e}")
+
     if not sqm_text:
         return await ctx.send("⚠️ Не вдалося отримати текст з файлу.")
 
+    # 3) Парсимо текст у групи
     groups = parse_mission_sqm_flexible(sqm_text)
     if not groups:
-        # фолбек: знайти unitName/description/text
         units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', sqm_text, flags=re.IGNORECASE | re.DOTALL)
         if not units:
             units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", sqm_text, flags=re.IGNORECASE | re.DOTALL)
@@ -477,12 +583,11 @@ async def імпорт_sqm(ctx: commands.Context):
         if units:
             groups = [("Відділення", [clean_slot_value(u) for u in units])]
 
-    # діагностика (коротко)
+    # 4) Діагностика (коротко)
     dbg_lines = []
     raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', sqm_text, flags=re.IGNORECASE | re.DOTALL)[:5]
     if raw_t_inner:
         dbg_lines.append("first <t>inner = " + (raw_t_inner[0][:300] + '...' if len(raw_t_inner[0])>300 else raw_t_inner[0]))
-
     emb_dbg = discord.Embed(title="🔍 Діагностика імпорту mission.sqm", color=discord.Color.orange())
     emb_dbg.add_field(name="Метод обробки", value=method or "unknown", inline=False)
     if dbg_lines:
@@ -492,6 +597,7 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
+    # 5) Якщо не знайшли груп — повернути прев'ю
     if not groups:
         preview = (sqm_text or "")[:2000]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
@@ -506,15 +612,15 @@ async def імпорт_sqm(ctx: commands.Context):
             await ctx.send(embed=emb)
         return
 
-    # публікація відділень у адмін-каналі
-    target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-    if not target_ch:
-        return await ctx.send("❌ Адмін-канал не знайдено за ID.")
-
+    # 6) Публікація відділень (очищення, dedupe)
+    target_ch = bot.get_channel(ADMIN_CHANNEL_ID) if ADMIN_CHANNEL_ID else ctx.channel
     sent_count = 0
     total_slots = 0
     for name, slots in groups:
-        cleaned = [clean_slot_value(s) for s in slots][:25]
+        raw_slots = [ s.get("name") if isinstance(s, dict) else s for s in slots ]
+        cleaned = [ normalize_slot_name(clean_slot_value(x)) for x in raw_slots ]
+        cleaned = [c for c in cleaned if c and c.lower() != "слот"]
+        cleaned = dedupe_preserve_order(cleaned)[:25]
         total_slots += len(cleaned)
         embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{i+1}. {s}" for i,s in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
         try:
@@ -592,7 +698,7 @@ class ClaimSlotButton(Button):
         embed.add_field(name="Слот #", value=str(self.idx+1), inline=True)
         embed.add_field(name="Власник", value=(sess["owners"][self.idx].mention if sess["owners"][self.idx] else "Вільний"), inline=True)
         embed.add_field(name="Кандидат", value=user.mention, inline=False)
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
+        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID) if ADMIN_CHANNEL_ID else None
         if admin_ch:
             msg = await admin_ch.send(embed=embed)
             await msg.edit(view=ClaimDecisionView(self.sid, self.idx, user.id, msg.id))
@@ -637,7 +743,7 @@ class DecisionModal(Modal):
             else:
                 await claimant.send(f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\nПричина: {reason}")
         except: pass
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
+        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID) if ADMIN_CHANNEL_ID else None
         if admin_ch:
             try:
                 admin_msg = await admin_ch.fetch_message(self.admin_msg_id)
@@ -704,7 +810,7 @@ class RemoveSlotView(View):
 
 @bot.command(name="зняти")
 async def зняти(ctx: commands.Context, session_msg_id: int):
-    if ctx.channel.id != ADMIN_CHANNEL_ID:
+    if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
     session = sessions.get(session_msg_id)
     if not session:
