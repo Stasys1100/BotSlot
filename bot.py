@@ -1,8 +1,7 @@
 # bot.py
-# Повний робочий код бота з інтеграцією зовнішнього сервісу (HTTP upload),
-# фіксами mojibake, витягом innerText з <t ...> тегів, діагностикою та інтегрованим парсером відділень.
-# Збережи цей файл як bot.py, додай змінні в .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, VTG_CHANNEL_ID,
-# EXTRACTOR_API_URL (і опціонально EXTRACTOR_API_KEY).
+# Discord бот: локальний витяг mission.sqm з .pbo через ExtractPbo (Mikero),
+# очищення тексту, парсинг відділень і публікація слотів.
+# .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, VTG_CHANNEL_ID (опц.), EXTRACTPBO_PATH
 
 import os
 import re
@@ -12,6 +11,8 @@ import html
 import json
 import subprocess
 import datetime
+import tempfile
+import shutil
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Dict, Any
 
@@ -21,20 +22,20 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# Якщо у тебе є keep_alive.py — залишаємо виклик, інакше ігноруємо
+# keep_alive optional
 try:
     from keep_alive import keep_alive
     keep_alive()
 except Exception:
     pass
 
-# Спроба підключити детектори кодування (необов'язково)
+# optional encoding detectors
 try:
-    from charset_normalizer import from_bytes as cn_from_bytes  # pip install charset-normalizer
+    from charset_normalizer import from_bytes as cn_from_bytes
 except Exception:
     cn_from_bytes = None
 try:
-    import chardet  # pip install chardet
+    import chardet
 except Exception:
     chardet = None
 
@@ -52,17 +53,16 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 1160843618433630228)
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 1395065909185478769)
 
-# External extractor config (опціонально)
-EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL")  # наприклад https://fileproinfo.com/api/upload
-EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY")  # опціонально
+# ExtractPbo path from .env (full path to ExtractPbo.exe)
+EXTRACTPBO_PATH = os.getenv("EXTRACTPBO_PATH", "ExtractPbo")
 
 processed_messages: set[int] = set()
-sessions: dict[int, dict] = {}              # message_id → { title, lines, owners, channel_id }
-claims: dict[tuple[int,int], list] = {}     # (message_id, idx) → [User, ...]
+sessions: dict[int, dict] = {}
+claims: dict[tuple[int,int], list] = {}
 request_counter = 0
 
-TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
-MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
+TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
+MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
 # ─── Reminder ─────────────────────────────────────────────────────────────────
@@ -77,7 +77,7 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── Утиліти: нормалізація, детектор кодування, mojibake ───────────────────────
+# ─── Utilities: encoding, mojibake fixes ──────────────────────────────────────
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
@@ -86,7 +86,6 @@ def _normalize_whitespace(s: str) -> str:
     return s.strip()
 
 def detect_encoding_bytes(b: bytes) -> Optional[str]:
-    """Спроба виявити кодування через charset_normalizer або chardet."""
     if cn_from_bytes:
         try:
             results = cn_from_bytes(b)
@@ -113,7 +112,6 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
     candidates: List[Tuple[str, str]] = []
     if initial_text is not None:
         candidates.append((initial_text, "as-decoded"))
-
     tried_encs = ["utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"]
     for enc in tried_encs:
         try:
@@ -121,7 +119,6 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
             candidates.append((txt, enc))
         except Exception:
             pass
-
     try:
         redecoded = initial_text.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
         candidates.append((redecoded, "latin1->utf8"))
@@ -137,13 +134,11 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
         candidates.append((redecoded, "cp1251->utf8"))
     except Exception:
         pass
-
     def score(item: Tuple[str, str]) -> Tuple[int, float]:
         txt, _ = item
         cyr = _cyrillic_score(txt)
         printable = sum(1 for ch in txt if ch.isprintable()) / max(1, len(txt))
         return (cyr, printable)
-
     best = max(candidates, key=score)
     return best[0], best[1]
 
@@ -175,15 +170,13 @@ def fix_mojibake_text(text: str) -> str:
         candidates.append((b.decode("cp1251", errors="replace"), "utf8bytes->cp1251"))
     except Exception:
         pass
-
     def score_item(it: Tuple[str, str]) -> Tuple[int, float]:
         t = it[0]
         return (_cyrillic_score(t), sum(1 for ch in t if ch.isprintable()) / max(1, len(t)))
-
     best = max(candidates, key=score_item)
     return best[0]
 
-# ─── HTML / тег <t> витяг та очищення ────────────────────────────────────────
+# ─── HTML / <t> extraction and cleaning ──────────────────────────────────────
 def extract_structured_text(raw: str) -> str:
     if not raw:
         return ""
@@ -195,7 +188,6 @@ def extract_structured_text(raw: str) -> str:
         inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
         inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
         inner = fix_mojibake_text(inner)
-        # додаткова спроба виправити класичний mojibake
         if re.search(r'Р\s?С', inner):
             try:
                 inner = inner.encode('latin-1', errors='replace').decode('utf-8', errors='replace')
@@ -226,19 +218,17 @@ def clean_slot_value(raw: str) -> str:
         return "Слот"
     return s or "Слот"
 
-# ─── RAP-декодер (aggressive) ────────────────────────────────────────────────
+# ─── RAP aggressive decoder ──────────────────────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
     detected = detect_encoding_bytes(data)
     initial_text = None
     tried_label = "unknown"
-
     if detected:
         try:
             initial_text = data.decode(detected, errors="replace")
             tried_label = detected
         except Exception:
             initial_text = None
-
     if initial_text is None:
         for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
             try:
@@ -250,20 +240,16 @@ def rap_to_text_aggressive(data: bytes) -> str:
     if initial_text is None:
         initial_text = data.decode("latin-1", errors="replace")
         tried_label = "latin-1-fallback"
-
     best_text, best_enc = _try_redecode_candidates(data, initial_text)
     if best_enc and best_enc != "as-decoded":
         tried_label = best_enc
-
     text = best_text
     text = fix_mojibake_text(text)
-
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', text)
     def keep(ch):
         o = ord(ch)
         return (32 <= o <= 126) or (0x0400 <= o <= 0x04FF) or ch in '\n\r\t{}=;"\'.,:-_()[]/\\<>|'
     filtered = ''.join(ch if keep(ch) else ' ' for ch in text)
-
     keywords = ['class Group', 'class Unit', 'groupName', 'unitName', 'description', 'name', 'title']
     low = filtered.lower()
     indices = []
@@ -276,7 +262,6 @@ def rap_to_text_aggressive(data: bytes) -> str:
                 break
             indices.append(idx)
             start = idx + len(k)
-
     if indices:
         window = 5000
         frags = []
@@ -287,19 +272,16 @@ def rap_to_text_aggressive(data: bytes) -> str:
         candidate = '\n'.join(frags)
     else:
         candidate = filtered[:300000]
-
     candidate = candidate.replace('};', '};\n')
     candidate = re.sub(r';\s*', ';\n', candidate)
     candidate = re.sub(r'\{\s*', '{\n', candidate)
     candidate = re.sub(r'\s*\}\s*', '\n}\n', candidate)
-
     lines = [l.strip() for l in candidate.splitlines() if l.strip()]
     candidate = '\n'.join(lines)
     candidate = _normalize_whitespace(candidate)
     candidate = candidate.replace("'", '"')
     return f"// rap_decoded (encoding={tried_label})\n{candidate}"
 
-# ─── Хевристика: чи це RAP/бінарні дані ──────────────────────────────────────
 def is_likely_rap_or_binary(b: bytes) -> bool:
     if len(b) >= 3 and b[:3] == b'raP':
         return True
@@ -307,20 +289,8 @@ def is_likely_rap_or_binary(b: bytes) -> bool:
     ratio = printable / max(1, len(b))
     return ratio < 0.6
 
-# ─── PBO extraction & attachment reading with robust encoding heuristics ─────
-def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
-    try:
-        import pbo as pbo_lib
-    except Exception:
-        pbo_lib = None
-    if pbo_lib:
-        try:
-            archive = pbo_lib.PBO(io.BytesIO(pbo_bytes))
-            for name in archive.list():
-                if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
-                    return archive.read(name)
-        except Exception:
-            pass
+# ─── PBO extraction helpers ──────────────────────────────────────────────────
+def extract_mission_from_pbo_bytes_zip(pbo_bytes: bytes) -> Optional[bytes]:
     try:
         z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
         for name in z.namelist():
@@ -330,153 +300,58 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
         pass
     return None
 
-async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
-    data = await attachment.read()
-    filename = attachment.filename.lower()
+def extract_mission_with_extractpbo(pbo_bytes: bytes, timeout: int = 60) -> str:
+    """
+    Використовує ExtractPbo (EXTRACTPBO_PATH) для витягу mission.sqm з .pbo байтів.
+    Повертає текст mission.sqm (str) або викидає помилку.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="extractpbo_")
+    try:
+        pbo_path = os.path.join(tmpdir, "upload.pbo")
+        with open(pbo_path, "wb") as f:
+            f.write(pbo_bytes)
+        outdir = os.path.join(tmpdir, "out")
+        os.makedirs(outdir, exist_ok=True)
 
-    if is_likely_rap_or_binary(data):
+        # Команда: підлаштуй аргументи під версію ExtractPbo, якщо потрібно
+        cmd = [EXTRACTPBO_PATH, "-o", outdir, pbo_path]
+
+        # Виконання без shell
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=timeout)
+
+        # Пошук mission.sqm
+        for root, _, files in os.walk(outdir):
+            for name in files:
+                if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
+                    with open(os.path.join(root, name), "rb") as sf:
+                        raw = sf.read()
+                        # якщо файл виглядає бінарним — застосуємо агресивний декодер
+                        if is_likely_rap_or_binary(raw):
+                            return rap_to_text_aggressive(raw)
+                        # спробуємо декодувати виявленим кодуванням або utf-8
+                        enc = detect_encoding_bytes(raw) or "utf-8"
+                        try:
+                            return raw.decode(enc, errors="replace")
+                        except Exception:
+                            return raw.decode("utf-8", errors="replace")
+        # фолбек: спробувати zip-витяг (якщо ExtractPbo не знайшов)
+        zres = extract_mission_from_pbo_bytes_zip(pbo_bytes)
+        if zres:
+            if is_likely_rap_or_binary(zres):
+                return rap_to_text_aggressive(zres)
+            enc = detect_encoding_bytes(zres) or "utf-8"
+            return zres.decode(enc, errors="replace")
+        raise FileNotFoundError("mission.sqm not found after ExtractPbo extraction")
+    finally:
         try:
-            text = rap_to_text_aggressive(data)
-            return text, "rap-detected"
+            shutil.rmtree(tmpdir)
         except Exception:
             pass
 
-    def try_decode_bytes(b: bytes) -> Tuple[str, str]:
-        detected = detect_encoding_bytes(b)
-        candidates: List[Tuple[str, str]] = []
-        if detected:
-            try:
-                txt = b.decode(detected, errors="replace")
-                candidates.append((txt, detected))
-            except Exception:
-                pass
-        for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
-            try:
-                txt = b.decode(enc, errors="replace")
-                candidates.append((txt, enc))
-            except Exception:
-                pass
-        if candidates:
-            base_txt = candidates[0][0]
-            try:
-                t = base_txt.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
-                candidates.append((t, "latin1->utf8"))
-            except Exception:
-                pass
-            try:
-                t = base_txt.encode("latin-1", errors="replace").decode("cp1251", errors="replace")
-                candidates.append((t, "latin1->cp1251"))
-            except Exception:
-                pass
-            try:
-                t = base_txt.encode("cp1251", errors="replace").decode("utf-8", errors="replace")
-                candidates.append((t, "cp1251->utf8"))
-            except Exception:
-                pass
-        best = max(candidates, key=lambda it: (_cyrillic_score(it[0]), sum(1 for ch in it[0] if ch.isprintable())/max(1,len(it[0]))))
-        return best
-
-    if filename.endswith(".pbo"):
-        sqm_raw = extract_mission_from_pbo_bytes(data)
-        if not sqm_raw:
-            text = rap_to_text_aggressive(data)
-            return text, "pbo-rap-fragments"
-        if is_likely_rap_or_binary(sqm_raw) or sqm_raw[:3] == b'raP':
-            text = rap_to_text_aggressive(sqm_raw)
-            return text, "pbo-rap"
-        text, enc = try_decode_bytes(sqm_raw)
-        text = fix_mojibake_text(text)
-        return text, f"pbo-{enc}"
-
-    if filename.endswith(".sqm"):
-        if is_likely_rap_or_binary(data) or data[:3] == b'raP':
-            text = rap_to_text_aggressive(data)
-            return text, "rap"
-        text, enc = try_decode_bytes(data)
-        text = fix_mojibake_text(text)
-        return text, enc
-
-    if is_likely_rap_or_binary(data):
-        return rap_to_text_aggressive(data), "rap-raw"
-    text, enc = try_decode_bytes(data)
-    text = fix_mojibake_text(text)
-    return text, enc
-
-# ─── Інтегрований парсер відділень (користувацький код) ──────────────────────
-def parse_section(text: str) -> Dict[str, Any]:
-    header_pattern = re.compile(
-        r'^(.*?)\|\s*(.*?)\|\s*(.*?)\|\s*(.*?)\|\s*(\[.*?\])\s*$',
-        re.MULTILINE
-    )
-    result = {
-        "section": None,
-        "formation": None,
-        "type": None,
-        "vehicle": None,
-        "slots": []
-    }
-
-    lines = text.strip().splitlines()
-    m_header = header_pattern.match(text.strip().splitlines()[0] if lines else "")
-    if m_header and lines:
-        header = m_header.group(1).strip()
-        formation = m_header.group(2).strip()
-        section_type = m_header.group(3).strip()
-        vehicle = m_header.group(4).strip()
-
-        result.update({
-            "section": header,
-            "formation": formation,
-            "type": section_type,
-            "vehicle": vehicle,
-        })
-
-        for line in lines[1:]:
-            m = re.match(r'^\s*(\d+)\.\s*(.*?)\s*(?:\s+(\w{2,})\s*)?$', line)
-            if m:
-                number = int(m.group(1))
-                name = fix_mojibake_text(m.group(2).strip())
-                abbr = m.group(3)
-                result["slots"].append({"num": number, "name": name, "abbr": abbr})
-            else:
-                t = line.strip()
-                if t:
-                    result["slots"].append({"num": None, "name": fix_mojibake_text(t), "abbr": None})
-    else:
-        slots: List[Dict[str, Any]] = []
-        header = lines[0] if lines else ""
-        for l in lines[1:]:
-            m = re.match(r'^\s*(\d+)\.\s*(.*?)\s*(?:\s+(\w{2,})\s*)?$', l)
-            if m:
-                slots.append({
-                    "num": int(m.group(1)),
-                    "name": fix_mojibake_text(m.group(2).strip()),
-                    "abbr": m.group(3)
-                })
-        result = {
-            "section": fix_mojibake_text(header.strip()),
-            "formation": None,
-            "type": None,
-            "vehicle": None,
-            "slots": slots
-        }
-    return result
-
-def extract_departments(text: str) -> List[Dict[str, Any]]:
-    blocks = re.split(r'\n\s*\n', text.strip())
-    res: List[Dict[str, Any]] = []
-    for block in blocks:
-        if not block.strip():
-            continue
-        parsed = parse_section(block)
-        if parsed:
-            res.append(parsed)
-    return res
-
+# ─── Parser for mission.sqm (flexible) ───────────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
-
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -484,7 +359,6 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             if not mname:
                 mname = re.search(r'(?:name|groupName|title)\s*=\s*[\'"](.*?)[\'"]', blk, flags=re.IGNORECASE | re.DOTALL)
             gname = clean_slot_value(mname.group(1)) if mname else "Відділення"
-
             units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
             slots = []
             for u in units:
@@ -510,7 +384,6 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
                 slots.append(clean_slot_value(q.group(1)) if q else "Слот")
             groups.append((gname, slots))
         return groups
-
     for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"(.*?)"\s*;', txt, flags=re.IGNORECASE | re.DOTALL):
         gname = clean_slot_value(m.group(1))
         start = m.end()
@@ -524,10 +397,8 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
                 units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
         if units:
             groups.append((gname, [clean_slot_value(u) for u in units]))
-
     if groups:
         return groups
-
     unit_matches = [(m.start(), clean_slot_value(m.group(1))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
     group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)\s*=', txt, flags=re.IGNORECASE)]
     if unit_matches:
@@ -549,153 +420,71 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
                 gname = clean_slot_value(mname2.group(1)) if mname2 else "Відділення"
             groups.append((gname, slots))
         return groups
-
     return []
 
-# ─── Інтеграція з зовнішнім сервісом (probe + upload) ────────────────────────
-async def probe_and_upload(attachment: discord.Attachment, timeout=30) -> Dict[str, Any]:
-    if not EXTRACTOR_API_URL:
-        return {"status":"no-config", "error":"EXTRACTOR_API_URL not set"}
-
-    candidates = []
-    url_base = EXTRACTOR_API_URL.rstrip('/')
-    candidates.append(EXTRACTOR_API_URL)
-    candidates += [
-        url_base + "/upload",
-        url_base + "/api/upload",
-        url_base + "/api/extract",
-        url_base + "/api/v1/upload",
-        url_base + "/file/upload"
-    ]
-
-    headers = {}
-    if EXTRACTOR_API_KEY:
-        headers['Authorization'] = f"Bearer {EXTRACTOR_API_KEY}"
-
-    file_bytes = await attachment.read()
-
-    async with aiohttp.ClientSession() as sess:
-        last_err = None
-        for url in candidates:
-            try:
-                try:
-                    async with sess.get(url, headers=headers, timeout=8) as rget:
-                        pass
-                except Exception:
-                    pass
-
-                data = aiohttp.FormData()
-                data.add_field('file', file_bytes, filename=attachment.filename, content_type='application/octet-stream')
-                async with sess.post(url, data=data, headers=headers, timeout=timeout) as resp:
-                    text = await resp.text()
-                    ctype = resp.headers.get('Content-Type', '')
-                    if resp.status in (200,201):
-                        if 'application/json' in ctype or text.strip().startswith('{') or text.strip().startswith('['):
-                            try:
-                                j = json.loads(text)
-                            except Exception:
-                                j = None
-                            if isinstance(j, dict) and j.get('departments'):
-                                return {"status":"ok","method":f"external:{url}","departments":j['departments']}
-                            if isinstance(j, dict) and j.get('decoded_text'):
-                                return {"status":"ok","method":f"external:{url}","decoded_text":j['decoded_text']}
-                            return {"status":"ok","method":f"external:{url}","json":j or text}
-                        return {"status":"ok","method":f"external:{url}","html":text}
-                    else:
-                        last_err = f"{url} -> {resp.status} {text[:200]}"
-            except Exception as e:
-                last_err = str(e)
-        return {"status":"error","error": last_err or "no candidate succeeded"}
-
-# ─── Команда імпорту з діагностикою та JSON-експортом (оновлена) ─────────────
+# ─── Command: import_sqm (uses ExtractPbo for .pbo) ──────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
-
     attachment = ctx.message.attachments[0]
+    await ctx.send("🔄 Обробка файлу...")
+
+    sqm_text = None
+    method = None
 
     try:
-        res = await probe_and_upload(attachment)
-    except Exception as e:
-        res = {"status":"error", "error": str(e)}
-
-    text = None
-    method = None
-    departments = None
-
-    if res.get("status") == "ok":
-        method = res.get("method", "external")
-        if res.get("departments"):
-            departments = res["departments"]
-        elif res.get("decoded_text"):
-            text = res["decoded_text"]
-        elif res.get("json") and isinstance(res["json"], dict):
-            j = res["json"]
-            if j.get("departments"):
-                departments = j["departments"]
-            elif j.get("decoded_text"):
-                text = j["decoded_text"]
-            else:
-                text = json.dumps(j, ensure_ascii=False)
-        elif res.get("html"):
-            method = method or "external:html"
-            html_text = res["html"]
-            m = re.search(r'<pre[^>]*>(.*?)</pre>', html_text, flags=re.DOTALL|re.IGNORECASE)
-            if m:
-                decoded = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
-                text = decoded
-            else:
-                decoded = re.sub(r'<[^>]+>', ' ', html_text)
-                text = decoded
-    else:
-        try:
-            text, method = await read_attachment_sqm_text(attachment)
-        except Exception as e:
-            return await ctx.send(f"❌ Не вдалося обробити файл ні зовнішнім сервісом, ні локально: {e}")
-
-    if departments is None and text:
-        groups = parse_mission_sqm_flexible(text)
-        if groups:
-            departments = [{"section": n, "slots":[{"name":s} for s in sl]} for n, sl in groups]
+        if attachment.filename.lower().endswith(".pbo"):
+            raw = await attachment.read()
+            try:
+                sqm_text = extract_mission_with_extractpbo(raw)
+                method = "local:ExtractPbo"
+            except subprocess.CalledProcessError as e:
+                return await ctx.send(f"❌ ExtractPbo помилка: {e}")
+            except FileNotFoundError:
+                return await ctx.send("❌ Не знайдено mission.sqm у PBO після витягу.")
+            except Exception as e:
+                return await ctx.send(f"❌ Помилка при витягу PBO: {e}")
         else:
-            units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
-            if not units:
-                units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", text, flags=re.IGNORECASE | re.DOTALL)
-            if not units:
-                arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)
-                for a in arrs:
-                    units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
-            if units:
-                departments = [{"section":"Відділення", "slots":[{"name":clean_slot_value(u)} for u in units]}]
+            # .sqm or other plain text
+            data = await attachment.read()
+            if is_likely_rap_or_binary(data):
+                sqm_text = rap_to_text_aggressive(data)
+                method = "local:rap"
+            else:
+                enc = detect_encoding_bytes(data) or "utf-8"
+                sqm_text = data.decode(enc, errors="replace")
+                method = enc
+    except Exception as e:
+        return await ctx.send(f"❌ Помилка читання вкладення: {e}")
 
+    # парсимо отриманий текст
+    if not sqm_text:
+        return await ctx.send("⚠️ Не вдалося отримати текст з файлу.")
+
+    groups = parse_mission_sqm_flexible(sqm_text)
+    if not groups:
+        # фолбек: знайти unitName/description/text
+        units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', sqm_text, flags=re.IGNORECASE | re.DOTALL)
+        if not units:
+            units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", sqm_text, flags=re.IGNORECASE | re.DOTALL)
+        if not units:
+            arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', sqm_text, flags=re.IGNORECASE | re.DOTALL)
+            for a in arrs:
+                units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
+        if units:
+            groups = [("Відділення", [clean_slot_value(u) for u in units])]
+
+    # діагностика (коротко)
     dbg_lines = []
-    if text:
-        raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-        raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
-        raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
-        raw_nq = re.findall(r'(?:description|unitName|text)\s*=\s*([^;{][^;]{1,400})\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-        raw_t_open = re.findall(r'<\s*t\b[^>]*>', text, flags=re.IGNORECASE)[:20]
-        raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-
-        def short(x): return (x[:300] + '...') if x and len(x) > 300 else (x or '')
-        if raw_double:
-            dbg_lines.append("raw_double[0] = " + short(raw_double[0]))
-        if raw_single:
-            dbg_lines.append("raw_single[0] = " + short(raw_single[0]))
-        if raw_arrays:
-            dbg_lines.append("raw_arrays[0] = " + short(raw_arrays[0]))
-        if raw_nq:
-            dbg_lines.append("raw_no_quotes[0] = " + short(raw_nq[0]))
-        if raw_t_open:
-            dbg_lines.append("first <t ...> tag = " + short(raw_t_open[0]))
-        if raw_t_inner:
-            dbg_lines.append("first <t>inner = " + short(raw_t_inner[0]))
+    raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', sqm_text, flags=re.IGNORECASE | re.DOTALL)[:5]
+    if raw_t_inner:
+        dbg_lines.append("first <t>inner = " + (raw_t_inner[0][:300] + '...' if len(raw_t_inner[0])>300 else raw_t_inner[0]))
 
     emb_dbg = discord.Embed(title="🔍 Діагностика імпорту mission.sqm", color=discord.Color.orange())
-    emb_dbg.add_field(name="Метод обробки", value=method or (res.get("method") if isinstance(res, dict) else "unknown"), inline=False)
+    emb_dbg.add_field(name="Метод обробки", value=method or "unknown", inline=False)
     if dbg_lines:
         emb_dbg.add_field(name="Приклади raw-захоплень", value="\n".join(dbg_lines)[:1000], inline=False)
     try:
@@ -703,23 +492,13 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
-    try:
-        if departments:
-            json_text = json.dumps(departments, ensure_ascii=False, indent=2)
-            buf = io.BytesIO(json_text.encode('utf-8'))
-            buf.seek(0)
-            file = discord.File(fp=buf, filename="departments.json")
-            await ctx.send("📁 Ось розпарсовані відділення (JSON):", file=file)
-    except Exception:
-        pass
-
-    if not departments:
-        preview = (text or "")[:2000]
+    if not groups:
+        preview = (sqm_text or "")[:2000]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
         emb.add_field(name="Метод обробки", value=method or "unknown", inline=False)
         emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
         try:
-            buf = io.BytesIO((text or "").encode('utf-8'))
+            buf = io.BytesIO((sqm_text or "").encode('utf-8'))
             buf.seek(0)
             file = discord.File(fp=buf, filename="decoded_mission_sqm.txt")
             await ctx.send(embed=emb, file=file)
@@ -727,33 +506,24 @@ async def імпорт_sqm(ctx: commands.Context):
             await ctx.send(embed=emb)
         return
 
+    # публікація відділень у адмін-каналі
     target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
     if not target_ch:
         return await ctx.send("❌ Адмін-канал не знайдено за ID.")
 
     sent_count = 0
     total_slots = 0
-    for d in departments:
-        title = d.get("section") or "Відділення"
-        slots = d.get("slots", [])
-        cleaned_slots = []
-        for s in slots:
-            name = s.get("name") if isinstance(s, dict) else s
-            name = clean_slot_value(name)
-            if not name or name.lower().startswith("<t color") or name in {'"', "'"}:
-                name = "Слот"
-            cleaned_slots.append(name)
-        cleaned_slots = [x for x in cleaned_slots if x][:25]
-        total_slots += len(cleaned_slots)
-        embed = discord.Embed(title=title, color=discord.Color.blurple())
-        embed.description = "\n".join(f"{i+1}. {s}" for i, s in enumerate(cleaned_slots)) if cleaned_slots else "— слотів не знайдено —"
+    for name, slots in groups:
+        cleaned = [clean_slot_value(s) for s in slots][:25]
+        total_slots += len(cleaned)
+        embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{i+1}. {s}" for i,s in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
         try:
             await target_ch.send(embed=embed)
             sent_count += 1
         except Exception:
             pass
 
-    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method or res.get('method','external')}`. Знайдено слотів: {total_slots}.")
+    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method}`. Знайдено слотів: {total_slots}.")
 
 # ─── Slot UI and management (existing logic preserved) ───────────────────────
 def build_embed(sess: dict) -> discord.Embed:
@@ -782,18 +552,15 @@ class SlotButton(Button):
         sess = sessions[self.sid]
         owner = sess["owners"][self.idx]
         ch_id = sess["channel_id"]
-
         if owner is None:
             for s in sessions.values():
                 if s["channel_id"] == ch_id and user in s["owners"]:
                     return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
             sess["owners"][self.idx] = user
             return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
-
         if owner == user:
             sess["owners"][self.idx] = None
             return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
-
         return await inter.response.send_message(f"⚠️ Цей слот зайнято {owner.mention}.", view=ClaimSlotView(self.sid, self.idx), ephemeral=True)
 
 class SlotView(View):
@@ -839,11 +606,7 @@ class DecisionModal(Modal):
     def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
         title = "Причина призначення" if accept else "Причина відмови"
         super().__init__(title=title)
-        self.sid = sid
-        self.idx = idx
-        self.claimant_id = claimant_id
-        self.admin_msg_id = admin_msg_id
-        self.accept = accept
+        self.sid = sid; self.idx = idx; self.claimant_id = claimant_id; self.admin_msg_id = admin_msg_id; self.accept = accept
         self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
         self.add_item(self.reason)
 
@@ -971,7 +734,6 @@ async def on_ready():
 async def on_message(message: discord.Message):
     if message.author.bot or message.id in processed_messages:
         return
-
     if "запис слоти" in message.content.lower():
         processed_messages.add(message.id)
         header, slots, owners = None, [], []
@@ -987,14 +749,12 @@ async def on_message(message: discord.Message):
                 owners.append(owner)
             elif header is None:
                 header = txt
-
         slots, owners = slots[:25], owners[:len(slots)]
         sess = {"title": header or DEFAULT_TITLE, "lines": slots, "owners": owners, "channel_id": message.channel.id}
         embed = build_embed(sess)
         sent  = await message.channel.send(embed=embed)
         sessions[sent.id] = sess
         await sent.edit(view=SlotView(sent.id))
-
     await bot.process_commands(message)
 
 @bot.command(name="оновити", aliases=["update"])
