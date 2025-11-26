@@ -1,4 +1,8 @@
 # bot.py
+# Повний робочий код бота з надійним імпортом mission.sqm/.pbo, виправленням mojibake,
+# витягом innerText з <t ...> тегів, діагностикою та інтеграцією парсера відділень.
+# Коментарі українською. Заміни свій поточний bot.py на цей файл.
+
 import os
 import re
 import io
@@ -16,14 +20,14 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# optional keep-alive (if you have such a module)
+# Якщо у тебе є keep_alive.py — залишаємо виклик, інакше ігноруємо
 try:
     from keep_alive import keep_alive
     keep_alive()
 except Exception:
     pass
 
-# Optional encoding detector libraries (if installed)
+# Спроба підключити детектори кодування (необов'язково)
 try:
     from charset_normalizer import from_bytes as cn_from_bytes  # pip install charset-normalizer
 except Exception:
@@ -68,7 +72,7 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── Utilities: whitespace, encoding detection, mojibake fixes, structured text ─
+# ─── Утиліти: нормалізація, детектор кодування, mojibake ───────────────────────
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
@@ -77,10 +81,7 @@ def _normalize_whitespace(s: str) -> str:
     return s.strip()
 
 def detect_encoding_bytes(b: bytes) -> Optional[str]:
-    """
-    Try to detect encoding using charset_normalizer or chardet.
-    Returns encoding name or None.
-    """
+    """Спроба виявити кодування через charset_normalizer або chardet."""
     if cn_from_bytes:
         try:
             results = cn_from_bytes(b)
@@ -105,8 +106,9 @@ def _cyrillic_score(s: str) -> int:
 
 def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[str, str]:
     """
-    Given original bytes and an initial decoded text, try multiple decoding strategies
-    and return the best candidate (text, encoding_label) based on cyrillic score and printability.
+    Спробувати кілька декодувань і вибрати найкращий кандидат за кількістю кирилиці
+    та відсотком друкованих символів.
+    Повертає (text, label).
     """
     candidates: List[Tuple[str, str]] = []
     if initial_text is not None:
@@ -120,7 +122,7 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
         except Exception:
             pass
 
-    # mojibake pattern: initial_text was decoded with wrong encoding -> re-encode/ decode
+    # Спроби "перекодування" (типовий випадок mojibake)
     try:
         redecoded = initial_text.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
         candidates.append((redecoded, "latin1->utf8"))
@@ -132,7 +134,6 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
     except Exception:
         pass
 
-    # scoring: prefer candidate with most Cyrillic letters and reasonable printable ratio
     def score(item: Tuple[str, str]) -> Tuple[int, float]:
         txt, _ = item
         cyr = _cyrillic_score(txt)
@@ -142,15 +143,17 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
     best = max(candidates, key=score)
     return best[0], best[1]
 
+# ─── HTML / тег <t> витяг та очищення ────────────────────────────────────────
 def extract_structured_text(raw: str) -> str:
     """
-    Extract inner text from <t ...>...</t> tags (all occurrences), decode HTML entities,
-    remove other tags and control characters. If no paired tags exist, remove opening tags.
+    Витягує innerText з тегів <t ...>...</t>, декодує HTML-entities,
+    видаляє інші теги та control-символи.
+    Якщо парних тегів немає — видаляє відкриваючі/закриваючі теги.
     """
     if not raw:
         return ""
     s = html.unescape(raw)
-    # Find paired <t ...>...</t> and join inner text
+    # знайти парні <t ...>...</t>
     chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
     if chunks:
         inner = " ".join(chunks)
@@ -158,7 +161,7 @@ def extract_structured_text(raw: str) -> str:
         inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
         inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
         return inner
-    # If no paired tags, remove opening/closing tags and other tags
+    # якщо парних тегів немає — просто видалити теги
     s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'</\s*t\s*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'<[^>]+>', ' ', s)
@@ -168,10 +171,10 @@ def extract_structured_text(raw: str) -> str:
 
 def clean_slot_value(raw: str) -> str:
     """
-    Aggressive cleaning of a single token:
-    - extract inner text from <t ...> tags
-    - remove paths, .sqf/.pbo, long addon paths, control chars
-    - if result is empty or obviously noisy, return 'Слот'
+    Агресивне очищення одного значення слоту:
+    - витяг innerText з <t ...>
+    - видалення шляхів, довгих хешів, control-символів
+    - якщо результат порожній або шумний — повернути 'Слот'
     """
     if raw is None:
         return "Слот"
@@ -180,26 +183,25 @@ def clean_slot_value(raw: str) -> str:
     s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\bhttps?://\S+\b', '', s)
-    s = re.sub(r'\b[A-Za-z0-9_\\/:.-]{40,}\b', ' ', s)  # long paths/strings
+    s = re.sub(r'\b[A-Za-z0-9_\\/:.\-]{40,}\b', ' ', s)  # довгі шляхи/рядки
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
     if not s or s.lower().startswith("<t color") or s in {'"', "'"}:
         return "Слот"
     return s or "Слот"
 
-# ─── RAP decoder with robust encoding handling ─────────────────────────────────
+# ─── RAP-декодер (aggressive) ────────────────────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
     """
-    Decode RAP-like bytes into text with robust encoding heuristics:
-    - try detector (charset_normalizer/chardet) first
-    - try utf-8, cp1251, latin-1, koi8-r
-    - apply re-decode mojibake fixes and pick best candidate by Cyrillic score
-    - normalize and return text prefixed with chosen encoding label
+    Агресивне декодування RAP/binary-даних:
+    - спроба детектора кодування
+    - спроби utf-8, cp1251, koi8-r, latin-1
+    - спроби "перекодування" для mojibake
+    - обрізка/нормалізація та повернення тексту
     """
     detected = detect_encoding_bytes(data)
     initial_text = None
     tried_label = "unknown"
 
-    # If detector suggests encoding, try it first
     if detected:
         try:
             initial_text = data.decode(detected, errors="replace")
@@ -207,7 +209,6 @@ def rap_to_text_aggressive(data: bytes) -> str:
         except Exception:
             initial_text = None
 
-    # If detector failed, try common encodings in order
     if initial_text is None:
         for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
             try:
@@ -220,14 +221,13 @@ def rap_to_text_aggressive(data: bytes) -> str:
         initial_text = data.decode("latin-1", errors="replace")
         tried_label = "latin-1-fallback"
 
-    # Try re-decode strategies and pick best
     best_text, best_enc = _try_redecode_candidates(data, initial_text)
     if best_enc and best_enc != "as-decoded":
         tried_label = best_enc
 
     text = best_text
 
-    # sanitize control characters and normalize
+    # видалити control-символи
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', text)
     def keep(ch):
         o = ord(ch)
@@ -269,8 +269,23 @@ def rap_to_text_aggressive(data: bytes) -> str:
     candidate = candidate.replace("'", '"')
     return f"// rap_decoded (encoding={tried_label})\n{candidate}"
 
-# ─── PBO extraction & attachment reading with robust encoding heuristics ─────
+# ─── Хевристика: чи це RAP/бінарні дані ──────────────────────────────────────
+def is_likely_rap_or_binary(b: bytes) -> bool:
+    """
+    Якщо починається з 'raP' або має низький відсоток друкованих байтів — вважаємо бінаром/RAP.
+    """
+    if len(b) >= 3 and b[:3] == b'raP':
+        return True
+    printable = sum(1 for ch in b if 32 <= ch <= 126 or ch in (9,10,13))
+    ratio = printable / max(1, len(b))
+    return ratio < 0.6
+
+# ─── PBO extraction та читання вкладення ─────────────────────────────────────
 def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
+    """
+    Спроба витягти mission.sqm з .pbo (через pbo lib або як zip).
+    Якщо не знайдено — повертає None.
+    """
     try:
         import pbo as pbo_lib
     except Exception:
@@ -294,14 +309,22 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
 
 async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Read attachment (.pbo or .sqm) and return (text, method).
-    Uses detector and multiple decode strategies, picks best candidate by Cyrillic score.
+    Прочитати вкладення (.pbo або .sqm) і повернути (text, method).
+    Пріоритет: якщо виглядає як RAP/binary — застосувати rap_to_text_aggressive.
+    Інакше — спробувати декодування різними кодуваннями та вибрати найкраще.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
+    # Якщо виглядає як RAP/binary — застосувати агресивний декодер
+    if is_likely_rap_or_binary(data):
+        try:
+            text = rap_to_text_aggressive(data)
+            return text, "rap-detected"
+        except Exception:
+            pass
+
     def try_decode_bytes(b: bytes) -> Tuple[str, str]:
-        # detector suggestion
         detected = detect_encoding_bytes(b)
         candidates: List[Tuple[str, str]] = []
         if detected:
@@ -310,14 +333,12 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
                 candidates.append((txt, detected))
             except Exception:
                 pass
-        # try common encodings
         for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
             try:
                 txt = b.decode(enc, errors="replace")
                 candidates.append((txt, enc))
             except Exception:
                 pass
-        # try mojibake fixes from first candidate if exists
         if candidates:
             base_txt = candidates[0][0]
             try:
@@ -330,7 +351,6 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
                 candidates.append((t, "latin1->cp1251"))
             except Exception:
                 pass
-        # score and pick best
         best = max(candidates, key=lambda it: (_cyrillic_score(it[0]), sum(1 for ch in it[0] if ch.isprintable())/max(1,len(it[0]))))
         return best
 
@@ -339,33 +359,26 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
         if not sqm_raw:
             text = rap_to_text_aggressive(data)
             return text, "pbo-rap-fragments"
-        if sqm_raw[:3] == b'raP':
+        if is_likely_rap_or_binary(sqm_raw) or sqm_raw[:3] == b'raP':
             text = rap_to_text_aggressive(sqm_raw)
             return text, "pbo-rap"
         text, enc = try_decode_bytes(sqm_raw)
         return text, f"pbo-{enc}"
 
     if filename.endswith(".sqm"):
-        if data[:3] == b'raP':
+        if is_likely_rap_or_binary(data) or data[:3] == b'raP':
             text = rap_to_text_aggressive(data)
             return text, "rap"
         text, enc = try_decode_bytes(data)
         return text, enc
 
-    if data[:3] == b'raP':
+    if is_likely_rap_or_binary(data):
         return rap_to_text_aggressive(data), "rap-raw"
     text, enc = try_decode_bytes(data)
     return text, enc
 
-# ─── User-provided parsing helpers (integrated) ──────────────────────────────
-# These functions are the user's section/department parser. They are integrated
-# and used to produce JSON output of departments/slots.
-
+# ─── Інтегрований парсер відділень (користувацький код) ──────────────────────
 def decode_text_simple(raw_bytes: bytes, encoding_hint: Optional[str] = None) -> str:
-    """
-    Simple fallback decoder used by the user's helper functions.
-    Tries hint first, then common encodings.
-    """
     if encoding_hint:
         try:
             return raw_bytes.decode(encoding_hint)
@@ -383,7 +396,6 @@ def parse_section(text: str) -> Dict[str, Any]:
     Парсинг секції відділення за прикладом:
     Альфа 2-1 | 93-тя ОМБр «Холодний Яр» | Механізоване відділення | БМП-2 | [СС]
     1. Командир відділення  ENG
-    2. Гренадер
     ...
     """
     header_pattern = re.compile(
@@ -447,7 +459,7 @@ def parse_section(text: str) -> Dict[str, Any]:
 
 def extract_departments(text: str) -> List[Dict[str, Any]]:
     """
-    Split text into department blocks by double newlines and parse each block.
+    Розбити текст на блоки по подвійних нових рядках і розпарсити кожен блок.
     """
     blocks = re.split(r'\n\s*\n', text.strip())
     res: List[Dict[str, Any]] = []
@@ -460,28 +472,14 @@ def extract_departments(text: str) -> List[Dict[str, Any]]:
     return res
 
 def process_input_text(input_text: str) -> str:
-    """
-    Input: raw text (or text after conversion)
-    Output: JSON string with all departments
-    """
     decomp = extract_departments(input_text)
     return json.dumps(decomp, ensure_ascii=False, indent=2)
 
-def load_file_as_text(file_path: str, encoding_hint: Optional[str] = None) -> str:
-    with open(file_path, "rb") as f:
-        raw = f.read()
-    return decode_text_simple(raw, encoding_hint=encoding_hint)
-
-# ─── Flexible parser with DOTALL and fallbacks (kept for compatibility) ──────
+# ─── Гнучкий парсер mission.sqm для ембедів ──────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
-    """
-    Returns list of (group_name, [slot1, slot2, ...])
-    This parser is used to create embeds similar to previous behavior.
-    """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
 
-    # 1) full class Group blocks
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -516,7 +514,6 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             groups.append((gname, slots))
         return groups
 
-    # 2) groupName/name/title + window
     for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"(.*?)"\s*;', txt, flags=re.IGNORECASE | re.DOTALL):
         gname = clean_slot_value(m.group(1))
         start = m.end()
@@ -534,7 +531,6 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     if groups:
         return groups
 
-    # 3) fallback: collect all unit tokens and group by markers
     unit_matches = [(m.start(), clean_slot_value(m.group(1))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
     group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)\s*=', txt, flags=re.IGNORECASE)]
     if unit_matches:
@@ -559,7 +555,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
 
     return []
 
-# ─── Import command with extended diagnostics and integrated user parser ──────
+# ─── Команда імпорту з діагностикою та JSON-експортом ────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -573,7 +569,7 @@ async def імпорт_sqm(ctx: commands.Context):
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # --- ДІАГНОСТИКА: перші raw-захоплення різними regex-ами ---
+    # Діагностика: приклади raw-захоплень
     raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
@@ -619,23 +615,21 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
-    # --- Use user's department parser to produce JSON output ---
+    # JSON-експорт розпарсованих відділень (для діагностики)
     try:
         departments = extract_departments(text)
         json_text = json.dumps(departments, ensure_ascii=False, indent=2)
-        # attach JSON as a file for convenience
         buf = io.BytesIO(json_text.encode('utf-8'))
         buf.seek(0)
         file = discord.File(fp=buf, filename="departments.json")
         await ctx.send("📁 Ось розпарсовані відділення (JSON):", file=file)
     except Exception:
-        # ignore if fails
         pass
 
-    # --- основний парсинг для ембедів (збережено сумісність) ---
+    # Основний парсинг для ембедів
     groups = parse_mission_sqm_flexible(text)
 
-    # фолбек: зібрати всі unit-токени
+    # Фолбек: зібрати всі unit-токени
     if not groups:
         units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
         if not units:
@@ -688,7 +682,7 @@ async def імпорт_sqm(ctx: commands.Context):
 
     await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method}`. Знайдено слотів: {total_slots}.")
 
-# ─── Slot UI and management (existing logic preserved) ───────────────────────
+# ─── Збережені UI/логіка слотів (залишено без змін) ──────────────────────────
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
@@ -877,7 +871,7 @@ async def зняти(ctx: commands.Context, session_msg_id: int):
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
     await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
 
-# ─── on_ready / on_message / service commands ─────────────────────────────────
+# ─── on_ready / on_message / сервісні команди ─────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
