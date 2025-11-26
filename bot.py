@@ -3,6 +3,8 @@ import re
 import subprocess
 import aiohttp
 import datetime
+import io
+import zipfile
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional
 
@@ -11,6 +13,12 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 from keep_alive import keep_alive
+
+# Optional PBO library (if installed on host). If не встановлено — pbo = None
+try:
+    import pbo
+except Exception:
+    pbo = None
 
 # ─── 1. Keep-alive та ENV ───────────────────────────────────────────────────────
 keep_alive()
@@ -25,17 +33,18 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─── 3. Конфігурація ────────────────────────────────────────────────────────────
-KYIV_TZ          = ZoneInfo("Europe/Kyiv")
-VTG_CHANNEL_ID   = 1160843618433630228
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+VTG_CHANNEL_ID = 1160843618433630228
+# Читаємо ADMIN_CHANNEL_ID з ENV; якщо не встановлено — можна підставити значення за замовчуванням
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or "1395065909185478769")
 
 processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}            # message_id → { title, lines, owners, channel_id }
 claims: dict[tuple[int,int], list] = {}   # (message_id, idx) → [User, ...]
 request_counter = 0                       # лічильник заявок
 
-TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
-MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
+TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
+MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
 
 # ─── 4. Щотижневий нагадувач VTG ────────────────────────────────────────────────
@@ -77,18 +86,18 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
 def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     """
     Повертає список кортежів (group_name, [slot1, slot2, ...]).
-    Парсер простий, орієнтований на стандартну структуру mission.sqm:
+    Парсер орієнтований на стандартну структуру mission.sqm:
     - class Group { ... name = "GroupName"; ... class Unit { ... description = "Role"; ... } ... }
-    Він намагається знайти name/groupName/description для групи та description/unitName для юнітів.
+    Підтримує різні поля: name, groupName, description, unitName, text.
     """
     groups: List[Tuple[str, List[str]]] = []
     current_group_name: Optional[str] = None
     current_slots: List[str] = []
 
     re_group_start = re.compile(r'^\s*class\s+Group\b', re.IGNORECASE)
-    re_name_line   = re.compile(r'^\s*(name|groupName|description)\s*=\s*"?(?P<val>[^";]+)"?\s*;', re.IGNORECASE)
-    re_unit_start  = re.compile(r'^\s*class\s+Unit\b', re.IGNORECASE)
-    re_slot_desc   = re.compile(r'^\s*(description|unitName)\s*=\s*"?(?P<val>[^";]+)"?\s*;', re.IGNORECASE)
+    re_group_name = re.compile(r'^\s*(name|groupName|description|title)\s*=\s*"?(?P<val>[^";]+)"?\s*;', re.IGNORECASE)
+    re_unit_start = re.compile(r'^\s*class\s+Unit\b', re.IGNORECASE)
+    re_slot_desc = re.compile(r'^\s*(description|unitName|text)\s*=\s*"?(?P<val>[^";]+)"?\s*;', re.IGNORECASE)
 
     in_group = False
     in_unit = False
@@ -96,32 +105,27 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     for raw in text.splitlines():
         line = raw.strip()
 
-        # Початок групи
         if re_group_start.match(line):
             # зберегти попередню групу
-            if current_group_name is not None:
-                groups.append((current_group_name, current_slots))
+            if current_group_name is not None or current_slots:
+                groups.append((current_group_name or "Відділення", current_slots))
             current_group_name = None
             current_slots = []
             in_group = True
             in_unit = False
             continue
 
-        # Назва групи (перший знайдений name/groupName/description)
         if in_group and current_group_name is None:
-            m_name = re_name_line.match(line)
+            m_name = re_group_name.match(line)
             if m_name:
                 current_group_name = m_name.group("val").strip()
                 continue
 
-        # Початок юніта (слоту)
         if re_unit_start.match(line):
             in_unit = True
-            # додаємо тимчасовий слот
             current_slots.append("Слот")
             continue
 
-        # Опис слоту (description або unitName)
         if in_unit:
             m_desc = re_slot_desc.match(line)
             if m_desc:
@@ -130,32 +134,87 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
                     current_slots[-1] = val
                 continue
 
-        # Груба детекція закінчення блоків
+        # груба детекція закінчення блоків
         if line == "};":
             if in_unit:
                 in_unit = False
                 continue
             if in_group:
-                # кінець групи
                 in_group = False
-                # якщо група мала назву або слоти — збережемо її
                 if current_group_name is not None or current_slots:
                     groups.append((current_group_name or "Відділення", current_slots))
                 current_group_name = None
                 current_slots = []
                 continue
 
-    # Якщо файл закінчився всередині групи
+    # кінець файлу
     if current_group_name is not None or current_slots:
         groups.append((current_group_name or "Відділення", current_slots))
 
-    # Очищення: заміна пустих слотів на "Слот", обрізка пробілів
+    # очищення
     cleaned: List[Tuple[str, List[str]]] = []
     for gname, gslots in groups:
         name = gname.strip() if gname else "Відділення"
         slots = [s.strip() if s and s.strip() else "Слот" for s in gslots]
         cleaned.append((name, slots))
     return cleaned
+
+# ─── 5.3 Допоміжні функції для читання вкладення (декодування + PBO) ───────────
+def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
+    """
+    Спроба витягти mission.sqm з PBO:
+    - якщо встановлено пакет pbo, використовуємо його;
+    - інакше пробуємо відкрити як zip (фолбек).
+    Повертає текст або None.
+    """
+    # Спроба через pbo (якщо встановлено)
+    if pbo:
+        try:
+            archive = pbo.PBO(io.BytesIO(pbo_bytes))
+            for name in archive.list():
+                if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
+                    data = archive.read(name)
+                    return data.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+    # Фолбек: zip-like
+    try:
+        z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
+        for name in z.namelist():
+            if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
+                return z.read(name).decode("utf-8", errors="ignore")
+    except Exception:
+        pass
+
+    return None
+
+async def read_attachment_text(attachment: discord.Attachment) -> Tuple[str, str]:
+    """
+    Пробує декодувати attachment різними кодуваннями.
+    Повертає (text, used_encoding).
+    Якщо attachment — .pbo, намагається витягти mission.sqm.
+    """
+    data = await attachment.read()
+    filename = attachment.filename.lower()
+
+    # Якщо .pbo — спробувати витягти
+    if filename.endswith(".pbo"):
+        extracted = extract_mission_from_pbo_bytes(data)
+        if extracted is not None:
+            return extracted, "extracted-from-pbo"
+        # якщо не вдалося — продовжимо пробувати декодування байтів
+
+    # Спроби декодування
+    for enc in ("utf-8", "cp1251", "latin-1"):
+        try:
+            text = data.decode(enc)
+            return text, enc
+        except Exception:
+            continue
+
+    # Фолбек: latin-1 з ignore
+    return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
 class SlotButton(Button):
@@ -529,27 +588,25 @@ async def імпорт_sqm(ctx: commands.Context):
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
 
     if not ctx.message.attachments:
-        return await ctx.send("❌ Прикріпіть файл mission.sqm до повідомлення.")
+        return await ctx.send("❌ Прикріпіть файл mission.sqm або .pbo до повідомлення.")
 
-    # Знайти attachment, який має назву mission.sqm або закінчується на .sqm
-    attachment = None
-    for a in ctx.message.attachments:
-        if a.filename.lower().endswith("mission.sqm") or a.filename.lower().endswith(".sqm"):
-            attachment = a
-            break
-
-    if not attachment:
-        return await ctx.send("❌ Не знайдено файл mission.sqm серед вкладень.")
+    # Знайти attachment (перший)
+    attachment = ctx.message.attachments[0]
 
     try:
-        data = await attachment.read()
-        text = data.decode("utf-8", errors="ignore")
+        text, used_enc = await read_attachment_text(attachment)
     except Exception:
-        return await ctx.send("❌ Не вдалося прочитати mission.sqm (кодування або формат).")
+        return await ctx.send("❌ Не вдалося прочитати вкладення.")
 
     groups = parse_mission_sqm(text)
     if not groups:
-        return await ctx.send("ℹ️ Відділення у mission.sqm не знайдено або файл порожній.")
+        preview = "\n".join(text.splitlines()[:40])[:1500]
+        await ctx.send(
+            "ℹ️ Відділення у mission.sqm не знайдено або файл порожній. "
+            f"Спроба декодування: **{used_enc}**. Ось прев'ю початку файлу для діагностики:"
+        )
+        await ctx.send(f"```\n{preview}\n```")
+        return
 
     target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
     if not target_ch:
@@ -557,7 +614,6 @@ async def імпорт_sqm(ctx: commands.Context):
 
     sent_count = 0
     for group_name, slot_list in groups:
-        # обмеження: максимум 25 слотів в одному embed; якщо більше — обрізаємо
         embed = build_group_embed(group_name, slot_list[:25])
         try:
             await target_ch.send(embed=embed)
@@ -634,7 +690,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
+        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
@@ -653,7 +709,7 @@ async def _gitpush(ctx: commands.Context):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
     emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
     emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
+    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
     emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
