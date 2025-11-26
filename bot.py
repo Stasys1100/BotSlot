@@ -1,6 +1,6 @@
 # bot.py
-# Discord бот: імпорт mission.sqm і побудова відділень/слотів + UI для “запис слоти”.
-# .env: DISCORD_TOKEN (обов'язково), ADMIN_CHANNEL_ID (опц.), VTG_CHANNEL_ID (опц.), DEPLOY_HOOK_URL (опц.)
+# Discord бот: імпорт mission.sqm та публікація відділень/слотів, із фільтрами та UI.
+# .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID (опц.), VTG_CHANNEL_ID (опц.), DEPLOY_HOOK_URL (опц.)
 
 import os
 import re
@@ -71,34 +71,29 @@ def is_noise(s: str) -> bool:
         return True
     low = s.lower()
 
-    # Літерали/службові
     noise_literals = {
         "none","null","true","false",
         "army","default","platoon","standard","nochange",
         "uk","ukr","honor","capture_1","defaultred","standardred",
-        "ввідділення","відділення"
+        "відділення","ввідділення"
     }
     if low in noise_literals:
         return True
 
-    # чисті числа або капс-токени
     if re.fullmatch(r'\d+', s):
         return True
     if re.fullmatch(r'[A-Z0-9_]+', s):
         return True
 
-    # моди/прапори/сервісні
     if ("rhs_" in low) or ("_hide" in low) or ("flag_manager" in low) or ("beacons" in low):
         return True
     if low.startswith("door_") or low.startswith("hatch") or "snorkel" in low or "plate" in low or "trunk" in low:
         return True
 
-    # моделі/персонажі
     if s.startswith("Male") and ("ENG" in s or "PER" in s or "RUS" in s):
         return True
 
-    # чисті назви техніки без контексту – відсікатимемо як окремий рядок (в слот потрапить у контексті)
-    single_tech = {"mavicblue1","mavicred1","m113","m113a3","bmp","bmp-2","bmп-2","mt-лб","gaз-66","tigр"}
+    single_tech = {"mavicblue1","mavicred1","m113","m113a3","bmp","bmp-2","бмп-2","mt-лб","gaz-66","tigр","tigr"}
     if low in single_tech:
         return True
 
@@ -159,7 +154,6 @@ def dedupe_preserve_order(items: List[str], fuzzy_threshold: float = 0.78) -> Li
         merged = False
         for i, e in enumerate(out):
             if difflib.SequenceMatcher(None, s_norm.lower(), e.lower()).ratio() >= fuzzy_threshold:
-                # кращий – багатший на кирилицю або довший
                 def cyr(x): return len(re.findall(r'[\u0400-\u04FF]', x))
                 if cyr(s_norm) > cyr(e) or (cyr(s_norm) == cyr(e) and len(s_norm) > len(e)):
                     out[i] = s_norm
@@ -180,7 +174,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     """
     Витягує (title, [slots]) з description/value і <t>…</t>.
     Фільтрує шум. Заголовки: містять '|' чи ключові слова (Альфа/Штаб/Бригада/ОМБр/ССО/ГУР/ЧВК/армейский/відділення/Піхотне).
-    Слоти: нумерація або початок на ключові слова; короткі токени техніки/ENG/MED теж допускаються (як частина слоту).
+    Слоти: нумерація або ключові слова; також всі інші рядки між заголовками, якщо не шум і не код.
     """
     text = text.replace('\r\n', '\n').replace('\r', '\n')
     matches = [(m.start(), html.unescape(m.group(1)).strip())
@@ -223,23 +217,9 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 cur_slots.append(slot)
             continue
 
-        # Короткі або технічні токени (ENG/MED/техніка) — додаємо, якщо не шум
-        if re.search(r'\b(ENG|MED|M113|M113A3|ZALA|Mavic|FPV|BMP|БМП|T-72|T-80|GAZ|ScanEagle|Орлан)\b', s, flags=re.IGNORECASE) or len(s.split()) <= 6:
-            if not is_noise(s):
-                cur_slots.append(clean_line_for_slot(s))
-            continue
-
-        # Інакше — або слот до активного заголовка, або новий заголовок
-        if cur_title:
-            if not is_noise(s):
-                cur_slots.append(clean_line_for_slot(s))
-        else:
-            if len(s) > 10 and not is_noise(s):
-                flush()
-                cur_title = s
-            else:
-                if not is_noise(s):
-                    cur_slots.append(clean_line_for_slot(s))
+        # Інші рядки між заголовками — додаємо як слоти, якщо не шум і не код
+        if not looks_like_code_block(s) and not is_noise(s):
+            cur_slots.append(clean_line_for_slot(s))
 
     flush()
     return groups
@@ -289,36 +269,60 @@ class SlotView(View):
             self.add_item(SlotButton(sid, idx))
 
 # ─── Claim flow (optional) ──────────────────────────────────────────────────
-class ClaimSlotButton(Button):
+class RemoveSlotModal(Modal):
     def __init__(self, sid: int, idx: int):
-        super().__init__(label="❗ Претендувати", style=discord.ButtonStyle.primary, custom_id=f"claim-slot-{sid}-{idx}")
+        super().__init__(title="Причина звільнення")
+        self.sid, self.idx = sid, idx
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
+        self.add_item(self.reason)
+
+    async def on_submit(self, inter: discord.Interaction):
+        sess = sessions[self.sid]
+        owner = sess["owners"][self.idx]
+        reason = self.reason.value
+        if not owner:
+            return await inter.response.send_message(f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True)
+        sess["owners"][self.idx] = None
+        ch = bot.get_channel(sess["channel_id"])
+        if ch:
+            try:
+                main = await ch.fetch_message(self.sid)
+                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
+            except: pass
+        try:
+            await owner.send(f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
+        except: pass
+        await inter.response.send_message(f"✅ Слот #{self.idx+1} звільнено.", ephemeral=True)
+
+class RemoveSlotButton(Button):
+    def __init__(self, sid: int, idx: int):
+        super().__init__(label=str(idx+1), style=discord.ButtonStyle.danger, custom_id=f"remove-{sid}-{idx}")
         self.sid, self.idx = sid, idx
 
     async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        # Заборона множинних претензій у тій же гілці
-        for s in sessions.values():
-            if s["channel_id"] == sess["channel_id"] and user in s.get("owners", []):
-                return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
-        key = (self.sid, self.idx)
-        lst = claims.setdefault(key, [])
-        if user in lst:
-            return await inter.response.send_message("ℹ️ Ви вже подали заявку.", ephemeral=True)
-        lst.append(user)
-        await inter.response.send_message("✅ Заявка прийнята.", ephemeral=True)
+        await inter.response.send_modal(RemoveSlotModal(self.sid, self.idx))
 
-class ClaimSlotView(View):
-    def __init__(self, sid: int, idx: int):
+class RemoveSlotView(View):
+    def __init__(self, sid: int):
         super().__init__(timeout=None)
-        self.add_item(ClaimSlotButton(sid, idx))
+        for idx in range(len(sessions[sid]["lines"])):
+            self.add_item(RemoveSlotButton(sid, idx))
+
+@bot.command(name="зняти")
+async def зняти(ctx: commands.Context, session_msg_id: int):
+    if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
+        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
+    session = sessions.get(session_msg_id)
+    if not session:
+        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
+    await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
 
 # ─── Commands ───────────────────────────────────────────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context, filter_id: str = None):
     """
     Імпорт текстового mission.sqm. Якщо задано filter_id (наприклад "2-2"),
-    повертає лише групи, де в заголовку присутній цей індекс.
+    повертає всі групи, де заголовок містить індекс як окремий токен (для всіх сторін).
     """
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
@@ -328,7 +332,6 @@ async def імпорт_sqm(ctx: commands.Context, filter_id: str = None):
     att = ctx.message.attachments[0]
     key = f"{ctx.message.id}:{att.id}"
     now = time.time()
-    # cleanup старих записів
     for k, t in list(_recent_imports.items()):
         if now - t > _RECENT_IMPORTS_TTL:
             _recent_imports.pop(k, None)
@@ -350,15 +353,15 @@ async def імпорт_sqm(ctx: commands.Context, filter_id: str = None):
         logger.exception("Parser crashed")
         groups = []
 
-    # Жорсткий фільтр по аргументу: якщо вказано filter_id — показуємо ТІЛЬКИ відповідні заголовки
+    # Якщо задано фільтр — відбираємо всі збіги по індексу (як окремий токен)
     if filter_id:
-        groups = [g for g in groups if filter_id in (g[0] or "")]
-        # Ніяких фолбеків або додаткових блоків у разі фільтра — тільки прямий збіг
+        pattern = re.compile(rf'\b{re.escape(filter_id)}\b')
+        groups = [g for g in groups if pattern.search(g[0] or "")]
         if not groups:
             _recent_imports.pop(key, None)
             return await ctx.send(f"⚠️ Не знайдено відділень з індексом {filter_id}.")
 
-    # Якщо фільтра немає і груп немає — спробуємо fallback за нумерованими рядками
+    # Якщо фільтра немає і нічого не знайдено — fallback: нумеровані рядки
     if not filter_id and not groups:
         all_numbered = re.findall(r'^\s*\d+\.\s*(.+)$', text, flags=re.MULTILINE)
         cleaned = []
@@ -374,7 +377,6 @@ async def імпорт_sqm(ctx: commands.Context, filter_id: str = None):
         _recent_imports.pop(key, None)
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
-    # Відправка лише того, що пройшло фільтр
     sent = 0
     for title, slots in groups:
         out = "\n".join([title] + slots)
