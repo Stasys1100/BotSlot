@@ -1,3 +1,4 @@
+```python
 # bot.py
 import os
 import re
@@ -22,7 +23,7 @@ try:
 except Exception:
     pass
 
-# Optional encoding detector libraries
+# Optional encoding detector libraries (if installed, used to improve detection)
 try:
     from charset_normalizer import from_bytes as cn_from_bytes  # pip install charset-normalizer
 except Exception:
@@ -105,11 +106,7 @@ def _cyrillic_score(s: str) -> int:
 def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[str, str]:
     """
     Given original bytes and an initial decoded text, try multiple decoding strategies
-    and return the best candidate (text, encoding_label) based on cyrillic score.
-    Strategies include:
-      - initial as-decoded
-      - decode bytes as cp1251, koi8-r, utf-8, latin-1
-      - re-encode initial as latin-1 then decode as utf-8 (common mojibake fix)
+    and return the best candidate (text, encoding_label) based on cyrillic score and printability.
     """
     candidates: List[Tuple[str, str]] = []
     if initial_text is not None:
@@ -272,10 +269,16 @@ def rap_to_text_aggressive(data: bytes) -> str:
 
 # ─── Flexible parser with DOTALL and fallbacks ────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
+    """
+    Повертає список (group_name, [slot1, slot2, ...])
+    1) шукає повні 'class Group { ... };' блоки (DOTALL)
+    2) інакше — groupName/name/title + вікно unit-токенів (DOTALL)
+    3) фолбек — всі unitName/description/text згруповані по маркерах
+    """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
 
-    # 1) full class Group blocks
+    # 1) Повні блоки class Group
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -328,7 +331,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     if groups:
         return groups
 
-    # 3) fallback: collect all unit tokens and group by markers
+    # 3) Фолбек: зібрати всі unit-токени і згрупувати по маркерах
     unit_matches = [(m.start(), clean_slot_value(m.group(1))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
     group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)\s*=', txt, flags=re.IGNORECASE)]
     if unit_matches:
@@ -455,7 +458,7 @@ async def імпорт_sqm(ctx: commands.Context):
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # Diagnostics: capture examples
+    # --- ДІАГНОСТИКА: перші raw-захоплення різними regex-ами ---
     raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
@@ -501,10 +504,10 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
-    # Parse
+    # --- основний парсинг ---
     groups = parse_mission_sqm_flexible(text)
 
-    # fallback: collect all unit tokens
+    # фолбек: зібрати всі unit-токени
     if not groups:
         units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
         if not units:
@@ -823,3 +826,4 @@ if not TOKEN:
     print("DISCORD_TOKEN not set in environment")
 else:
     bot.run(TOKEN)
+```
