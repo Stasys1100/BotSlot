@@ -71,7 +71,7 @@ def build_embed(sess: dict) -> discord.Embed:
     embed.description = "\n".join(lines)
     return embed
 
-# ─── 5.1 Генератор Embed для відділень (новий) ──────────────────────────────────
+# ─── 5.1 Генератор Embed для відділень ──────────────────────────────────────────
 def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
     embed = discord.Embed(title=title or "Відділення", color=discord.Color.blurple())
     if slots:
@@ -81,11 +81,11 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
         embed.description = "— слотів не знайдено —"
     return embed
 
-# ─── 5.2 Парсер mission.sqm (витягує назви відділень та слоти) ────────────────
+# ─── 5.2 Парсер mission.sqm ───────────────────────────────────────────────────
 def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     """
-    Повертає список кортежів (group_name, [slot1, slot2, ...]).
-    Підтримує різні поля: name, groupName, description, unitName, text.
+    Повертає [(group_name, [slot1, slot2, ...]), ...]
+    Підтримує: name, groupName, description, title для груп; description, unitName, text для юнітів.
     """
     groups: List[Tuple[str, List[str]]] = []
     current_group_name: Optional[str] = None
@@ -154,13 +154,11 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
         cleaned.append((name, slots))
     return cleaned
 
-# ─── 5.3 Допоміжні функції для читання вкладення (декодування + PBO) ───────────
+# ─── 5.3 Допоміжні функції для читання вкладення ────────────────────────────────
 def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
     """
-    Спроба витягти mission.sqm з PBO:
-    - якщо встановлено пакет pbo, використовуємо його;
-    - інакше пробуємо відкрити як zip (фолбек).
-    Повертає текст або None.
+    Повертає текст mission.sqm з PBO або None.
+    Використовує пітоновий пакет pbo (якщо є) або zip-фолбек.
     """
     if pbo:
         try:
@@ -184,8 +182,8 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[str]:
 
 def extract_text_fragments_from_bytes(data: bytes, min_fragment_len: int = 40) -> str:
     """
-    Декодує байти як latin-1 і витягує фрагменти навколо ключових слів
-    (class Group, class Unit, name =, description =), щоб "виловити" текст з бінарного SQM/PBO.
+    Декодує байти як latin-1 і витягує фрагменти навколо ключових слів,
+    щоб виловити текст з бінарного SQM/PBO: class Group, class Unit, name=, description=, unitName.
     """
     text = data.decode("latin-1", errors="ignore")
     keywords = ["class Group", "class Unit", "name =", "description =", "unitName"]
@@ -213,8 +211,7 @@ def extract_text_fragments_from_bytes(data: bytes, min_fragment_len: int = 40) -
 
 async def read_attachment_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Повертає (text, used_encoding_or_method).
-    Підтримує: .pbo (витяг), .sqm (декодування), або бінарні файли (фрагменти).
+    Повертає (text, used_encoding_or_method). Підтримує .pbo/.sqm та бінарні фрагменти.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
@@ -286,7 +283,7 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
-# ─── 7. “Претендувати” на слот ─────────────────────────────────────────────────
+# ─── 7. Претендування на слот ──────────────────────────────────────────────────
 class ClaimSlotButton(Button):
     def __init__(self, sid: int, idx: int):
         super().__init__(
@@ -527,7 +524,7 @@ async def зняти(ctx: commands.Context, session_msg_id: int):
         view=RemoveSlotView(session_msg_id)
     )
 
-# ─── 9.5. Команда !записати ─────────────────────────────────────────────────────
+# ─── 9.5. Команда записати ─────────────────────────────────────────────────────
 @bot.command(name="записати")
 async def записати(ctx: commands.Context, session_msg_id: int, member: discord.Member):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -599,10 +596,9 @@ class AssignSlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(AssignSlotButton(sid, idx, uid))
 
-# ─── 10. Команда імпорту mission.sqm (нова) ────────────────────────────────────
+# ─── 10. Команда імпорту mission.sqm / .pbo ─────────────────────────────────────
 @bot.command(name="імпорт_sqm")
 async def імпорт_sqm(ctx: commands.Context):
-    # Доступ лише в адміністративному каналі
     if ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
 
@@ -621,7 +617,7 @@ async def імпорт_sqm(ctx: commands.Context):
         preview = "\n".join(text.splitlines()[:40])[:1500]
         await ctx.send(
             "ℹ️ Відділення у mission.sqm не знайдено або файл порожній. "
-            f"Спроба декодування: **{used_enc}**. Ось прев'ю початку файлу для діагностики:"
+            f"Спроба декодування/витягу: **{used_enc}**. Ось прев'ю початку файлу для діагностики:"
         )
         await ctx.send(f"```\n{preview}\n```")
         return
@@ -708,7 +704,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
+        return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
@@ -727,7 +723,7 @@ async def _gitpush(ctx: commands.Context):
     emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
     emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
     emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
+    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
     emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
