@@ -1,14 +1,14 @@
 # bot.py
-# Повний робочий код бота з інтеграцією зовнішнього сервісу (HTTP upload),
-# фіксами mojibake, витягом innerText з <t ...> тегів, діагностикою та інтегрованим парсером відділень.
+# Discord бот: завантажує .pbo/.sqm на зовнішній сервіс (EXTRACTOR_API_URL),
+# отримує розпакований/декодований текст або JSON з відділеннями і повертає тільки відділення та слоти.
+# Мінімальні змінні в .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, EXTRACTOR_API_URL (і опціонально EXTRACTOR_API_KEY).
 
 import os
 import re
 import io
-import zipfile
-import html
 import json
-import subprocess
+import html
+import zipfile
 import datetime
 from zoneinfo import ZoneInfo
 from typing import List, Tuple, Optional, Dict, Any
@@ -16,458 +16,47 @@ from typing import List, Tuple, Optional, Dict, Any
 import aiohttp
 import discord
 from discord.ext import commands, tasks
-from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# Якщо у тебе є keep_alive.py — залишаємо виклик, інакше ігноруємо
-try:
-    from keep_alive import keep_alive
-    keep_alive()
-except Exception:
-    pass
-
-# Спроба підключити детектори кодування (необов'язково)
-try:
-    from charset_normalizer import from_bytes as cn_from_bytes  # pip install charset-normalizer
-except Exception:
-    cn_from_bytes = None
-try:
-    import chardet  # pip install chardet
-except Exception:
-    chardet = None
-
-# ─── ENV / INIT ───────────────────────────────────────────────────────────────
 load_dotenv()
+
+# ─── Конфігурація ───────────────────────────────────────────────────────────
 TOKEN = os.getenv("DISCORD_TOKEN")
-DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
+VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 0)
+EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL")  # наприклад https://fileproinfo.com/api/upload
+EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY")  # опціонально
 
 intents = discord.Intents.default()
-intents.guilds = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
-VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 1160843618433630228)
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 1395065909185478769)
 
-# External extractor config (опціонально)
-EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL")  # наприклад https://fileproinfo.com/api/upload
-EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY")  # опціонально
-
-processed_messages: set[int] = set()
-sessions: dict[int, dict] = {}              # message_id → { title, lines, owners, channel_id }
-claims: dict[tuple[int,int], list] = {}     # (message_id, idx) → [User, ...]
-request_counter = 0
-
-TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
-MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
-DEFAULT_TITLE = "Alpha 1-2 | 3. Prikaati 'Karhu' | Jalkaväen haara"
-
-# ─── Reminder ─────────────────────────────────────────────────────────────────
-@tasks.loop(minutes=1)
-async def vtg_reminder():
-    now = datetime.datetime.now(KYIV_TZ)
-    if now.weekday() in (4, 6) and now.hour == 19 and now.minute == 30:
-        ch = bot.get_channel(VTG_CHANNEL_ID)
-        if ch:
-            try:
-                await ch.send("||@everyone||\n**Сбор VTG**")
-            except:
-                pass
-
-# ─── Утиліти: нормалізація, детектор кодування, mojibake ───────────────────────
+# ─── Утиліти для очищення і парсингу ────────────────────────────────────────
 def _normalize_whitespace(s: str) -> str:
     s = re.sub(r'\r\n|\r', '\n', s)
     s = re.sub(r'[ \t]+', ' ', s)
-    s = re.sub(r'\n[ \t]+', '\n', s)
     s = re.sub(r'\n{3,}', '\n\n', s)
     return s.strip()
-
-def detect_encoding_bytes(b: bytes) -> Optional[str]:
-    """Спроба виявити кодування через charset_normalizer або chardet."""
-    if cn_from_bytes:
-        try:
-            results = cn_from_bytes(b)
-            if results:
-                best = results.best()
-                if best and best.encoding:
-                    return best.encoding.lower()
-        except Exception:
-            pass
-    if chardet:
-        try:
-            res = chardet.detect(b)
-            enc = res.get('encoding')
-            if enc:
-                return enc.lower()
-        except Exception:
-            pass
-    return None
-
-def _cyrillic_score(s: str) -> int:
-    return len(re.findall(r'[\u0400-\u04FF]', s))
-
-def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[str, str]:
-    candidates: List[Tuple[str, str]] = []
-    if initial_text is not None:
-        candidates.append((initial_text, "as-decoded"))
-
-    tried_encs = ["utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"]
-    for enc in tried_encs:
-        try:
-            txt = original_bytes.decode(enc, errors="replace")
-            candidates.append((txt, enc))
-        except Exception:
-            pass
-
-    try:
-        redecoded = initial_text.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
-        candidates.append((redecoded, "latin1->utf8"))
-    except Exception:
-        pass
-    try:
-        redecoded = initial_text.encode("latin-1", errors="replace").decode("cp1251", errors="replace")
-        candidates.append((redecoded, "latin1->cp1251"))
-    except Exception:
-        pass
-    try:
-        redecoded = initial_text.encode("cp1251", errors="replace").decode("utf-8", errors="replace")
-        candidates.append((redecoded, "cp1251->utf8"))
-    except Exception:
-        pass
-
-    def score(item: Tuple[str, str]) -> Tuple[int, float]:
-        txt, _ = item
-        cyr = _cyrillic_score(txt)
-        printable = sum(1 for ch in txt if ch.isprintable()) / max(1, len(txt))
-        return (cyr, printable)
-
-    best = max(candidates, key=score)
-    return best[0], best[1]
-
-def fix_mojibake_text(text: str) -> str:
-    if not text:
-        return text
-    if not re.search(r'[ÐР]', text):
-        return text
-    candidates: List[Tuple[str, str]] = []
-    candidates.append((text, "orig"))
-    try:
-        candidates.append((text.encode("latin-1", errors="replace").decode("utf-8", errors="replace"), "latin1->utf8"))
-    except Exception:
-        pass
-    try:
-        candidates.append((text.encode("cp1251", errors="replace").decode("utf-8", errors="replace"), "cp1251->utf8"))
-    except Exception:
-        pass
-    try:
-        candidates.append((text.encode("utf-8", errors="replace").decode("cp1251", errors="replace"), "utf8->cp1251"))
-    except Exception:
-        pass
-    try:
-        candidates.append((text.encode("latin-1", errors="replace").decode("cp1251", errors="replace"), "latin1->cp1251"))
-    except Exception:
-        pass
-    try:
-        b = text.encode("utf-8", errors="replace")
-        candidates.append((b.decode("cp1251", errors="replace"), "utf8bytes->cp1251"))
-    except Exception:
-        pass
-
-    def score_item(it: Tuple[str, str]) -> Tuple[int, float]:
-        t = it[0]
-        return (_cyrillic_score(t), sum(1 for ch in t if ch.isprintable()) / max(1, len(t)))
-
-    best = max(candidates, key=score_item)
-    return best[0]
-
-# ─── HTML / тег <t> витяг та очищення ────────────────────────────────────────
-def extract_structured_text(raw: str) -> str:
-    if not raw:
-        return ""
-    s = html.unescape(raw)
-    chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
-    if chunks:
-        inner = " ".join(chunks)
-        inner = re.sub(r'<[^>]+>', ' ', inner)
-        inner = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', inner)
-        inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
-        inner = fix_mojibake_text(inner)
-        return inner
-    s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
-    s = re.sub(r'</\s*t\s*>', ' ', s, flags=re.IGNORECASE)
-    s = re.sub(r'<[^>]+>', ' ', s)
-    s = re.sub(r'[\x00-\x1f\x7f-\x9f]', ' ', s)
-    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
-    s = fix_mojibake_text(s)
-    return s
 
 def clean_slot_value(raw: str) -> str:
     if raw is None:
         return "Слот"
-    s = extract_structured_text(raw)
-    s = fix_mojibake_text(s)
-    s = s.replace('\\', '/')
+    s = html.unescape(raw)
+    s = re.sub(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', lambda m: m.group(1), s, flags=re.IGNORECASE|re.DOTALL)
+    s = re.sub(r'<[^>]+>', ' ', s)
+    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'')
     s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\bhttps?://\S+\b', '', s)
-    s = re.sub(r'\b[A-Za-z0-9_\\/:.\-]{40,}\b', ' ', s)
-    s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
-    if not s or s.lower().startswith("<t color") or s in {'"', "'"}:
-        return "Слот"
+    s = s.strip()
     return s or "Слот"
-
-# ─── RAP-декодер (aggressive) ────────────────────────────────────────────────
-def rap_to_text_aggressive(data: bytes) -> str:
-    detected = detect_encoding_bytes(data)
-    initial_text = None
-    tried_label = "unknown"
-
-    if detected:
-        try:
-            initial_text = data.decode(detected, errors="replace")
-            tried_label = detected
-        except Exception:
-            initial_text = None
-
-    if initial_text is None:
-        for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
-            try:
-                initial_text = data.decode(enc, errors="replace")
-                tried_label = enc
-                break
-            except Exception:
-                continue
-    if initial_text is None:
-        initial_text = data.decode("latin-1", errors="replace")
-        tried_label = "latin-1-fallback"
-
-    best_text, best_enc = _try_redecode_candidates(data, initial_text)
-    if best_enc and best_enc != "as-decoded":
-        tried_label = best_enc
-
-    text = best_text
-    text = fix_mojibake_text(text)
-
-    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', text)
-    def keep(ch):
-        o = ord(ch)
-        return (32 <= o <= 126) or (0x0400 <= o <= 0x04FF) or ch in '\n\r\t{}=;"\'.,:-_()[]/\\<>|'
-    filtered = ''.join(ch if keep(ch) else ' ' for ch in text)
-
-    keywords = ['class Group', 'class Unit', 'groupName', 'unitName', 'description', 'name', 'title']
-    low = filtered.lower()
-    indices = []
-    for kw in keywords:
-        start = 0
-        k = kw.lower()
-        while True:
-            idx = low.find(k, start)
-            if idx == -1:
-                break
-            indices.append(idx)
-            start = idx + len(k)
-
-    if indices:
-        window = 5000
-        frags = []
-        for idx in sorted(set(indices)):
-            s = max(0, idx - 400)
-            e = min(len(filtered), idx + window)
-            frags.append(filtered[s:e])
-        candidate = '\n'.join(frags)
-    else:
-        candidate = filtered[:300000]
-
-    candidate = candidate.replace('};', '};\n')
-    candidate = re.sub(r';\s*', ';\n', candidate)
-    candidate = re.sub(r'\{\s*', '{\n', candidate)
-    candidate = re.sub(r'\s*\}\s*', '\n}\n', candidate)
-
-    lines = [l.strip() for l in candidate.splitlines() if l.strip()]
-    candidate = '\n'.join(lines)
-    candidate = _normalize_whitespace(candidate)
-    candidate = candidate.replace("'", '"')
-    return f"// rap_decoded (encoding={tried_label})\n{candidate}"
-
-# ─── Хевристика: чи це RAP/бінарні дані ──────────────────────────────────────
-def is_likely_rap_or_binary(b: bytes) -> bool:
-    if len(b) >= 3 and b[:3] == b'raP':
-        return True
-    printable = sum(1 for ch in b if 32 <= ch <= 126 or ch in (9,10,13))
-    ratio = printable / max(1, len(b))
-    return ratio < 0.6
-
-# ─── PBO extraction & attachment reading with robust encoding heuristics ─────
-def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
-    try:
-        import pbo as pbo_lib
-    except Exception:
-        pbo_lib = None
-    if pbo_lib:
-        try:
-            archive = pbo_lib.PBO(io.BytesIO(pbo_bytes))
-            for name in archive.list():
-                if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
-                    return archive.read(name)
-        except Exception:
-            pass
-    try:
-        z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
-        for name in z.namelist():
-            if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
-                return z.read(name)
-    except Exception:
-        pass
-    return None
-
-async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
-    data = await attachment.read()
-    filename = attachment.filename.lower()
-
-    if is_likely_rap_or_binary(data):
-        try:
-            text = rap_to_text_aggressive(data)
-            return text, "rap-detected"
-        except Exception:
-            pass
-
-    def try_decode_bytes(b: bytes) -> Tuple[str, str]:
-        detected = detect_encoding_bytes(b)
-        candidates: List[Tuple[str, str]] = []
-        if detected:
-            try:
-                txt = b.decode(detected, errors="replace")
-                candidates.append((txt, detected))
-            except Exception:
-                pass
-        for enc in ("utf-8", "cp1251", "windows-1251", "koi8-r", "latin-1"):
-            try:
-                txt = b.decode(enc, errors="replace")
-                candidates.append((txt, enc))
-            except Exception:
-                pass
-        if candidates:
-            base_txt = candidates[0][0]
-            try:
-                t = base_txt.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
-                candidates.append((t, "latin1->utf8"))
-            except Exception:
-                pass
-            try:
-                t = base_txt.encode("latin-1", errors="replace").decode("cp1251", errors="replace")
-                candidates.append((t, "latin1->cp1251"))
-            except Exception:
-                pass
-            try:
-                t = base_txt.encode("cp1251", errors="replace").decode("utf-8", errors="replace")
-                candidates.append((t, "cp1251->utf8"))
-            except Exception:
-                pass
-        best = max(candidates, key=lambda it: (_cyrillic_score(it[0]), sum(1 for ch in it[0] if ch.isprintable())/max(1,len(it[0]))))
-        return best
-
-    if filename.endswith(".pbo"):
-        sqm_raw = extract_mission_from_pbo_bytes(data)
-        if not sqm_raw:
-            text = rap_to_text_aggressive(data)
-            return text, "pbo-rap-fragments"
-        if is_likely_rap_or_binary(sqm_raw) or sqm_raw[:3] == b'raP':
-            text = rap_to_text_aggressive(sqm_raw)
-            return text, "pbo-rap"
-        text, enc = try_decode_bytes(sqm_raw)
-        text = fix_mojibake_text(text)
-        return text, f"pbo-{enc}"
-
-    if filename.endswith(".sqm"):
-        if is_likely_rap_or_binary(data) or data[:3] == b'raP':
-            text = rap_to_text_aggressive(data)
-            return text, "rap"
-        text, enc = try_decode_bytes(data)
-        text = fix_mojibake_text(text)
-        return text, enc
-
-    if is_likely_rap_or_binary(data):
-        return rap_to_text_aggressive(data), "rap-raw"
-    text, enc = try_decode_bytes(data)
-    text = fix_mojibake_text(text)
-    return text, enc
-
-# ─── Інтегрований парсер відділень (користувацький код) ──────────────────────
-def parse_section(text: str) -> Dict[str, Any]:
-    header_pattern = re.compile(
-        r'^(.*?)\|\s*(.*?)\|\s*(.*?)\|\s*(.*?)\|\s*(\[.*?\])\s*$',
-        re.MULTILINE
-    )
-    result = {
-        "section": None,
-        "formation": None,
-        "type": None,
-        "vehicle": None,
-        "slots": []
-    }
-
-    lines = text.strip().splitlines()
-    m_header = header_pattern.match(text.strip().splitlines()[0] if lines else "")
-    if m_header and lines:
-        header = m_header.group(1).strip()
-        formation = m_header.group(2).strip()
-        section_type = m_header.group(3).strip()
-        vehicle = m_header.group(4).strip()
-
-        result.update({
-            "section": header,
-            "formation": formation,
-            "type": section_type,
-            "vehicle": vehicle,
-        })
-
-        for line in lines[1:]:
-            m = re.match(r'^\s*(\d+)\.\s*(.*?)\s*(?:\s+(\w{2,})\s*)?$', line)
-            if m:
-                number = int(m.group(1))
-                name = fix_mojibake_text(m.group(2).strip())
-                abbr = m.group(3)
-                result["slots"].append({"num": number, "name": name, "abbr": abbr})
-            else:
-                t = line.strip()
-                if t:
-                    result["slots"].append({"num": None, "name": fix_mojibake_text(t), "abbr": None})
-    else:
-        slots: List[Dict[str, Any]] = []
-        header = lines[0] if lines else ""
-        for l in lines[1:]:
-            m = re.match(r'^\s*(\d+)\.\s*(.*?)\s*(?:\s+(\w{2,})\s*)?$', l)
-            if m:
-                slots.append({
-                    "num": int(m.group(1)),
-                    "name": fix_mojibake_text(m.group(2).strip()),
-                    "abbr": m.group(3)
-                })
-        result = {
-            "section": fix_mojibake_text(header.strip()),
-            "formation": None,
-            "type": None,
-            "vehicle": None,
-            "slots": slots
-        }
-    return result
-
-def extract_departments(text: str) -> List[Dict[str, Any]]:
-    blocks = re.split(r'\n\s*\n', text.strip())
-    res: List[Dict[str, Any]] = []
-    for block in blocks:
-        if not block.strip():
-            continue
-        parsed = parse_section(block)
-        if parsed:
-            res.append(parsed)
-    return res
 
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
-
+    # 1) Try to extract class Group blocks
     group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
     if group_blocks:
         for blk in group_blocks:
@@ -475,7 +64,6 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             if not mname:
                 mname = re.search(r'(?:name|groupName|title)\s*=\s*[\'"](.*?)[\'"]', blk, flags=re.IGNORECASE | re.DOTALL)
             gname = clean_slot_value(mname.group(1)) if mname else "Відділення"
-
             units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
             slots = []
             for u in units:
@@ -502,6 +90,7 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
             groups.append((gname, slots))
         return groups
 
+    # 2) Fallback: find name/title and following unitName/description/text
     for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"(.*?)"\s*;', txt, flags=re.IGNORECASE | re.DOTALL):
         gname = clean_slot_value(m.group(1))
         start = m.end()
@@ -515,90 +104,61 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
                 units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
         if units:
             groups.append((gname, [clean_slot_value(u) for u in units]))
-
     if groups:
         return groups
 
-    unit_matches = [(m.start(), clean_slot_value(m.group(1))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
-    group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)\s*=', txt, flags=re.IGNORECASE)]
+    # 3) Last resort: collect all unitName/description/text tokens
+    unit_matches = [clean_slot_value(m.group(1)) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
     if unit_matches:
-        if not group_markers:
-            return [("Відділення", [u for _, u in unit_matches])]
-        grouped: Dict[int, List[str]] = {}
-        for pos, uname in unit_matches:
-            prev_positions = [p for p in group_markers if p <= pos]
-            key = max(prev_positions) if prev_positions else -1
-            grouped.setdefault(key, []).append(uname)
-        for key, slots in grouped.items():
-            if key == -1:
-                gname = "Відділення"
-            else:
-                snippet = txt[key:key+400]
-                mname2 = re.search(r'(?:name|groupName|title)\s*=\s*"(.*?)"', snippet, flags=re.IGNORECASE | re.DOTALL)
-                if not mname2:
-                    mname2 = re.search(r'(?:name|groupName|title)\s*=\s*[\'"](.*?)[\'"]', snippet, flags=re.IGNORECASE | re.DOTALL)
-                gname = clean_slot_value(mname2.group(1)) if mname2 else "Відділення"
-            groups.append((gname, slots))
-        return groups
-
+        return [("Відділення", unit_matches)]
     return []
 
-# ─── Інтеграція з зовнішнім сервісом (probe + upload) ────────────────────────
-async def probe_and_upload(attachment: discord.Attachment, timeout=30) -> Dict[str, Any]:
-    if not EXTRACTOR_API_URL:
-        return {"status":"no-config", "error":"EXTRACTOR_API_URL not set"}
+# ─── PBO helper ─────────────────────────────────────────────────────────────
+def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
+    try:
+        z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
+        for name in z.namelist():
+            if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
+                return z.read(name)
+    except Exception:
+        pass
+    return None
 
-    candidates = []
-    url_base = EXTRACTOR_API_URL.rstrip('/')
-    candidates.append(EXTRACTOR_API_URL)
-    candidates += [
-        url_base + "/upload",
-        url_base + "/api/upload",
-        url_base + "/api/extract",
-        url_base + "/api/v1/upload",
-        url_base + "/file/upload"
-    ]
+# ─── Інтеграція з зовнішнім сервісом ────────────────────────────────────────
+async def upload_to_service(attachment: discord.Attachment, timeout: int = 60) -> Dict[str, Any]:
+    """
+    Завантажує файл на EXTRACTOR_API_URL і повертає розпарений результат.
+    Очікує JSON з полями 'departments' або 'decoded_text', або HTML/plain text.
+    """
+    if not EXTRACTOR_API_URL:
+        return {"status": "no-config", "error": "EXTRACTOR_API_URL not set"}
 
     headers = {}
     if EXTRACTOR_API_KEY:
-        headers['Authorization'] = f"Bearer {EXTRACTOR_API_KEY}"
+        headers["Authorization"] = f"Bearer {EXTRACTOR_API_KEY}"
 
     file_bytes = await attachment.read()
+    data = aiohttp.FormData()
+    data.add_field("file", file_bytes, filename=attachment.filename, content_type="application/octet-stream")
 
     async with aiohttp.ClientSession() as sess:
-        last_err = None
-        for url in candidates:
-            try:
-                try:
-                    async with sess.get(url, headers=headers, timeout=8) as rget:
-                        pass
-                except Exception:
-                    pass
+        try:
+            async with sess.post(EXTRACTOR_API_URL, data=data, headers=headers, timeout=timeout) as resp:
+                text = await resp.text()
+                ctype = resp.headers.get("Content-Type", "")
+                if resp.status not in (200, 201):
+                    return {"status": "error", "error": f"{resp.status} {text[:400]}"}
+                if "application/json" in ctype or text.strip().startswith("{") or text.strip().startswith("["):
+                    try:
+                        j = json.loads(text)
+                        return {"status": "ok", "json": j}
+                    except Exception:
+                        return {"status": "ok", "text": text}
+                return {"status": "ok", "text": text}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
-                data = aiohttp.FormData()
-                data.add_field('file', file_bytes, filename=attachment.filename, content_type='application/octet-stream')
-                async with sess.post(url, data=data, headers=headers, timeout=timeout) as resp:
-                    text = await resp.text()
-                    ctype = resp.headers.get('Content-Type', '')
-                    if resp.status in (200,201):
-                        if 'application/json' in ctype or text.strip().startswith('{') or text.strip().startswith('['):
-                            try:
-                                j = json.loads(text)
-                            except Exception:
-                                j = None
-                            if isinstance(j, dict) and j.get('departments'):
-                                return {"status":"ok","method":f"external:{url}","departments":j['departments']}
-                            if isinstance(j, dict) and j.get('decoded_text'):
-                                return {"status":"ok","method":f"external:{url}","decoded_text":j['decoded_text']}
-                            return {"status":"ok","method":f"external:{url}","json":j or text}
-                        return {"status":"ok","method":f"external:{url}","html":text}
-                    else:
-                        last_err = f"{url} -> {resp.status} {text[:200]}"
-            except Exception as e:
-                last_err = str(e)
-        return {"status":"error","error": last_err or "no candidate succeeded"}
-
-# ─── Команда імпорту з діагностикою та JSON-експортом (оновлена) ─────────────
+# ─── Команда імпорту через сервіс ───────────────────────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -607,342 +167,330 @@ async def імпорт_sqm(ctx: commands.Context):
         return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
 
     attachment = ctx.message.attachments[0]
+    await ctx.send("🔄 Завантажую файл на сервіс для очищення...")
 
-    try:
-        res = await probe_and_upload(attachment)
-    except Exception as e:
-        res = {"status":"error", "error": str(e)}
+    res = await upload_to_service(attachment)
+    if res.get("status") != "ok":
+        # повідомити про помилку
+        return await ctx.send(f"❌ Помилка сервісу: {res.get('error')}")
 
-    text = None
-    method = None
+    method_label = "external"
     departments = None
+    decoded_text = None
 
-    if res.get("status") == "ok":
-        method = res.get("method", "external")
-        if res.get("departments"):
-            departments = res["departments"]
-        elif res.get("decoded_text"):
-            text = res["decoded_text"]
-        elif res.get("json") and isinstance(res["json"], dict):
-            j = res["json"]
-            if j.get("departments"):
-                departments = j["departments"]
-            elif j.get("decoded_text"):
-                text = j["decoded_text"]
-            else:
-                text = json.dumps(j, ensure_ascii=False)
-        elif res.get("html"):
-            method = method or "external:html"
-            html_text = res["html"]
-            m = re.search(r'<pre[^>]*>(.*?)</pre>', html_text, flags=re.DOTALL|re.IGNORECASE)
-            if m:
-                decoded = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
-                text = decoded
-            else:
-                decoded = re.sub(r'<[^>]+>', ' ', html_text)
-                text = decoded
-    else:
-        try:
-            text, method = await read_attachment_sqm_text(attachment)
-        except Exception as e:
-            return await ctx.send(f"❌ Не вдалося обробити файл ні зовнішнім сервісом, ні локально: {e}")
-
-    if departments is None and text:
-        groups = parse_mission_sqm_flexible(text)
-        if groups:
-            departments = [{"section": n, "slots":[{"name":s} for s in sl]} for n, sl in groups]
+    # Якщо сервіс повернув JSON з departments або decoded_text
+    if res.get("json"):
+        j = res["json"]
+        if isinstance(j, dict) and j.get("departments"):
+            departments = j["departments"]
+            method_label = "external:departments"
+        elif isinstance(j, dict) and j.get("decoded_text"):
+            decoded_text = j["decoded_text"]
+            method_label = "external:decoded_text"
         else:
-            units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
+            # якщо JSON — спробуємо знайти decoded_text or departments keys
+            if isinstance(j, dict):
+                for k in ("decoded_text", "text", "content"):
+                    if j.get(k):
+                        decoded_text = j.get(k)
+                        method_label = "external:json-text"
+                        break
+    elif res.get("text"):
+        # сервіс повернув plain text або HTML
+        text = res["text"]
+        # спробуємо витягти <pre> якщо є
+        m = re.search(r'<pre[^>]*>(.*?)</pre>', text, flags=re.DOTALL | re.IGNORECASE)
+        if m:
+            decoded_text = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
+            method_label = "external:html-pre"
+        else:
+            # якщо текст містить JSON-like structure
+            if text.strip().startswith("{") or text.strip().startswith("["):
+                try:
+                    j2 = json.loads(text)
+                    if isinstance(j2, dict) and j2.get("departments"):
+                        departments = j2["departments"]
+                        method_label = "external:json-text"
+                    elif isinstance(j2, dict) and j2.get("decoded_text"):
+                        decoded_text = j2["decoded_text"]
+                        method_label = "external:json-text"
+                except Exception:
+                    decoded_text = re.sub(r'<[^>]+>', ' ', text)
+                    method_label = "external:plain"
+            else:
+                decoded_text = re.sub(r'<[^>]+>', ' ', text)
+                method_label = "external:plain"
+
+    # Якщо сервіс поверив departments — відправляємо їх
+    if departments:
+        # Очистити і відправити ембеди
+        sent = 0
+        total_slots = 0
+        for d in departments:
+            title = d.get("section") or d.get("name") or "Відділення"
+            slots = d.get("slots") or d.get("units") or []
+            cleaned = []
+            for s in slots:
+                name = s.get("name") if isinstance(s, dict) else s
+                cleaned.append(clean_slot_value(name))
+            cleaned = [c for c in cleaned if c][:25]
+            total_slots += len(cleaned)
+            embed = discord.Embed(title=title, description="\n".join(f"{i+1}. {x}" for i,x in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
+            try:
+                await ctx.send(embed=embed)
+                sent += 1
+            except Exception:
+                pass
+        await ctx.send(f"✅ Очищення завершено. Опубліковано відділень: {sent}. Знайдено слотів: {total_slots}. Метод: `{method_label}`.")
+        return
+
+    # Якщо сервіс повернув decoded_text — парсимо локально і відправляємо
+    if decoded_text:
+        groups = parse_mission_sqm_flexible(decoded_text)
+        if not groups:
+            # фолбек: знайти unitName/description/text
+            units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', decoded_text, flags=re.IGNORECASE | re.DOTALL)
             if not units:
-                units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", text, flags=re.IGNORECASE | re.DOTALL)
+                units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", decoded_text, flags=re.IGNORECASE | re.DOTALL)
             if not units:
-                arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)
+                arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', decoded_text, flags=re.IGNORECASE | re.DOTALL)
                 for a in arrs:
                     units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
             if units:
-                departments = [{"section":"Відділення", "slots":[{"name":clean_slot_value(u)} for u in units]}]
+                groups = [("Відділення", [clean_slot_value(u) for u in units])]
 
-    dbg_lines = []
-    if text:
-        raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-        raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
-        raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
-        raw_nq = re.findall(r'(?:description|unitName|text)\s*=\s*([^;{][^;]{1,400})\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-        raw_t_open = re.findall(r'<\s*t\b[^>]*>', text, flags=re.IGNORECASE)[:20]
-        raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)[:20]
+        if not groups:
+            preview = (decoded_text or "")[:2000]
+            emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
+            emb.add_field(name="Метод обробки", value=method_label, inline=False)
+            emb.add_field(name="Прев'ю", value=f"```{preview}```", inline=False)
+            try:
+                buf = io.BytesIO((decoded_text or "").encode("utf-8"))
+                buf.seek(0)
+                await ctx.send(embed=emb, file=discord.File(fp=buf, filename="decoded_mission_sqm.txt"))
+            except Exception:
+                await ctx.send(embed=emb)
+            return
 
-        def short(x): return (x[:300] + '...') if x and len(x) > 300 else (x or '')
-        if raw_double:
-            dbg_lines.append("raw_double[0] = " + short(raw_double[0]))
-        if raw_single:
-            dbg_lines.append("raw_single[0] = " + short(raw_single[0]))
-        if raw_arrays:
-            dbg_lines.append("raw_arrays[0] = " + short(raw_arrays[0]))
-        if raw_nq:
-            dbg_lines.append("raw_no_quotes[0] = " + short(raw_nq[0]))
-        if raw_t_open:
-            dbg_lines.append("first <t ...> tag = " + short(raw_t_open[0]))
-        if raw_t_inner:
-            dbg_lines.append("first <t>inner = " + short(raw_t_inner[0]))
-
-    emb_dbg = discord.Embed(title="🔍 Діагностика імпорту mission.sqm", color=discord.Color.orange())
-    emb_dbg.add_field(name="Метод обробки", value=method or (res.get("method") if isinstance(res, dict) else "unknown"), inline=False)
-    if dbg_lines:
-        emb_dbg.add_field(name="Приклади raw-захоплень", value="\n".join(dbg_lines)[:1000], inline=False)
-    try:
-        await ctx.send(embed=emb_dbg)
-    except:
-        pass
-
-    try:
-        if departments:
-            json_text = json.dumps(departments, ensure_ascii=False, indent=2)
-            buf = io.BytesIO(json_text.encode('utf-8'))
-            buf.seek(0)
-            file = discord.File(fp=buf, filename="departments.json")
-            await ctx.send("📁 Ось розпарсовані відділення (JSON):", file=file)
-    except Exception:
-        pass
-
-    if not departments:
-        preview = (text or "")[:2000]
-        emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
-        emb.add_field(name="Метод обробки", value=method or "unknown", inline=False)
-        emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
-        try:
-            buf = io.BytesIO((text or "").encode('utf-8'))
-            buf.seek(0)
-            file = discord.File(fp=buf, filename="decoded_mission_sqm.txt")
-            await ctx.send(embed=emb, file=file)
-        except Exception:
-            await ctx.send(embed=emb)
+        sent = 0
+        total_slots = 0
+        for name, slots in groups:
+            cleaned = [clean_slot_value(s) for s in slots][:25]
+            total_slots += len(cleaned)
+            embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{i+1}. {s}" for i,s in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
+            try:
+                await ctx.send(embed=embed)
+                sent += 1
+            except Exception:
+                pass
+        await ctx.send(f"✅ Очищення завершено. Опубліковано відділень: {sent}. Знайдено слотів: {total_slots}. Метод: `{method_label}`.")
         return
 
-    target_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-    if not target_ch:
-        return await ctx.send("❌ Адмін-канал не знайдено за ID.")
+    # Якщо нічого не вдалося — повідомити
+    await ctx.send("⚠️ Сервіс повернув непередбачуваний результат. Спробуйте інший сервіс або надішліть файл локально для діагностики.")
+# --- Початок вставки: інтеграція з зовнішнім сервісом для очищення (.pbo/.sqm) ---
+import os, json, aiohttp, html, re, io
+from typing import Dict, Any, List, Tuple, Optional
 
-    sent_count = 0
-    total_slots = 0
-    for d in departments:
-        title = d.get("section") or "Відділення"
-        slots = d.get("slots", [])
-        cleaned_slots = []
-        for s in slots:
-            name = s.get("name") if isinstance(s, dict) else s
-            name = clean_slot_value(name)
-            if not name or name.lower().startswith("<t color") or name in {'"', "'"}:
-                name = "Слот"
-            cleaned_slots.append(name)
-        cleaned_slots = [x for x in cleaned_slots if x][:25]
-        total_slots += len(cleaned_slots)
-        embed = discord.Embed(title=title, color=discord.Color.blurple())
-        embed.description = "\n".join(f"{i+1}. {s}" for i, s in enumerate(cleaned_slots)) if cleaned_slots else "— слотів не знайдено —"
+EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL")  # наприклад https://fileproinfo.com/api/upload
+EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY")  # опціонально
+
+def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
+    """Швидкий PBO->mission.sqm витяг через zip fallback (якщо всередині zip)."""
+    try:
+        z = zipfile.ZipFile(io.BytesIO(pbo_bytes))
+        for name in z.namelist():
+            if name.lower().endswith("mission.sqm") or name.lower().endswith(".sqm"):
+                return z.read(name)
+    except Exception:
+        pass
+    return None
+
+async def upload_to_service(attachment: discord.Attachment, timeout: int = 60) -> Dict[str, Any]:
+    """
+    Завантажує файл на EXTRACTOR_API_URL і повертає структуру:
+      {'status':'ok','json':...} або {'status':'ok','text':...} або {'status':'error','error':...}
+    """
+    if not EXTRACTOR_API_URL:
+        return {"status": "error", "error": "EXTRACTOR_API_URL not configured"}
+
+    headers = {}
+    if EXTRACTOR_API_KEY:
+        headers["Authorization"] = f"Bearer {EXTRACTOR_API_KEY}"
+
+    file_bytes = await attachment.read()
+    data = aiohttp.FormData()
+    data.add_field("file", file_bytes, filename=attachment.filename, content_type="application/octet-stream")
+
+    async with aiohttp.ClientSession() as sess:
         try:
-            await target_ch.send(embed=embed)
-            sent_count += 1
-        except Exception:
-            pass
+            async with sess.post(EXTRACTOR_API_URL, data=data, headers=headers, timeout=timeout) as resp:
+                text = await resp.text()
+                ctype = resp.headers.get("Content-Type", "")
+                if resp.status not in (200, 201):
+                    return {"status": "error", "error": f"{resp.status} {text[:400]}"}
+                if "application/json" in ctype or text.strip().startswith("{") or text.strip().startswith("["):
+                    try:
+                        j = json.loads(text)
+                        return {"status": "ok", "json": j}
+                    except Exception:
+                        return {"status": "ok", "text": text}
+                return {"status": "ok", "text": text}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
 
-    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method or res.get('method','external')}`. Знайдено слотів: {total_slots}.")
-
-# ─── Slot UI and management (existing logic preserved) ───────────────────────
-def build_embed(sess: dict) -> discord.Embed:
-    embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
-    lines = []
-    for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-        prefix = f"{i+1}. "
-        if owner:
-            lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
-        else:
-            lines.append(f"{prefix}{text}")
-    embed.description = "\n".join(lines)
-    return embed
-
-class SlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        owner = sessions[sid]["owners"][idx]
-        free = owner is None
-        label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
-        style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
-        super().__init__(label=label, style=style, custom_id=f"slot-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        owner = sess["owners"][self.idx]
-        ch_id = sess["channel_id"]
-
-        if owner is None:
-            for s in sessions.values():
-                if s["channel_id"] == ch_id and user in s["owners"]:
-                    return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
-            sess["owners"][self.idx] = user
-            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
-
-        if owner == user:
-            sess["owners"][self.idx] = None
-            return await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
-
-        return await inter.response.send_message(f"⚠️ Цей слот зайнято {owner.mention}.", view=ClaimSlotView(self.sid, self.idx), ephemeral=True)
-
-class SlotView(View):
-    def __init__(self, sid: int):
-        super().__init__(timeout=None)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(SlotButton(sid, idx))
-
-class ClaimSlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(label="❗ Претендувати", style=discord.ButtonStyle.primary, custom_id=f"claim-slot-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        for s in sessions.values():
-            if s["channel_id"] == sess["channel_id"] and user in s["owners"]:
-                return await inter.response.send_message("⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True)
-        key = (self.sid, self.idx)
-        lst = claims.setdefault(key, [])
-        if user in lst:
-            return await inter.response.send_message("ℹ️ Ви вже подали заявку.", ephemeral=True)
-        lst.append(user)
-        await inter.response.send_message("✅ Заявка прийнята.", ephemeral=True)
-        global request_counter
-        request_counter += 1
-        embed = discord.Embed(title=f"📝 Заявка #{request_counter}", description=sess["title"], color=discord.Color.orange())
-        embed.add_field(name="Слот #", value=str(self.idx+1), inline=True)
-        embed.add_field(name="Власник", value=(sess["owners"][self.idx].mention if sess["owners"][self.idx] else "Вільний"), inline=True)
-        embed.add_field(name="Кандидат", value=user.mention, inline=False)
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-        if admin_ch:
-            msg = await admin_ch.send(embed=embed)
-            await msg.edit(view=ClaimDecisionView(self.sid, self.idx, user.id, msg.id))
-
-class ClaimSlotView(View):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(timeout=None)
-        self.add_item(ClaimSlotButton(sid, idx))
-
-class DecisionModal(Modal):
-    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
-        title = "Причина призначення" if accept else "Причина відмови"
-        super().__init__(title=title)
-        self.sid = sid
-        self.idx = idx
-        self.claimant_id = claimant_id
-        self.admin_msg_id = admin_msg_id
-        self.accept = accept
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
-        self.add_item(self.reason)
-
-    async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
-        key = (self.sid, self.idx)
-        claimant = await bot.fetch_user(self.claimant_id)
-        old_owner = sess["owners"][self.idx]
-        reason = self.reason.value
-        if self.accept:
-            sess["owners"][self.idx] = claimant
-            claims.pop(key, None)
-        else:
-            lst = claims.get(key, [])
-            if claimant in lst:
-                lst.remove(claimant)
-        ch = bot.get_channel(sess["channel_id"])
-        if ch:
-            try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except: pass
-        try:
-            if self.accept:
-                await claimant.send(f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
-                if old_owner and old_owner != claimant:
-                    await old_owner.send(f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention}.\nПричина: {reason}")
-            else:
-                await claimant.send(f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\nПричина: {reason}")
-        except: pass
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-        if admin_ch:
-            try:
-                admin_msg = await admin_ch.fetch_message(self.admin_msg_id)
-                await admin_msg.delete()
-            except: pass
-        await inter.response.send_message("✔️ Готово.", ephemeral=True)
-
-class ClaimDecisionButton(Button):
-    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
-        label = "✅ Призначити" if accept else "❌ Відхилити"
-        style = discord.ButtonStyle.success if accept else discord.ButtonStyle.danger
-        tag = "accept" if accept else "deny"
-        super().__init__(label=label, style=style, custom_id=f"dec-{tag}-{sid}-{idx}-{claimant_id}-{admin_msg_id}")
-        self.sid = sid; self.idx = idx; self.claimant_id = claimant_id; self.admin_msg_id = admin_msg_id; self.accept = accept
-
-    async def callback(self, inter: discord.Interaction):
-        modal = DecisionModal(self.sid, self.idx, self.claimant_id, self.admin_msg_id, self.accept)
-        await inter.response.send_modal(modal)
-
-class ClaimDecisionView(View):
-    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int):
-        super().__init__(timeout=None)
-        self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, True))
-        self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, False))
-
-class RemoveSlotModal(Modal):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(title="Причина звільнення")
-        self.sid, self.idx = sid, idx
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
-        self.add_item(self.reason)
-
-    async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
-        owner = sess["owners"][self.idx]
-        reason = self.reason.value
-        if not owner:
-            return await inter.response.send_message(f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True)
-        sess["owners"][self.idx] = None
-        ch = bot.get_channel(sess["channel_id"])
-        if ch:
-            try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except: pass
-        try:
-            await owner.send(f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
-        except: pass
-        await inter.response.send_message(f"✅ Слот #{self.idx+1} звільнено.", ephemeral=True)
-
-class RemoveSlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(label=str(idx+1), style=discord.ButtonStyle.danger, custom_id=f"remove-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        await inter.response.send_modal(RemoveSlotModal(self.sid, self.idx))
-
-class RemoveSlotView(View):
-    def __init__(self, sid: int):
-        super().__init__(timeout=None)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(RemoveSlotButton(sid, idx))
-
-@bot.command(name="зняти")
-async def зняти(ctx: commands.Context, session_msg_id: int):
+# Команда: імпорт через зовнішній сервіс (фолбек на локальний парсер)
+@bot.command(name="імпорт_sqm", aliases=["import_sqm"])
+async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
-    session = sessions.get(session_msg_id)
-    if not session:
-        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
-    await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
+        return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
+    if not ctx.message.attachments:
+        return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
 
-# ─── on_ready / on_message / сервісні команди ─────────────────────────────────
+    attachment = ctx.message.attachments[0]
+    await ctx.send("🔄 Завантажую файл на сервіс для очищення...")
+
+    res = await upload_to_service(attachment)
+    if res.get("status") != "ok":
+        # фолбек: локальна обробка (якщо є read_attachment_sqm_text)
+        try:
+            if 'read_attachment_sqm_text' in globals():
+                text, method = await read_attachment_sqm_text(attachment)
+                method_label = f"local:{method}"
+            else:
+                return await ctx.send(f"❌ Помилка сервісу: {res.get('error')}")
+        except Exception as e:
+            return await ctx.send(f"❌ Помилка сервісу і локального фолбеку: {e}")
+    else:
+        method_label = "external"
+        decoded_text = None
+        departments = None
+
+        if res.get("json"):
+            j = res["json"]
+            # якщо сервіс повернув готові departments
+            if isinstance(j, dict) and j.get("departments"):
+                departments = j["departments"]
+                method_label = "external:departments"
+            # якщо сервіс повернув decoded_text
+            elif isinstance(j, dict) and j.get("decoded_text"):
+                decoded_text = j["decoded_text"]
+                method_label = "external:decoded_text"
+            else:
+                # знайти можливі текстові поля
+                for k in ("decoded_text", "text", "content", "result"):
+                    if isinstance(j, dict) and j.get(k):
+                        decoded_text = j.get(k)
+                        method_label = "external:json-text"
+                        break
+                # якщо JSON — але не містить текст/відділення — збережемо як текст для парсингу
+                if decoded_text is None and isinstance(j, (dict, list)):
+                    decoded_text = json.dumps(j, ensure_ascii=False)
+                    method_label = "external:json-dump"
+        elif res.get("text"):
+            txt = res["text"]
+            # витягнути <pre> якщо є
+            m = re.search(r'<pre[^>]*>(.*?)</pre>', txt, flags=re.DOTALL | re.IGNORECASE)
+            if m:
+                decoded_text = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
+                method_label = "external:html-pre"
+            else:
+                # plain text або HTML fallback
+                decoded_text = re.sub(r'<[^>]+>', ' ', txt)
+                method_label = "external:plain"
+
+        # якщо сервіс повернув departments — відправляємо їх
+        if departments:
+            sent = 0
+            total_slots = 0
+            for d in departments:
+                title = d.get("section") or d.get("name") or "Відділення"
+                slots = d.get("slots") or d.get("units") or []
+                cleaned = []
+                for s in slots:
+                    name = s.get("name") if isinstance(s, dict) else s
+                    # використовуємо наявну clean_slot_value якщо є
+                    if 'clean_slot_value' in globals():
+                        cleaned.append(clean_slot_value(name))
+                    else:
+                        cleaned.append(str(name or "Слот"))
+                cleaned = [c for c in cleaned if c][:25]
+                total_slots += len(cleaned)
+                embed = discord.Embed(title=title, description="\n".join(f"{i+1}. {x}" for i,x in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
+                try:
+                    await ctx.send(embed=embed)
+                    sent += 1
+                except Exception:
+                    pass
+            await ctx.send(f"✅ Очищення завершено. Опубліковано відділень: {sent}. Знайдено слотів: {total_slots}. Метод: `{method_label}`.")
+            return
+
+        # якщо сервіс повернув текст — парсимо локально
+        if decoded_text:
+            # якщо текст виглядає як бінар/rap (має нульові символи або 'raP' на початку), спробуємо витягти сирі байти з attachment і обробити локально
+            if ("\x00" in decoded_text) or decoded_text.strip().startswith("raP"):
+                try:
+                    raw_bytes = await attachment.read()
+                    sqm_raw = extract_mission_from_pbo_bytes(raw_bytes) or raw_bytes
+                    if 'rap_to_text_aggressive' in globals():
+                        decoded_text = rap_to_text_aggressive(sqm_raw)
+                        method_label += "+rap_fallback"
+                except Exception:
+                    pass
+
+            # використовуємо наявний парсер parse_mission_sqm_flexible
+            if 'parse_mission_sqm_flexible' in globals():
+                groups = parse_mission_sqm_flexible(decoded_text)
+            else:
+                groups = []
+
+            if not groups:
+                # фолбек: знайти unitName/description/text
+                units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', decoded_text, flags=re.IGNORECASE | re.DOTALL)
+                if not units:
+                    units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", decoded_text, flags=re.IGNORECASE | re.DOTALL)
+                if not units:
+                    arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', decoded_text, flags=re.IGNORECASE | re.DOTALL)
+                    for a in arrs:
+                        units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
+                if units:
+                    groups = [("Відділення", [ (clean_slot_value(u) if 'clean_slot_value' in globals() else u) for u in units ])]
+
+            if not groups:
+                preview = (decoded_text or "")[:2000]
+                emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
+                emb.add_field(name="Метод обробки", value=method_label, inline=False)
+                emb.add_field(name="Прев'ю", value=f"```{preview}```", inline=False)
+                try:
+                    buf = io.BytesIO((decoded_text or "").encode('utf-8'))
+                    buf.seek(0)
+                    await ctx.send(embed=emb, file=discord.File(fp=buf, filename="decoded_mission_sqm.txt"))
+                except Exception:
+                    await ctx.send(embed=emb)
+                return
+
+            # відправляємо ембеди з груп
+            sent = 0
+            total_slots = 0
+            for name, slots in groups:
+                cleaned = [ (clean_slot_value(s) if 'clean_slot_value' in globals() else s) for s in slots ][:25]
+                total_slots += len(cleaned)
+                embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{i+1}. {s}" for i,s in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
+                try:
+                    await ctx.send(embed=embed)
+                    sent += 1
+                except Exception:
+                    pass
+            await ctx.send(f"✅ Очищення завершено. Опубліковано відділень: {sent}. Знайдено слотів: {total_slots}. Метод: `{method_label}`.")
+            return
+
+    # Якщо нічого не повернуто
+    await ctx.send("⚠️ Сервіс повернув непередбачуваний результат. Спробуйте інший сервіс або надішліть файл локально для діагностики.")
+# --- Кінець вставки ---
+# ─── on_ready ───────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
-    print(f"[on_ready] {bot.user}")
+    print(f"[on_ready] {bot.user} (id: {bot.user.id})")
     try:
         commit = subprocess.getoutput("git rev-parse --short HEAD")
     except Exception:
@@ -955,63 +503,8 @@ async def on_ready():
                 await ch.send(embed=embed)
             except:
                 pass
-    if not vtg_reminder.is_running():
-        vtg_reminder.start()
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or message.id in processed_messages:
-        return
-
-    if "запис слоти" in message.content.lower():
-        processed_messages.add(message.id)
-        header, slots, owners = None, [], []
-        for line in message.content.splitlines():
-            txt = line.strip()
-            if not txt or "запис слоти" in txt.lower() or "everyone" in txt.lower():
-                continue
-            m = TRIGGER_RE.match(txt)
-            if m:
-                owner = next((u for u in message.mentions if f"<@{u.id}>" in txt or f"<@!{u.id}>" in txt), None)
-                clean = MENTION_RE.sub("", m.group(2)).strip()
-                slots.append(clean)
-                owners.append(owner)
-            elif header is None:
-                header = txt
-
-        slots, owners = slots[:25], owners[:len(slots)]
-        sess = {"title": header or DEFAULT_TITLE, "lines": slots, "owners": owners, "channel_id": message.channel.id}
-        embed = build_embed(sess)
-        sent  = await message.channel.send(embed=embed)
-        sessions[sent.id] = sess
-        await sent.edit(view=SlotView(sent.id))
-
-    await bot.process_commands(message)
-
-@bot.command(name="оновити", aliases=["update"])
-async def _оновити(ctx: commands.Context):
-    if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
-    async with aiohttp.ClientSession() as sess:
-        await sess.post(DEPLOY_HOOK_URL)
-    await ctx.send("🔄 Деплой тригерено!")
-
-@bot.command(name="статус", aliases=["status"])
-async def _статус(ctx: commands.Context):
-    commit = subprocess.getoutput("git rev-parse --short HEAD")
-    await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
-
-@bot.command(name="gitpush")
-async def _gitpush(ctx: commands.Context):
-    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
-    emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m \"Оновлення слота\"`', inline=False)
-    emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
-    emb.set_footer(text="Після push → !оновити")
-    await ctx.send(embed=emb)
-
-# ─── Run ─────────────────────────────────────────────────────────────────────
+# ─── Запуск ────────────────────────────────────────────────────────────────
 if not TOKEN:
     print("DISCORD_TOKEN not set in environment")
 else:
