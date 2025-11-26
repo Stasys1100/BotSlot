@@ -1,5 +1,6 @@
 # bot.py
-# Discord бот: імпорт mission.sqm / .pbo, локальний фолбек, очищення слотів з fuzzy-dedupe
+# Оновлений бот: розширений парсер mission.sqm, більше правил вилучення слотів,
+# підтримка <t> inner, масивів, нецитованих значень, фолбеки для .pbo.
 # .env: DISCORD_TOKEN, ADMIN_CHANNEL_ID, VTG_CHANNEL_ID (опц.), EXTRACTPBO_PATH (опц.), EXTRACTOR_API_URL (опц.), EXTRACTOR_API_KEY (опц.)
 
 import os
@@ -57,7 +58,6 @@ EXTRACTPBO_PATH = os.getenv("EXTRACTPBO_PATH", "").strip()
 EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL", "").strip()
 EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY", "").strip()
 
-# internal state
 processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}
 claims: dict[tuple[int,int], list] = {}
@@ -348,88 +348,114 @@ def extract_mission_fallback(pbo_bytes: bytes) -> str:
     enc = detect_encoding_bytes(pbo_bytes) or "utf-8"
     return pbo_bytes.decode(enc, errors="replace")
 
-# ─── Parser for mission.sqm (flexible) ───────────────────────────────────────
+# ─── Parser for mission.sqm (stronger extraction) ────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
+    """
+    Розширений парсер:
+    - витягує class Group / class Section / class Unit блоки
+    - шукає name/groupName/title, unitName/description/text у різних форматах
+    - витягує <t> inner як можливий слот
+    - витягує нецитовані значення (без лапок) після = якщо вони короткі
+    - витягує масиви {...}
+    """
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
-    group_blocks = re.findall(r'(class\s+Group\b.*?\{.*?\}[\s;]*)', txt, flags=re.IGNORECASE | re.DOTALL)
-    if group_blocks:
-        for blk in group_blocks:
-            mname = re.search(r'(?:name|groupName|title)\s*=\s*"(.*?)"\s*;', blk, flags=re.IGNORECASE | re.DOTALL)
-            if not mname:
-                mname = re.search(r'(?:name|groupName|title)\s*=\s*[\'"](.*?)[\'"]', blk, flags=re.IGNORECASE | re.DOTALL)
-            gname = clean_slot_value(mname.group(1)) if mname else "Відділення"
-            units = re.findall(r'class\s+Unit\b.*?\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL)
-            slots = []
-            for u in units:
-                mslot = re.search(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', u, flags=re.IGNORECASE | re.DOTALL)
-                if not mslot:
-                    mslot = re.search(r'(?:description|unitName|text)\s*=\s*[\'"](.*?)[\'"]', u, flags=re.IGNORECASE | re.DOTALL)
-                if mslot:
-                    slots.append(clean_slot_value(mslot.group(1)))
-                    continue
-                arr = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', u, flags=re.IGNORECASE | re.DOTALL)
-                if arr:
-                    items = re.findall(r'[\'"](.+?)[\'"]', arr[0], flags=re.DOTALL)
-                    for it in items:
-                        slots.append(clean_slot_value(it))
-                    continue
-                mslot2 = re.search(r'(?:name)\s*=\s*"(.*?)"\s*;', u, flags=re.IGNORECASE | re.DOTALL)
-                if not mslot2:
-                    mslot2 = re.search(r'(?:name)\s*=\s*[\'"](.*?)[\'"]', u, flags=re.IGNORECASE | re.DOTALL)
-                if mslot2:
-                    slots.append(clean_slot_value(mslot2.group(1)))
-                    continue
-                q = re.search(r'"([^"]{2,200})"', u, flags=re.DOTALL)
-                slots.append(clean_slot_value(q.group(1)) if q else "Слот")
-            groups.append((gname, slots))
-        return groups
-    for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"(.*?)"\s*;', txt, flags=re.IGNORECASE | re.DOTALL):
-        gname = clean_slot_value(m.group(1))
-        start = m.end()
-        frag = txt[start:start + 30000]
-        units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"\s*;', frag, flags=re.IGNORECASE | re.DOTALL)
-        if not units:
-            units = re.findall(r'(?:unitName|description|text)\s*=\s*[\'"](.*?)[\'"]', frag, flags=re.IGNORECASE | re.DOTALL)
-        if not units:
-            arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', frag, flags=re.IGNORECASE | re.DOTALL)
-            for a in arrs:
-                units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
-        if units:
-            groups.append((gname, [clean_slot_value(u) for u in units]))
-    if groups:
-        return groups
-    unit_matches = [(m.start(), clean_slot_value(m.group(1))) for m in re.finditer(r'(?:unitName|description|text)\s*=\s*"(.*?)"', txt, flags=re.IGNORECASE | re.DOTALL)]
-    group_markers = [m.start() for m in re.finditer(r'(?:class\s+Group\b|groupName|name|title)\s*=', txt, flags=re.IGNORECASE)]
-    if unit_matches:
-        if not group_markers:
-            return [("Відділення", [u for _, u in unit_matches])]
-        grouped: Dict[int, List[str]] = {}
-        for pos, uname in unit_matches:
-            prev_positions = [p for p in group_markers if p <= pos]
-            key = max(prev_positions) if prev_positions else -1
-            grouped.setdefault(key, []).append(uname)
-        for key, slots in grouped.items():
-            if key == -1:
-                gname = "Відділення"
+
+    # 1) знайти блоки class Group / class Section / class Unit
+    block_pattern = re.compile(r'(class\s+(?:Group|Section|Unit|Side|Faction)\b.*?\{.*?\}\s*;?)', flags=re.IGNORECASE | re.DOTALL)
+    blocks = block_pattern.findall(txt)
+    if blocks:
+        for blk in blocks:
+            # знайти назву блоку (name, groupName, title)
+            mname = re.search(r'(?:name|groupName|title)\s*=\s*(?P<val>"[^"]*"|\'[^\']*\'|[^\s;]+)\s*;', blk, flags=re.IGNORECASE)
+            if mname:
+                raw_name = mname.group('val').strip()
+                raw_name = raw_name.strip('"\'')
+                gname = clean_slot_value(raw_name)
             else:
-                snippet = txt[key:key+400]
-                mname2 = re.search(r'(?:name|groupName|title)\s*=\s*"(.*?)"', snippet, flags=re.IGNORECASE | re.DOTALL)
-                if not mname2:
-                    mname2 = re.search(r'(?:name|groupName|title)\s*=\s*[\'"](.*?)[\'"]', snippet, flags=re.IGNORECASE | re.DOTALL)
-                gname = clean_slot_value(mname2.group(1)) if mname2 else "Відділення"
-            groups.append((gname, slots))
+                gname = "Відділення"
+
+            # збираємо слоти всередині блоку: unitName, description, text, name, <t> inner, масиви
+            slots: List[str] = []
+
+            # 1a) цитовані значення
+            for m in re.finditer(r'(?:unitName|description|text|name)\s*=\s*"(.*?)"\s*;', blk, flags=re.IGNORECASE | re.DOTALL):
+                slots.append(m.group(1))
+            for m in re.finditer(r"(?:unitName|description|text|name)\s*=\s*'(.*?)'\s*;", blk, flags=re.IGNORECASE | re.DOTALL):
+                slots.append(m.group(1))
+
+            # 1b) масиви: unitName[] = { "a","b" }
+            for arr in re.finditer(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', blk, flags=re.IGNORECASE | re.DOTALL):
+                inner = arr.group(1)
+                items = re.findall(r'[\'"](.+?)[\'"]', inner, flags=re.DOTALL)
+                for it in items:
+                    slots.append(it)
+
+            # 1c) нецитовані короткі значення (name = SomeName;)
+            for m in re.finditer(r'(?:unitName|description|text|name)\s*=\s*([A-Za-z0-9_\-\/\\\s]{2,60})\s*;', blk, flags=re.IGNORECASE):
+                val = m.group(1).strip()
+                # ігноруємо якщо це ключове слово або число
+                if not re.fullmatch(r'\d+', val):
+                    slots.append(val)
+
+            # 1d) <t> inner всередині блоку
+            tinners = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', blk, flags=re.IGNORECASE | re.DOTALL)
+            for ti in tinners:
+                slots.append(ti)
+
+            # 1e) fallback: будь-які рядки в Unit блоках, які виглядають як текст (рядки без =)
+            for line in re.findall(r'\n\s*([^=\n]{3,120})\n', blk):
+                line = line.strip()
+                if len(line) > 3 and not line.lower().startswith('class '):
+                    # відкидаємо якщо це ключові слова
+                    if not re.search(r'\b(class|position|vehicle|side|rank)\b', line, flags=re.IGNORECASE):
+                        slots.append(line)
+
+            # очистити і додати
+            cleaned_slots = [clean_slot_value(s) for s in slots if s and s.strip()]
+            if cleaned_slots:
+                groups.append((gname, cleaned_slots))
         return groups
+
+    # 2) якщо немає блоків — глобальний пошук по всьому тексту
+
+    # 2a) знайти всі цитовані unitName/description/text/name
+    slots_global: List[str] = []
+    for m in re.finditer(r'(?:unitName|description|text|name)\s*=\s*"(.*?)"\s*;', txt, flags=re.IGNORECASE | re.DOTALL):
+        slots_global.append(m.group(1))
+    for m in re.finditer(r"(?:unitName|description|text|name)\s*=\s*'(.*?)'\s*;", txt, flags=re.IGNORECASE | re.DOTALL):
+        slots_global.append(m.group(1))
+
+    # 2b) масиви
+    for arr in re.finditer(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', txt, flags=re.IGNORECASE | re.DOTALL):
+        inner = arr.group(1)
+        items = re.findall(r'[\'"](.+?)[\'"]', inner, flags=re.DOTALL)
+        for it in items:
+            slots_global.append(it)
+
+    # 2c) <t> inner по всьому тексту
+    for ti in re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', txt, flags=re.IGNORECASE | re.DOTALL):
+        slots_global.append(ti)
+
+    # 2d) нецитовані значення після = (глобально)
+    for m in re.finditer(r'(?:unitName|description|text|name)\s*=\s*([A-Za-z0-9_\-\/\\\s]{2,80})\s*;', txt, flags=re.IGNORECASE):
+        val = m.group(1).strip()
+        if not re.fullmatch(r'\d+', val):
+            slots_global.append(val)
+
+    if slots_global:
+        cleaned = [clean_slot_value(s) for s in slots_global if s and s.strip()]
+        return [("Відділення", cleaned)]
+
     return []
 
-# ─── Slot normalization + fuzzy dedupe ───────────────────────────────────────
+# ─── Helpers: normalize/dedupe slots (less aggressive) ───────────────────────
 def normalize_slot_name(s: str) -> str:
     s = s or ""
     s = s.strip()
     s = re.sub(r'\s{2,}', ' ', s)
     s = re.sub(r'\s+([!?.,:;])', r'\1', s)
     s = re.sub(r'([!?.]){2,}', r'\1', s)
-    # remove leading/trailing punctuation
     s = s.strip(" \t\n\r-–—")
     return s
 
@@ -439,36 +465,18 @@ def is_template_slot(s: str) -> bool:
     low = s.lower().strip()
     if low in ("слот", "-", "—", "n/a", "none", "пусто"):
         return True
-    # short generic templates
     if re.fullmatch(r'^[\W_]{1,5}$', low):
         return True
     return False
 
-def fuzzy_merge_slots(slots: List[str], threshold: float = 0.86) -> List[str]:
-    """
-    Зберігає порядок, зливає дуже схожі рядки (ratio >= threshold).
-    Повертає список унікальних назв.
-    """
-    out: List[str] = []
-    for s in slots:
-        s_norm = s.strip()
-        if not s_norm:
-            continue
-        merged = False
-        for i, existing in enumerate(out):
-            ratio = difflib.SequenceMatcher(None, existing.lower(), s_norm.lower()).ratio()
-            if ratio >= threshold:
-                # keep the shorter or the one with more Cyrillic characters
-                if len(s_norm) < len(existing):
-                    out[i] = s_norm
-                else:
-                    # prefer the one with higher cyrillic score
-                    if _cyrillic_score(s_norm) > _cyrillic_score(existing):
-                        out[i] = s_norm
-                merged = True
-                break
-        if not merged:
-            out.append(s_norm)
+def dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for it in items:
+        key = it.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(it)
     return out
 
 # ─── Optional: upload to external extractor (if used) ────────────────────────
@@ -522,9 +530,7 @@ async def імпорт_sqm(ctx: commands.Context):
                         sqm_text = j.get("decoded_text")
                         method = "external:decoded_text"
                     elif isinstance(j, dict) and j.get("departments"):
-                        # service returned departments directly
                         departments = j.get("departments")
-                        # publish departments (cleaned) and return
                         sent_count = 0
                         total_slots = 0
                         for d in departments:
@@ -533,8 +539,8 @@ async def імпорт_sqm(ctx: commands.Context):
                             raw_slots = [ s.get("name") if isinstance(s, dict) else s for s in slots ]
                             cleaned = [ normalize_slot_name(clean_slot_value(x)) for x in raw_slots ]
                             cleaned = [c for c in cleaned if not is_template_slot(c)]
-                            cleaned = fuzzy_merge_slots(cleaned)
-                            cleaned = cleaned[:25]
+                            cleaned = dedupe_preserve_order(cleaned)
+                            cleaned = cleaned[:200]  # більше ліміту для діагностики
                             total_slots += len(cleaned)
                             embed = discord.Embed(title=title, description="\n".join(f"{i+1}. {x}" for i,x in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
                             try:
@@ -591,7 +597,7 @@ async def імпорт_sqm(ctx: commands.Context):
         if units:
             groups = [("Відділення", [clean_slot_value(u) for u in units])]
 
-    # 4) diagnostics
+    # 4) diagnostics (запис перших 8KB у файл для аналізу)
     dbg_lines = []
     raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', sqm_text, flags=re.IGNORECASE | re.DOTALL)[:5]
     if raw_t_inner:
@@ -603,6 +609,14 @@ async def імпорт_sqm(ctx: commands.Context):
     try:
         await ctx.send(embed=emb_dbg)
     except:
+        pass
+    # додатково: прикріпимо перші 8KB для діагностики
+    try:
+        preview_bytes = sqm_text.encode('utf-8')[:8192]
+        buf = io.BytesIO(preview_bytes)
+        buf.seek(0)
+        await ctx.send("📄 Прев'ю (перші 8KB):", file=discord.File(fp=buf, filename="preview_decoded_mission_sqm.txt"))
+    except Exception:
         pass
 
     # 5) if no groups -> preview
@@ -620,7 +634,7 @@ async def імпорт_sqm(ctx: commands.Context):
             await ctx.send(embed=emb)
         return
 
-    # 6) publish cleaned groups
+    # 6) publish cleaned groups (зберігаємо більше слотів)
     target_ch = bot.get_channel(ADMIN_CHANNEL_ID) if ADMIN_CHANNEL_ID else ctx.channel
     sent_count = 0
     total_slots = 0
@@ -628,15 +642,19 @@ async def імпорт_sqm(ctx: commands.Context):
         raw_slots = [ s.get("name") if isinstance(s, dict) else s for s in slots ]
         cleaned = [ normalize_slot_name(clean_slot_value(x)) for x in raw_slots ]
         cleaned = [c for c in cleaned if not is_template_slot(c)]
-        cleaned = fuzzy_merge_slots(cleaned, threshold=0.86)
-        cleaned = cleaned[:25]
+        cleaned = dedupe_preserve_order(cleaned)
+        cleaned = cleaned[:200]  # даємо більше, щоб ти бачив всі варіанти
         total_slots += len(cleaned)
-        embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{i+1}. {s}" for i,s in enumerate(cleaned)) or "— слотів не знайдено —", color=discord.Color.blurple())
-        try:
-            await target_ch.send(embed=embed)
-            sent_count += 1
-        except Exception:
-            pass
+        # якщо дуже багато — розбиваємо на кілька ембедів по 50
+        chunk_size = 50
+        for i in range(0, len(cleaned), chunk_size):
+            chunk = cleaned[i:i+chunk_size]
+            embed = discord.Embed(title=name or "Відділення", description="\n".join(f"{j+1+i}. {s}" for j,s in enumerate(chunk)) or "— слотів не знайдено —", color=discord.Color.blurple())
+            try:
+                await target_ch.send(embed=embed)
+                sent_count += 1
+            except Exception:
+                pass
 
     await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method}`. Знайдено слотів: {total_slots}.")
 
