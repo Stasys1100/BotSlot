@@ -1,7 +1,6 @@
 # bot.py
-# Повний робочий код бота з надійним імпортом mission.sqm/.pbo,
+# Повний робочий код бота з інтеграцією зовнішнього сервісу (HTTP upload),
 # фіксами mojibake, витягом innerText з <t ...> тегів, діагностикою та інтегрованим парсером відділень.
-# Збережи цей файл як bot.py і перезапусти бота.
 
 import os
 import re
@@ -50,6 +49,10 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID = int(os.getenv("VTG_CHANNEL_ID") or 1160843618433630228)
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 1395065909185478769)
+
+# External extractor config (опціонально)
+EXTRACTOR_API_URL = os.getenv("EXTRACTOR_API_URL")  # наприклад https://fileproinfo.com/api/upload
+EXTRACTOR_API_KEY = os.getenv("EXTRACTOR_API_KEY")  # опціонально
 
 processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}              # message_id → { title, lines, owners, channel_id }
@@ -105,11 +108,6 @@ def _cyrillic_score(s: str) -> int:
     return len(re.findall(r'[\u0400-\u04FF]', s))
 
 def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[str, str]:
-    """
-    Спробувати кілька декодувань і вибрати найкращий кандидат за кількістю кирилиці
-    та відсотком друкованих символів.
-    Повертає (text, label).
-    """
     candidates: List[Tuple[str, str]] = []
     if initial_text is not None:
         candidates.append((initial_text, "as-decoded"))
@@ -122,7 +120,6 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
         except Exception:
             pass
 
-    # Спроби "перекодування" (типовий випадок mojibake)
     try:
         redecoded = initial_text.encode("latin-1", errors="replace").decode("utf-8", errors="replace")
         candidates.append((redecoded, "latin1->utf8"))
@@ -149,20 +146,12 @@ def _try_redecode_candidates(original_bytes: bytes, initial_text: str) -> Tuple[
     return best[0], best[1]
 
 def fix_mojibake_text(text: str) -> str:
-    """
-    Якщо текст містить типові ознаки mojibake (наприклад 'РўРё' або 'Ð¢Ð¸'),
-    спробувати кілька перетворень і повернути найкращий варіант.
-    """
     if not text:
         return text
-    # швидка перевірка: чи є в тексті послідовності, що часто зустрічаються у mojibake
     if not re.search(r'[ÐР]', text):
-        return text  # ймовірно, нормальний текст
-
+        return text
     candidates: List[Tuple[str, str]] = []
     candidates.append((text, "orig"))
-
-    # common fixes
     try:
         candidates.append((text.encode("latin-1", errors="replace").decode("utf-8", errors="replace"), "latin1->utf8"))
     except Exception:
@@ -179,7 +168,6 @@ def fix_mojibake_text(text: str) -> str:
         candidates.append((text.encode("latin-1", errors="replace").decode("cp1251", errors="replace"), "latin1->cp1251"))
     except Exception:
         pass
-
     try:
         b = text.encode("utf-8", errors="replace")
         candidates.append((b.decode("cp1251", errors="replace"), "utf8bytes->cp1251"))
@@ -195,15 +183,9 @@ def fix_mojibake_text(text: str) -> str:
 
 # ─── HTML / тег <t> витяг та очищення ────────────────────────────────────────
 def extract_structured_text(raw: str) -> str:
-    """
-    Витягує innerText з тегів <t ...>...</t>, декодує HTML-entities,
-    видаляє інші теги та control-символи.
-    Якщо парних тегів немає — видаляє відкриваючі/закриваючі теги.
-    """
     if not raw:
         return ""
     s = html.unescape(raw)
-    # знайти парні <t ...>...</t>
     chunks = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', s, flags=re.IGNORECASE | re.DOTALL)
     if chunks:
         inner = " ".join(chunks)
@@ -212,7 +194,6 @@ def extract_structured_text(raw: str) -> str:
         inner = re.sub(r'\s{2,}', ' ', inner).strip(' "\'').strip()
         inner = fix_mojibake_text(inner)
         return inner
-    # якщо парних тегів немає — просто видалити теги
     s = re.sub(r'<\s*t\b[^>]*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'</\s*t\s*>', ' ', s, flags=re.IGNORECASE)
     s = re.sub(r'<[^>]+>', ' ', s)
@@ -222,13 +203,6 @@ def extract_structured_text(raw: str) -> str:
     return s
 
 def clean_slot_value(raw: str) -> str:
-    """
-    Агресивне очищення одного значення слоту:
-    - витяг innerText з <t ...>
-    - видалення шляхів, довгих хешів, control-символів
-    - застосування fix_mojibake_text
-    - якщо результат порожній або шумний — повернути 'Слот'
-    """
     if raw is None:
         return "Слот"
     s = extract_structured_text(raw)
@@ -237,7 +211,7 @@ def clean_slot_value(raw: str) -> str:
     s = re.sub(r'\.sqf\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\.pbo\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\bhttps?://\S+\b', '', s)
-    s = re.sub(r'\b[A-Za-z0-9_\\/:.\-]{40,}\b', ' ', s)  # довгі шляхи/рядки
+    s = re.sub(r'\b[A-Za-z0-9_\\/:.\-]{40,}\b', ' ', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'').strip()
     if not s or s.lower().startswith("<t color") or s in {'"', "'"}:
         return "Слот"
@@ -245,13 +219,6 @@ def clean_slot_value(raw: str) -> str:
 
 # ─── RAP-декодер (aggressive) ────────────────────────────────────────────────
 def rap_to_text_aggressive(data: bytes) -> str:
-    """
-    Агресивне декодування RAP/binary-даних:
-    - спроба детектора кодування
-    - спроби utf-8, cp1251, koi8-r, latin-1
-    - спроби "перекодування" для mojibake
-    - обрізка/нормалізація та повернення тексту
-    """
     detected = detect_encoding_bytes(data)
     initial_text = None
     tried_label = "unknown"
@@ -282,7 +249,6 @@ def rap_to_text_aggressive(data: bytes) -> str:
     text = best_text
     text = fix_mojibake_text(text)
 
-    # видалити control-символи
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]+', ' ', text)
     def keep(ch):
         o = ord(ch)
@@ -326,9 +292,6 @@ def rap_to_text_aggressive(data: bytes) -> str:
 
 # ─── Хевристика: чи це RAP/бінарні дані ──────────────────────────────────────
 def is_likely_rap_or_binary(b: bytes) -> bool:
-    """
-    Якщо починається з 'raP' або має низький відсоток друкованих байтів — вважаємо бінаром/RAP.
-    """
     if len(b) >= 3 and b[:3] == b'raP':
         return True
     printable = sum(1 for ch in b if 32 <= ch <= 126 or ch in (9,10,13))
@@ -359,15 +322,9 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
     return None
 
 async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
-    """
-    Read attachment (.pbo or .sqm) and return (text, method).
-    Uses detector and multiple decode strategies, picks best candidate by Cyrillic score.
-    Prioritizes RAP decoding when file looks binary or starts with 'raP'.
-    """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
-    # If the bytes look like RAP/binary, decode aggressively with rap_to_text_aggressive
     if is_likely_rap_or_binary(data):
         try:
             text = rap_to_text_aggressive(data)
@@ -477,7 +434,6 @@ def parse_section(text: str) -> Dict[str, Any]:
                 if t:
                     result["slots"].append({"num": None, "name": fix_mojibake_text(t), "abbr": None})
     else:
-        # Simple processing without header
         slots: List[Dict[str, Any]] = []
         header = lines[0] if lines else ""
         for l in lines[1:]:
@@ -508,11 +464,6 @@ def extract_departments(text: str) -> List[Dict[str, Any]]:
             res.append(parsed)
     return res
 
-def process_input_text(input_text: str) -> str:
-    decomp = extract_departments(input_text)
-    return json.dumps(decomp, ensure_ascii=False, indent=2)
-
-# ─── Гнучкий парсер mission.sqm для ембедів ──────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
     groups: List[Tuple[str, List[str]]] = []
     txt = text.replace('\r\n', '\n')
@@ -592,7 +543,62 @@ def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
 
     return []
 
-# ─── Команда імпорту з діагностикою та JSON-експортом ────────────────────────
+# ─── Інтеграція з зовнішнім сервісом (probe + upload) ────────────────────────
+async def probe_and_upload(attachment: discord.Attachment, timeout=30) -> Dict[str, Any]:
+    if not EXTRACTOR_API_URL:
+        return {"status":"no-config", "error":"EXTRACTOR_API_URL not set"}
+
+    candidates = []
+    url_base = EXTRACTOR_API_URL.rstrip('/')
+    candidates.append(EXTRACTOR_API_URL)
+    candidates += [
+        url_base + "/upload",
+        url_base + "/api/upload",
+        url_base + "/api/extract",
+        url_base + "/api/v1/upload",
+        url_base + "/file/upload"
+    ]
+
+    headers = {}
+    if EXTRACTOR_API_KEY:
+        headers['Authorization'] = f"Bearer {EXTRACTOR_API_KEY}"
+
+    file_bytes = await attachment.read()
+
+    async with aiohttp.ClientSession() as sess:
+        last_err = None
+        for url in candidates:
+            try:
+                try:
+                    async with sess.get(url, headers=headers, timeout=8) as rget:
+                        pass
+                except Exception:
+                    pass
+
+                data = aiohttp.FormData()
+                data.add_field('file', file_bytes, filename=attachment.filename, content_type='application/octet-stream')
+                async with sess.post(url, data=data, headers=headers, timeout=timeout) as resp:
+                    text = await resp.text()
+                    ctype = resp.headers.get('Content-Type', '')
+                    if resp.status in (200,201):
+                        if 'application/json' in ctype or text.strip().startswith('{') or text.strip().startswith('['):
+                            try:
+                                j = json.loads(text)
+                            except Exception:
+                                j = None
+                            if isinstance(j, dict) and j.get('departments'):
+                                return {"status":"ok","method":f"external:{url}","departments":j['departments']}
+                            if isinstance(j, dict) and j.get('decoded_text'):
+                                return {"status":"ok","method":f"external:{url}","decoded_text":j['decoded_text']}
+                            return {"status":"ok","method":f"external:{url}","json":j or text}
+                        return {"status":"ok","method":f"external:{url}","html":text}
+                    else:
+                        last_err = f"{url} -> {resp.status} {text[:200]}"
+            except Exception as e:
+                last_err = str(e)
+        return {"status":"error","error": last_err or "no candidate succeeded"}
+
+# ─── Команда імпорту з діагностикою та JSON-експортом (оновлена) ─────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -601,94 +607,110 @@ async def імпорт_sqm(ctx: commands.Context):
         return await ctx.send("❌ Прикріпіть файл .pbo або mission.sqm до повідомлення.")
 
     attachment = ctx.message.attachments[0]
-    try:
-        text, method = await read_attachment_sqm_text(attachment)
-    except Exception as e:
-        return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # --- ДІАГНОСТИКА: перші raw-захоплення різними regex-ами ---
-    raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-    raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
-    raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
-    raw_nq = re.findall(r'(?:description|unitName|text)\s*=\s*([^;{][^;]{1,400})\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
-    raw_t_open = re.findall(r'<\s*t\b[^>]*>', text, flags=re.IGNORECASE)[:20]
-    raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)[:20]
+    try:
+        res = await probe_and_upload(attachment)
+    except Exception as e:
+        res = {"status":"error", "error": str(e)}
+
+    text = None
+    method = None
+    departments = None
+
+    if res.get("status") == "ok":
+        method = res.get("method", "external")
+        if res.get("departments"):
+            departments = res["departments"]
+        elif res.get("decoded_text"):
+            text = res["decoded_text"]
+        elif res.get("json") and isinstance(res["json"], dict):
+            j = res["json"]
+            if j.get("departments"):
+                departments = j["departments"]
+            elif j.get("decoded_text"):
+                text = j["decoded_text"]
+            else:
+                text = json.dumps(j, ensure_ascii=False)
+        elif res.get("html"):
+            method = method or "external:html"
+            html_text = res["html"]
+            m = re.search(r'<pre[^>]*>(.*?)</pre>', html_text, flags=re.DOTALL|re.IGNORECASE)
+            if m:
+                decoded = html.unescape(re.sub(r'<[^>]+>', '', m.group(1)))
+                text = decoded
+            else:
+                decoded = re.sub(r'<[^>]+>', ' ', html_text)
+                text = decoded
+    else:
+        try:
+            text, method = await read_attachment_sqm_text(attachment)
+        except Exception as e:
+            return await ctx.send(f"❌ Не вдалося обробити файл ні зовнішнім сервісом, ні локально: {e}")
+
+    if departments is None and text:
+        groups = parse_mission_sqm_flexible(text)
+        if groups:
+            departments = [{"section": n, "slots":[{"name":s} for s in sl]} for n, sl in groups]
+        else:
+            units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
+            if not units:
+                units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", text, flags=re.IGNORECASE | re.DOTALL)
+            if not units:
+                arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)
+                for a in arrs:
+                    units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
+            if units:
+                departments = [{"section":"Відділення", "slots":[{"name":clean_slot_value(u)} for u in units]}]
 
     dbg_lines = []
-    def short(x): return (x[:300] + '...') if x and len(x) > 300 else (x or '')
-    if raw_double:
-        dbg_lines.append("raw_double[0] = " + short(raw_double[0]))
-    if raw_single:
-        dbg_lines.append("raw_single[0] = " + short(raw_single[0]))
-    if raw_arrays:
-        dbg_lines.append("raw_arrays[0] = " + short(raw_arrays[0]))
-    if raw_nq:
-        dbg_lines.append("raw_no_quotes[0] = " + short(raw_nq[0]))
-    if raw_t_open:
-        dbg_lines.append("first <t ...> tag = " + short(raw_t_open[0]))
-    if raw_t_inner:
-        dbg_lines.append("first <t>inner = " + short(raw_t_inner[0]))
+    if text:
+        raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
+        raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
+        raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
+        raw_nq = re.findall(r'(?:description|unitName|text)\s*=\s*([^;{][^;]{1,400})\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
+        raw_t_open = re.findall(r'<\s*t\b[^>]*>', text, flags=re.IGNORECASE)[:20]
+        raw_t_inner = re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)[:20]
 
-    cleaned_examples = []
-    if raw_double:
-        cleaned_examples.append(clean_slot_value(raw_double[0]))
-    elif raw_single:
-        cleaned_examples.append(clean_slot_value(raw_single[0]))
-    elif raw_arrays:
-        arr_items = re.findall(r'[\'"](.+?)[\'"]', raw_arrays[0], flags=re.DOTALL)
-        if arr_items:
-            cleaned_examples.append(clean_slot_value(arr_items[0]))
-    elif raw_nq:
-        cleaned_examples.append(clean_slot_value(raw_nq[0]))
+        def short(x): return (x[:300] + '...') if x and len(x) > 300 else (x or '')
+        if raw_double:
+            dbg_lines.append("raw_double[0] = " + short(raw_double[0]))
+        if raw_single:
+            dbg_lines.append("raw_single[0] = " + short(raw_single[0]))
+        if raw_arrays:
+            dbg_lines.append("raw_arrays[0] = " + short(raw_arrays[0]))
+        if raw_nq:
+            dbg_lines.append("raw_no_quotes[0] = " + short(raw_nq[0]))
+        if raw_t_open:
+            dbg_lines.append("first <t ...> tag = " + short(raw_t_open[0]))
+        if raw_t_inner:
+            dbg_lines.append("first <t>inner = " + short(raw_t_inner[0]))
 
     emb_dbg = discord.Embed(title="🔍 Діагностика імпорту mission.sqm", color=discord.Color.orange())
-    emb_dbg.add_field(name="Метод обробки", value=method, inline=False)
+    emb_dbg.add_field(name="Метод обробки", value=method or (res.get("method") if isinstance(res, dict) else "unknown"), inline=False)
     if dbg_lines:
         emb_dbg.add_field(name="Приклади raw-захоплень", value="\n".join(dbg_lines)[:1000], inline=False)
-    if cleaned_examples:
-        emb_dbg.add_field(name="Приклад очищення", value=cleaned_examples[0][:1000], inline=False)
     try:
         await ctx.send(embed=emb_dbg)
     except:
         pass
 
-    # --- Use user's department parser to produce JSON output ---
     try:
-        departments = extract_departments(text)
-        json_text = json.dumps(departments, ensure_ascii=False, indent=2)
-        # attach JSON as a file for convenience
-        buf = io.BytesIO(json_text.encode('utf-8'))
-        buf.seek(0)
-        file = discord.File(fp=buf, filename="departments.json")
-        await ctx.send("📁 Ось розпарсовані відділення (JSON):", file=file)
+        if departments:
+            json_text = json.dumps(departments, ensure_ascii=False, indent=2)
+            buf = io.BytesIO(json_text.encode('utf-8'))
+            buf.seek(0)
+            file = discord.File(fp=buf, filename="departments.json")
+            await ctx.send("📁 Ось розпарсовані відділення (JSON):", file=file)
     except Exception:
-        # ignore if fails
         pass
 
-    # --- основний парсинг для ембедів (збережено сумісність) ---
-    groups = parse_mission_sqm_flexible(text)
-
-    # фолбек: зібрати всі unit-токени
-    if not groups:
-        units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
-        if not units:
-            units = re.findall(r"(?:unitName|description|text)\s*=\s*'(.*?)'", text, flags=re.IGNORECASE | re.DOTALL)
-        if not units:
-            arrs = re.findall(r'(?:unitName|description|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)
-            for a in arrs:
-                units += re.findall(r'[\'"](.+?)[\'"]', a, flags=re.DOTALL)
-        if not units:
-            units = re.findall(r'(?:unitName|description|text)\s*=\s*([^;{][^;]{1,400})\s*;', text, flags=re.IGNORECASE | re.DOTALL)
-        if units:
-            groups = [("Відділення", [clean_slot_value(u) for u in units])]
-
-    if not groups:
-        preview = "\n".join(text.splitlines()[:150])[:1900]
+    if not departments:
+        preview = (text or "")[:2000]
         emb = discord.Embed(title="ℹ️ Не знайдено відділень", color=discord.Color.red())
-        emb.add_field(name="Метод обробки", value=method, inline=False)
+        emb.add_field(name="Метод обробки", value=method or "unknown", inline=False)
         emb.add_field(name="Прев'ю початку файлу", value=f"```{preview}```", inline=False)
         try:
-            buf = io.BytesIO(text.encode('utf-8'))
+            buf = io.BytesIO((text or "").encode('utf-8'))
             buf.seek(0)
             file = discord.File(fp=buf, filename="decoded_mission_sqm.txt")
             await ctx.send(embed=emb, file=file)
@@ -702,16 +724,19 @@ async def імпорт_sqm(ctx: commands.Context):
 
     sent_count = 0
     total_slots = 0
-    for group_name, slot_list in groups:
+    for d in departments:
+        title = d.get("section") or "Відділення"
+        slots = d.get("slots", [])
         cleaned_slots = []
-        for s in slot_list:
-            s2 = clean_slot_value(s)
-            if not s2 or s2.lower().startswith("<t color") or s2 in {'"', "'"}:
-                s2 = "Слот"
-            cleaned_slots.append(s2)
+        for s in slots:
+            name = s.get("name") if isinstance(s, dict) else s
+            name = clean_slot_value(name)
+            if not name or name.lower().startswith("<t color") or name in {'"', "'"}:
+                name = "Слот"
+            cleaned_slots.append(name)
         cleaned_slots = [x for x in cleaned_slots if x][:25]
         total_slots += len(cleaned_slots)
-        embed = discord.Embed(title=group_name or "Відділення", color=discord.Color.blurple())
+        embed = discord.Embed(title=title, color=discord.Color.blurple())
         embed.description = "\n".join(f"{i+1}. {s}" for i, s in enumerate(cleaned_slots)) if cleaned_slots else "— слотів не знайдено —"
         try:
             await target_ch.send(embed=embed)
@@ -719,7 +744,7 @@ async def імпорт_sqm(ctx: commands.Context):
         except Exception:
             pass
 
-    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method}`. Знайдено слотів: {total_slots}.")
+    await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method or res.get('method','external')}`. Знайдено слотів: {total_slots}.")
 
 # ─── Slot UI and management (existing logic preserved) ───────────────────────
 def build_embed(sess: dict) -> discord.Embed:
@@ -805,7 +830,11 @@ class DecisionModal(Modal):
     def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
         title = "Причина призначення" if accept else "Причина відмови"
         super().__init__(title=title)
-        self.sid = sid; self.idx = idx; self.claimant_id = claimant_id; self.admin_msg_id = admin_msg_id; self.accept = accept
+        self.sid = sid
+        self.idx = idx
+        self.claimant_id = claimant_id
+        self.admin_msg_id = admin_msg_id
+        self.accept = accept
         self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
         self.add_item(self.reason)
 
