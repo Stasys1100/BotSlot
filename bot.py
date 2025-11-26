@@ -126,13 +126,17 @@ def is_noise(s: str) -> bool:
     oneoff_tech = {
         "mavicblue1","mavicblue2","mavicred1","mavicred2",
         "m113","m113a3","bmp","bmp-2","бмп-2",
-        "mt-лб","gaz-66","gaз-66","tigr","тигр","bradley"
+        "mt-лб","gaz-66","gaз-66","tigr","тигр","bradley","m2a3","m109a6","abrams"
     }
     if low in oneoff_tech:
         return True
 
     # моделі/персонажі
     if s.startswith("Male") and ("ENG" in s or "PER" in s or "RUS" in s):
+        return True
+
+    # колекції/масиви
+    if s.startswith("[[[") and s.endswith("]]],false"):
         return True
 
     return False
@@ -214,7 +218,7 @@ def decode_bytes(raw: bytes) -> str:
 # Визначення заголовків
 # ─────────────────────────────────────────────────────────────────────────────
 TITLE_PATTERN = re.compile(
-    r'@Альфа|@Alpha|Штаб|бригада|Окрема|відділення|Піхотне|ОМБр|ССО|ГУР|артилерій|ЧВК|армейский|мотострелков|Infantry Squad|Squad|Regiment|Battalion|SEAL Team',
+    r'@Альфа|@Alpha|Штаб|бригада|Окрема|відділення|Піхотне|ОМБр|ССО|ГУР|артилерій|ЧВК|армейский|мотострелков|Infantry Squad|Squad|Regiment|Battalion|SEAL Team|Artillery Crew|Tank Crew',
     flags=re.IGNORECASE
 )
 
@@ -227,18 +231,22 @@ def split_commander_from_title(s: str) -> Tuple[str, Optional[str]]:
     """
     s_clean = s.strip()
     # Українська/російська
-    m = re.match(r'^\s*(Командир [^|@]*)(?:\s*\|\s*ENG)?\s*@', s_clean, flags=re.IGNORECASE)
+    m = re.match(r'^\s*(Командир [^|@]*)(?:\s*\|\s*\w+)?\s*@', s_clean, flags=re.IGNORECASE)
     if m:
-        commander = m.group(1)
-        title = re.sub(r'^\s*' + re.escape(m.group(0)).replace('@', '@'), '@', s_clean).strip()
-        # Тепер title починається з @Альфа... решту беремо як є
-        return title, commander
+        commander = m.group(1).strip()
+        # Замінити початок на '@' так, щоб заголовок лишився без "Командир ..."
+        idx = s_clean.find('@')
+        if idx != -1:
+            title = s_clean[idx:].strip()
+            return title, commander
     # Англійська (Squad Leader ...)
     m2 = re.match(r'^\s*(Squad Leader[^|@]*)(?:\s*\|\s*[A-Z]+)?\s*@', s_clean, flags=re.IGNORECASE)
     if m2:
-        commander = m2.group(1)
-        title = re.sub(r'^\s*' + re.escape(m2.group(0)).replace('@', '@'), '@', s_clean).strip()
-        return title, commander
+        commander = m2.group(1).strip()
+        idx = s_clean.find('@')
+        if idx != -1:
+            title = s_clean[idx:].strip()
+            return title, commander
     # Якщо не знайдено шаблону — інколи заголовок вже без "Командир ...", тоді повертаємо як є
     return s_clean, None
 
@@ -302,7 +310,9 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             cur_title = title_line
             # Додати командира як перший слот (якщо знайшли)
             if commander_slot:
-                cur_slots.append(commander_slot)
+                # Нормалізувати форму: "Командир відділення" / "Squad Leader"
+                cs_norm = re.sub(r'\s{2,}', ' ', commander_slot).strip()
+                cur_slots.append(cs_norm)
             continue
 
         # Слот за нумерацією або ключовими словами
@@ -325,13 +335,13 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 def detect_side_from_title(title: str) -> str:
     t = title.lower()
     # Українська сторона
-    if any(k in t for k in ["омбр", "зсу", "гуp", "ссо", "окрема", "бригада", "@альфа", "альфа", "холодний яр"]):
+    if any(k in t for k in ["омбр", "зсу", "гуp", "ссо", "окрема", "бригада", "@альфа", "альфа", "холодний яр", "механізоване відділення", "піхотне відділення"]):
         return "ЗСУ"
     # Російська / ПВК
-    if any(k in t for k in ["армейский", "чвк", "мотострелковая", "корпус", "отдельная", "армия", "72-я", "3-й ак"]):
+    if any(k in t for k in ["армейский", "чвк", "мотострелковая", "корпус", "отдельная", "армия", "72-я", "3-й ак", "омсбр", "рбр", "вдв"]):
         return "ЗС РФ/ПВК"
     # Союзники/нато/англомовне
-    if any(k in t for k in ["regiment", "battalion", "seal team", "mechanized squad", "@alpha"]):
+    if any(k in t for k in ["regiment", "battalion", "seal team", "mechanized squad", "@alpha", "artillery crew", "tank crew"]):
         return "Союзники"
     return "Невідомо"
 
@@ -433,7 +443,7 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
     Імпорт текстового mission.sqm.
     - Без аргументів: виводить усі відділення по групах (дублікати заголовків об'єднані).
     - З аргументами (наприклад "2-2" або "1-2 2-5"): показує лише відповідні заголовки (як окремий токен), для всіх сторін.
-    Формат виводу: Назва відділення (без "Командир ...") окремим рядком, далі повний список слотів з "Командир відділення" як перший.
+    Формат виводу: Назва відділення (без "Командир ...") окремим рядком, далі повний список слотів з "Командир ..." як перший.
     """
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
@@ -470,21 +480,18 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
     # фільтрація по індексах (як окремий токен), якщо передані аргументи
     if filter_ids:
         patterns = [re.compile(rf'\b{re.escape(fid)}\b') for fid in filter_ids]
-        filtered = []
-        seen_titles = set()
+        filtered: List[Tuple[str, List[str]]] = []
         for title, slots in groups:
             if any(p.search(title or "") for p in patterns):
+                # об'єднання слотів для повторюваних заголовків
                 t_norm = re.sub(r'\s{2,}', ' ', title).strip()
-                if t_norm in seen_titles:
-                    # об'єднання слотів — на випадок повторних класів
-                    idx = next((i for i, (tt, _) in enumerate(filtered) if tt == t_norm), None)
-                    if idx is not None:
-                        prev_slots = filtered[idx][1]
-                        merged = prev_slots + [x for x in slots if x not in prev_slots]
-                        filtered[idx] = (t_norm, merged)
-                    continue
-                seen_titles.add(t_norm)
-                filtered.append((t_norm, slots))
+                merged_idx = next((i for i, (tt, _) in enumerate(filtered) if tt == t_norm), None)
+                if merged_idx is not None:
+                    prev_slots = filtered[merged_idx][1]
+                    merged = prev_slots + [x for x in slots if x not in prev_slots]
+                    filtered[merged_idx] = (t_norm, merged)
+                else:
+                    filtered.append((t_norm, slots))
         groups = filtered
 
     if not groups:
@@ -497,7 +504,7 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
         side = detect_side_from_title(title)
         by_side[side].append((title, slots))
 
-    # відправка з правильним форматом
+    # відправка з правильним форматом: Назва + слоти
     sent = 0
     for side in ("ЗСУ", "ЗС РФ/ПВК", "Союзники", "Невідомо"):
         blocks = by_side[side]
