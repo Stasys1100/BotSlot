@@ -192,88 +192,135 @@ def looks_like_tech_line(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return True
-    if re.search(r'\b(className|addons?|url|preview|version|randomSeed|ScenarioDatas|Datasource|author)\b', s, flags=re.IGNORECASE):
+    if re.search(r'\b(className|addons?|url|preview|version|randomSeed|ScenarioDatas|Datasource|author|classNamer)\b', s, flags=re.IGNORECASE):
         return True
     if re.search(r'https?://', s, flags=re.IGNORECASE):
         return True
-    if ('_' in s and len(s.split()) == 1) or (len(s.split()) == 1 and len(s) < 30 and re.search(r'[A-Za-z0-9_]', s)):
+    # рядки, що виглядають як модулі/клас-ідентифікатори (без пробілів або з підкресленнями)
+    if ('_' in s and len(s.split()) == 1) or (len(s.split()) == 1 and re.search(r'[A-Za-z0-9_]', s)):
         return True
-    if len(s) <= 3 and not re.search(r'[А-Яа-яA-Za-z]', s):
+    # дуже короткі або лише цифри
+    if re.fullmatch(r'[\d\W]{1,4}', s):
         return True
     return False
 
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
-    lines = [ln.strip() for ln in text.replace('\r\n', '\n').splitlines()]
-    filtered = []
-    for ln in lines:
-        if not ln:
+    """
+    Повертає список (title, [slot1, slot2, ...]) у форматі, готовому для виводу.
+    Агресивно фільтрує технічні рядки і addon-списки.
+    """
+    # розбити на рядки і попередньо очистити
+    raw_lines = [ln.strip() for ln in text.replace('\r\n', '\n').splitlines()]
+    # видалити явні control/порожні рядки
+    raw_lines = [ln for ln in raw_lines if ln and not re.fullmatch(r'[\x00-\x1f\x7f-\x9f]+', ln)]
+
+    # Якщо файл починається з великого списку addon/class (багато рядків без пробілів або з підкресленнями),
+    # пропустимо перший блок таких рядків — це джерело "мусору".
+    cleaned_lines: List[str] = []
+    i = 0
+    n = len(raw_lines)
+    # пропускаємо початковий блок технічних рядків довжиною >= 5
+    tech_block_len = 0
+    while i < n and looks_like_tech_line(raw_lines[i]):
+        tech_block_len += 1
+        i += 1
+    if tech_block_len >= 5:
+        # пропустили великий технічний блок
+        pass
+    else:
+        # якщо блок короткий — не пропускаємо
+        i = 0
+
+    # з i починаємо збирати релевантні рядки
+    while i < n:
+        ln = raw_lines[i]
+        # якщо рядок явно технічний — пропускаємо
+        if looks_like_tech_line(ln):
+            i += 1
             continue
-        if re.match(r'^\s*\d+\.\s+', ln):
-            filtered.append(ln)
-            continue
-        if '|' in ln:
-            filtered.append(ln)
-            continue
-        if re.search(r'[А-Яа-яЁёЇїІіЄєҐґA-Za-z]', ln) and len(ln.split()) >= 2 and not looks_like_tech_line(ln):
-            filtered.append(ln)
-            continue
+        cleaned_lines.append(ln)
+        i += 1
+
+    # Тепер з cleaned_lines шукаємо заголовки і їхні нумеровані слоти
     groups: List[Tuple[str, List[str]]] = []
     i = 0
-    while i < len(filtered):
-        ln = filtered[i]
-        if re.match(r'^\s*\d+\.\s+', ln):
+    m = len(cleaned_lines)
+    while i < m:
+        ln = cleaned_lines[i]
+        # Якщо рядок виглядає як заголовок (містить '|' або '@' або слово "відділення" або довгий опис) — беремо як title
+        if '|' in ln or '@' in ln or re.search(r'\b(відділен|відділ|бригада|екіпаж|crew|командир)\b', ln, flags=re.IGNORECASE):
+            title = ln
+            # збираємо наступні нумеровані слоти
+            slots: List[str] = []
+            j = i + 1
+            while j < m and re.match(r'^\s*\d+\.\s*', cleaned_lines[j]):
+                slot = re.sub(r'^\s*\d+\.\s*', '', cleaned_lines[j]).strip()
+                if slot and not looks_like_tech_line(slot):
+                    slots.append(slot)
+                j += 1
+            # якщо після заголовка немає нумерованих слотів, можливо слоти йдуть в одному рядку або через коми — спробуємо знайти наступні 10 рядків з нумерацією в середині
+            if not slots:
+                k = i + 1
+                while k < m and len(slots) < 25:
+                    if re.search(r'\d+\.', cleaned_lines[k]):
+                        found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', cleaned_lines[k])
+                        for f in found:
+                            f2 = f.strip()
+                            if f2 and not looks_like_tech_line(f2):
+                                slots.append(f2)
+                    k += 1
+            if slots:
+                groups.append((title.strip(), [normalize_slot_name(s) for s in slots]))
+                i = j
+                continue
+            else:
+                i += 1
+                continue
+
+        # Якщо рядок починається з нумерації — зібрати послідовність слотів і створити заголовок "Відділення"
+        if re.match(r'^\s*\d+\.\s*', ln):
             slots = []
-            while i < len(filtered) and re.match(r'^\s*\d+\.\s+', filtered[i]):
-                slot_text = re.sub(r'^\s*\d+\.\s*', '', filtered[i]).strip()
-                if slot_text:
-                    slots.append(slot_text)
+            while i < m and re.match(r'^\s*\d+\.\s*', cleaned_lines[i]):
+                slot = re.sub(r'^\s*\d+\.\s*', '', cleaned_lines[i]).strip()
+                if slot and not looks_like_tech_line(slot):
+                    slots.append(normalize_slot_name(slot))
                 i += 1
             if slots:
                 groups.append(("Відділення", slots))
             continue
-        title_candidate = ln
-        j = i + 1
-        slots = []
-        while j < len(filtered) and re.match(r'^\s*\d+\.\s+', filtered[j]):
-            slot_text = re.sub(r'^\s*\d+\.\s*', '', filtered[j]).strip()
-            if slot_text:
-                slots.append(slot_text)
-            j += 1
-        if slots:
-            title_clean = re.sub(r'\s{2,}', ' ', title_candidate).strip()
-            groups.append((title_clean, slots))
-            i = j
-            continue
-        i += 1
-    final_groups: List[Tuple[str, List[str]]] = []
-    for title, slots in groups:
-        cleaned = []
-        seen = set()
-        for s in slots:
-            s2 = re.sub(r'\s{2,}', ' ', s).strip()
-            if not s2:
+
+        # Інакше — можливо це одиночний рядок, який містить заголовок і слоти в одному рядку (через крапки або коми)
+        if '|' in ln and re.search(r'\d+\.', ln):
+            parts = ln.split('|', 1)
+            title = parts[0].strip()
+            rest = parts[1]
+            found = re.findall(r'\d+\.\s*([^0-9]+?)(?=(?:\d+\.|$))', rest)
+            slots = [normalize_slot_name(f.strip()) for f in found if f.strip() and not looks_like_tech_line(f.strip())]
+            if slots:
+                groups.append((title, slots))
+                i += 1
                 continue
-            key = s2.lower()
-            if key in seen:
+
+        i += 1
+
+    # фінальна очистка: видалити дублікати та порожні
+    final: List[Tuple[str, List[str]]] = []
+    for title, slots in groups:
+        seen = set()
+        cleaned_slots = []
+        for s in slots:
+            key = s.lower().strip()
+            if not key or key in seen:
                 continue
             seen.add(key)
-            cleaned.append(s2)
-        if cleaned:
-            final_groups.append((title, cleaned))
-    return final_groups
+            cleaned_slots.append(s)
+        if cleaned_slots:
+            final.append((re.sub(r'\s{2,}', ' ', title).strip(), cleaned_slots))
+    return final
 
-# ─── Command: import decoded SQM ──────────────────────────────────────────────
+# ─── Оновлена команда: імпорт_sqm_decoded (без попереднього "не знайдено") ─────
 @bot.command(name="імпорт_sqm_decoded", aliases=["import_sqm", "import_sqm_decoded", "імпорт_sqm"])
 async def імпорт_sqm_decoded(ctx: commands.Context):
-    """
-    Приймає прикріплений вже дебінаризований mission.sqm (plain text)
-    і повертає тільки відділення та слоти у форматі:
-    Title
-    Slot1
-    Slot2
-    ...
-    """
-    # optional: restrict to admin channel
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
     if not ctx.message.attachments:
@@ -292,26 +339,28 @@ async def імпорт_sqm_decoded(ctx: commands.Context):
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # extract units and slots using heuristics
     groups = extract_units_and_slots(sqm_text)
+
+    if not groups:
+        # Якщо нічого не знайшлося — спробуємо ще агресивно витягнути всі рядки з нумерацією і повернути їх як одне відділення
+        all_numbered = re.findall(r'^\s*\d+\.\s*(.+)$', sqm_text, flags=re.MULTILINE)
+        cleaned = [normalize_slot_name(clean_slot_value(s)) for s in all_numbered if s and not looks_like_tech_line(s)]
+        cleaned = [s for s in cleaned if s]
+        cleaned = dedupe_preserve_order(cleaned)
+        if cleaned:
+            groups = [("Відділення", cleaned)]
 
     if not groups:
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
-    # format output exactly as requested: title line, then each slot on its own line (no numbering)
+    # Формат виводу: заголовок у першому рядку, потім слоти (без нумерації), як просив
     for title, slots in groups:
-        # normalize title
         title_line = re.sub(r'\s{2,}', ' ', title).strip()
-        # build block: title + each slot on new line
-        lines = [title_line]
-        for s in slots:
-            lines.append(s)
+        lines = [title_line] + slots
         out_text = "\n".join(lines)
-        # send as code block to preserve formatting
         try:
             await ctx.send(f"```{out_text}```")
         except Exception:
-            # fallback: split into smaller messages if too long
             parts = out_text.splitlines()
             chunk = []
             for i, line in enumerate(parts):
