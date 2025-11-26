@@ -85,22 +85,20 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
 def rap_to_text(data: bytes) -> str:
     """
     Heuristic RAP decoder:
-    - Перевіряє заголовок 'raP' і витягує читабельні ASCII/UTF-8 фрагменти.
-    - Розбиває на "рядки" за ; та дужками, нормалізує пропуски.
-    - Збирає фрагменти з ключовими словами (class, name=, description=, unitName, groupName).
-    Повертає псевдо-текст mission.sqm, достатній для парсингу регулярками.
+    - Перевіряє вміст байтів і витягує читабельні фрагменти.
+    - Склеює блоки навколо ключових слів і нормалізує формат для парсингу.
     """
-    # 1) Базове латин-1 декодування, щоб зберегти байти як символи
+    # 1) Декодуємо як latin-1, щоб зберегти байти як символи
     text = data.decode("latin-1", errors="ignore")
 
-    # 2) Витягнути всі читабельні символи (ASCII + базова латиниця + кирилиця)
+    # 2) Фільтруємо символи, залишаємо читабельні
     def is_readable(ch: str) -> bool:
         o = ord(ch)
-        return (32 <= o <= 126) or (0x00A0 <= o <= 0x04FF)  # латиниця/кирилиця
+        return (32 <= o <= 126) or (0x00A0 <= o <= 0x04FF)
 
     filtered = "".join(ch if is_readable(ch) else " " for ch in text)
 
-    # 3) Залишити лише блоки навколо ключових слів
+    # 3) Збираємо фрагменти навколо ключових слів
     keywords = ["class Group", "class Unit", "name", "groupName", "description", "unitName", "text", "title", "{", "}", ";"]
     indices = []
     for kw in keywords:
@@ -113,10 +111,8 @@ def rap_to_text(data: bytes) -> str:
             start = idx + len(kw)
 
     if not indices:
-        # Якщо ключів немає — повертаємо фільтрований текст як є
         candidate = filtered
     else:
-        # Збираємо великі вікна навколо знайдених ключів
         window = 3000
         frags = []
         for idx in sorted(set(indices)):
@@ -125,10 +121,9 @@ def rap_to_text(data: bytes) -> str:
             frags.append(filtered[s:e])
         candidate = "\n".join(frags)
 
-    # 4) Нормалізуємо пробіли, вставляємо переноси рядків після '};' та ';'
+    # 4) Нормалізація форматування
     candidate = re.sub(r'[ \t]+', ' ', candidate)
     candidate = candidate.replace("};", "};\n").replace(" {", " {\n").replace("; ", ";\n")
-    # 5) Спрощення: розбити блоки 'class X' у нові рядки
     candidate = re.sub(r'\bclass\s+Group\b', '\nclass Group', candidate, flags=re.IGNORECASE)
     candidate = re.sub(r'\bclass\s+Unit\b', '\nclass Unit', candidate, flags=re.IGNORECASE)
 
@@ -138,8 +133,7 @@ def rap_to_text(data: bytes) -> str:
 def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     """
     Повертає [(group_name, [slot1, slot2, ...]), ...]
-    Підтримує: name, groupName, description, title для груп; description, unitName, text для юнітів.
-    Працює як з нормальним текстом, так і з RAP-декодованими фрагментами.
+    Працює з нормальним текстом або з RAP-декодованими фрагментами.
     """
     groups: List[Tuple[str, List[str]]] = []
     current_group_name: Optional[str] = None
@@ -212,7 +206,7 @@ def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
 def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
     """
     Повертає raw bytes mission.sqm з PBO або None.
-    Якщо є пакет pbo — використовуємо його; інакше пробуємо zip-фолбек.
+    Використовує пакет pbo якщо встановлено, інакше zip-фолбек.
     """
     if pbo:
         try:
@@ -236,8 +230,8 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
 async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
     Повертає (text, method):
-    - Якщо .pbo → бере mission.sqm, якщо знайдено. Якщо не знайдено — помилка.
-    - Якщо .sqm → визначає, чи це RAP (бінарний), тоді декодує через rap_to_text; інакше пробує стандартні кодування.
+    - Якщо .pbo → бере mission.sqm (raw bytes) і декодує;
+    - Якщо .sqm → визначає RAP або текст і повертає текст для парсингу.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
@@ -246,14 +240,14 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
     if filename.endswith(".pbo"):
         sqm_raw = extract_mission_from_pbo_bytes(data)
         if not sqm_raw:
-            # Якщо не знайшли явно — пробуємо як RAP напряму
+            # Якщо не знайшли явно — пробуємо декодувати як RAP фрагменти з самого PBO
             text = rap_to_text(data)
             return text, "pbo-rap-fragments"
-        # Визначити, чи RAP (початок 'raP')
+        # Якщо знайдено raw mission.sqm — визначаємо формат
         if sqm_raw[:3] == b'raP':
             text = rap_to_text(sqm_raw)
             return text, "pbo-rap"
-        # Інакше — спроба декодування як текстовий SQM
+        # Інакше — пробуємо стандартні кодування
         for enc in ("utf-8", "cp1251", "latin-1"):
             try:
                 return sqm_raw.decode(enc), f"pbo-{enc}"
@@ -266,7 +260,6 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
         if data[:3] == b'raP':
             text = rap_to_text(data)
             return text, "rap"
-        # текстовий SQM
         for enc in ("utf-8", "cp1251", "latin-1"):
             try:
                 return data.decode(enc), enc
@@ -274,7 +267,7 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
                 continue
         return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
-    # інше розширення: спроба RAP-фолбек + текстові кодування
+    # інші файли: фолбек
     if data[:3] == b'raP':
         return rap_to_text(data), "rap-raw"
     for enc in ("utf-8", "cp1251", "latin-1"):
@@ -750,7 +743,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
+        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
