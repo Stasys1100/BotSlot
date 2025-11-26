@@ -1,5 +1,8 @@
 # bot.py
-# Повний робочий код бота з додатковим фіксом mojibake та покращеною обробкою .pbo/.sqm
+# Повний робочий код бота з надійним імпортом mission.sqm/.pbo,
+# фіксами mojibake, витягом innerText з <t ...> тегів, діагностикою та інтегрованим парсером відділень.
+# Збережи цей файл як bot.py і перезапусти бота.
+
 import os
 import re
 import io
@@ -17,7 +20,7 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# Якщо є keep_alive.py — викликаємо, інакше ігноруємо
+# Якщо у тебе є keep_alive.py — залишаємо виклик, інакше ігноруємо
 try:
     from keep_alive import keep_alive
     keep_alive()
@@ -177,14 +180,12 @@ def fix_mojibake_text(text: str) -> str:
     except Exception:
         pass
 
-    # also try re-encoding via bytes from original utf-8 interpretation
     try:
         b = text.encode("utf-8", errors="replace")
         candidates.append((b.decode("cp1251", errors="replace"), "utf8bytes->cp1251"))
     except Exception:
         pass
 
-    # score by cyrillic count and printability
     def score_item(it: Tuple[str, str]) -> Tuple[int, float]:
         t = it[0]
         return (_cyrillic_score(t), sum(1 for ch in t if ch.isprintable()) / max(1, len(t)))
@@ -334,12 +335,8 @@ def is_likely_rap_or_binary(b: bytes) -> bool:
     ratio = printable / max(1, len(b))
     return ratio < 0.6
 
-# ─── PBO extraction та читання вкладення ─────────────────────────────────────
+# ─── PBO extraction & attachment reading with robust encoding heuristics ─────
 def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
-    """
-    Спроба витягти mission.sqm з .pbo (через pbo lib або як zip).
-    Якщо не знайдено — повертає None.
-    """
     try:
         import pbo as pbo_lib
     except Exception:
@@ -363,14 +360,14 @@ def extract_mission_from_pbo_bytes(pbo_bytes: bytes) -> Optional[bytes]:
 
 async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str, str]:
     """
-    Прочитати вкладення (.pbo або .sqm) і повернути (text, method).
-    Пріоритет: якщо виглядає як RAP/binary — застосувати rap_to_text_aggressive.
-    Інакше — спробувати декодування різними кодуваннями та вибрати найкраще.
+    Read attachment (.pbo or .sqm) and return (text, method).
+    Uses detector and multiple decode strategies, picks best candidate by Cyrillic score.
+    Prioritizes RAP decoding when file looks binary or starts with 'raP'.
     """
     data = await attachment.read()
     filename = attachment.filename.lower()
 
-    # Якщо виглядає як RAP/binary — застосувати агресивний декодер
+    # If the bytes look like RAP/binary, decode aggressively with rap_to_text_aggressive
     if is_likely_rap_or_binary(data):
         try:
             text = rap_to_text_aggressive(data)
@@ -410,17 +407,14 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
                 candidates.append((t, "cp1251->utf8"))
             except Exception:
                 pass
-        # вибрати найкращий кандидат
         best = max(candidates, key=lambda it: (_cyrillic_score(it[0]), sum(1 for ch in it[0] if ch.isprintable())/max(1,len(it[0]))))
         return best
 
     if filename.endswith(".pbo"):
         sqm_raw = extract_mission_from_pbo_bytes(data)
         if not sqm_raw:
-            # якщо з pbo не витягло mission.sqm — спробувати rap-декодер на всьому pbo
             text = rap_to_text_aggressive(data)
             return text, "pbo-rap-fragments"
-        # якщо витягнутий sqm виглядає як RAP/binary — rap-декодуємо
         if is_likely_rap_or_binary(sqm_raw) or sqm_raw[:3] == b'raP':
             text = rap_to_text_aggressive(sqm_raw)
             return text, "pbo-rap"
@@ -436,7 +430,6 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
         text = fix_mojibake_text(text)
         return text, enc
 
-    # generic fallback
     if is_likely_rap_or_binary(data):
         return rap_to_text_aggressive(data), "rap-raw"
     text, enc = try_decode_bytes(data)
@@ -514,6 +507,10 @@ def extract_departments(text: str) -> List[Dict[str, Any]]:
         if parsed:
             res.append(parsed)
     return res
+
+def process_input_text(input_text: str) -> str:
+    decomp = extract_departments(input_text)
+    return json.dumps(decomp, ensure_ascii=False, indent=2)
 
 # ─── Гнучкий парсер mission.sqm для ембедів ──────────────────────────────────
 def parse_mission_sqm_flexible(text: str) -> List[Tuple[str, List[str]]]:
@@ -609,7 +606,7 @@ async def імпорт_sqm(ctx: commands.Context):
     except Exception as e:
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # Діагностика: приклади raw-захоплень
+    # --- ДІАГНОСТИКА: перші raw-захоплення різними regex-ами ---
     raw_double = re.findall(r'(?:description|unitName|text)\s*=\s*"(.*?)"\s*;', text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_single = re.findall(r"(?:description|unitName|text)\s*=\s*'(.*?)'\s*;", text, flags=re.IGNORECASE | re.DOTALL)[:20]
     raw_arrays = re.findall(r'(?:description|unitName|text)\s*\[\s*\]\s*=\s*\{(.*?)\}', text, flags=re.IGNORECASE | re.DOTALL)[:10]
@@ -655,21 +652,23 @@ async def імпорт_sqm(ctx: commands.Context):
     except:
         pass
 
-    # JSON-експорт розпарсованих відділень (для діагностики)
+    # --- Use user's department parser to produce JSON output ---
     try:
         departments = extract_departments(text)
         json_text = json.dumps(departments, ensure_ascii=False, indent=2)
+        # attach JSON as a file for convenience
         buf = io.BytesIO(json_text.encode('utf-8'))
         buf.seek(0)
         file = discord.File(fp=buf, filename="departments.json")
         await ctx.send("📁 Ось розпарсовані відділення (JSON):", file=file)
     except Exception:
+        # ignore if fails
         pass
 
-    # Основний парсинг для ембедів
+    # --- основний парсинг для ембедів (збережено сумісність) ---
     groups = parse_mission_sqm_flexible(text)
 
-    # Фолбек: зібрати всі unit-токени
+    # фолбек: зібрати всі unit-токени
     if not groups:
         units = re.findall(r'(?:unitName|description|text)\s*=\s*"(.*?)"', text, flags=re.IGNORECASE | re.DOTALL)
         if not units:
@@ -722,7 +721,7 @@ async def імпорт_sqm(ctx: commands.Context):
 
     await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. Метод: `{method}`. Знайдено слотів: {total_slots}.")
 
-# ─── Збережені UI/логіка слотів (залишено без змін) ──────────────────────────
+# ─── Slot UI and management (existing logic preserved) ───────────────────────
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
