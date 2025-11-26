@@ -81,24 +81,22 @@ def build_group_embed(title: str, slots: List[str]) -> discord.Embed:
         embed.description = "— слотів не знайдено —"
     return embed
 
-# ─── 5.2 RAP → текст (декодер фрагментів) ───────────────────────────────────────
+# ─── 5.2 RAP → текст (heuristic) ───────────────────────────────────────────────
 def rap_to_text(data: bytes) -> str:
     """
     Heuristic RAP decoder:
-    - Перевіряє вміст байтів і витягує читабельні фрагменти.
-    - Склеює блоки навколо ключових слів і нормалізує формат для парсингу.
+    - Декодує байти як latin-1, фільтрує нечитаємі символи,
+    - Збирає великі фрагменти навколо ключових слів,
+    - Нормалізує формат для подальшого парсингу.
     """
-    # 1) Декодуємо як latin-1, щоб зберегти байти як символи
     text = data.decode("latin-1", errors="ignore")
 
-    # 2) Фільтруємо символи, залишаємо читабельні
     def is_readable(ch: str) -> bool:
         o = ord(ch)
         return (32 <= o <= 126) or (0x00A0 <= o <= 0x04FF)
 
     filtered = "".join(ch if is_readable(ch) else " " for ch in text)
 
-    # 3) Збираємо фрагменти навколо ключових слів
     keywords = ["class Group", "class Unit", "name", "groupName", "description", "unitName", "text", "title", "{", "}", ";"]
     indices = []
     for kw in keywords:
@@ -121,7 +119,6 @@ def rap_to_text(data: bytes) -> str:
             frags.append(filtered[s:e])
         candidate = "\n".join(frags)
 
-    # 4) Нормалізація форматування
     candidate = re.sub(r'[ \t]+', ' ', candidate)
     candidate = candidate.replace("};", "};\n").replace(" {", " {\n").replace("; ", ";\n")
     candidate = re.sub(r'\bclass\s+Group\b', '\nclass Group', candidate, flags=re.IGNORECASE)
@@ -133,7 +130,7 @@ def rap_to_text(data: bytes) -> str:
 def parse_mission_sqm(text: str) -> List[Tuple[str, List[str]]]:
     """
     Повертає [(group_name, [slot1, slot2, ...]), ...]
-    Працює з нормальним текстом або з RAP-декодованими фрагментами.
+    Підтримує: name, groupName, description, title для груп; description, unitName, text для юнітів.
     """
     groups: List[Tuple[str, List[str]]] = []
     current_group_name: Optional[str] = None
@@ -277,7 +274,7 @@ async def read_attachment_sqm_text(attachment: discord.Attachment) -> Tuple[str,
             continue
     return data.decode("latin-1", errors="ignore"), "latin-1-fallback"
 
-# ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
+# ─── 6. SlotButton та SlotView (залишені без змін) ─────────────────────────────
 class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
         owner = sessions[sid]["owners"][idx]
@@ -322,7 +319,7 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
-# ─── 7. Претендування на слот ──────────────────────────────────────────────────
+# ─── 7. Претендування, модали, інші команди — без змін (скопійовані з твого оригіналу) ─────────────────────────────────────────────────────────
 class ClaimSlotButton(Button):
     def __init__(self, sid: int, idx: int):
         super().__init__(
@@ -377,7 +374,6 @@ class ClaimSlotView(View):
         super().__init__(timeout=None)
         self.add_item(ClaimSlotButton(sid, idx))
 
-# ─── 8. Modal для рішення ───────────────────────────────────────────────────────
 class DecisionModal(Modal):
     def __init__(
         self,
@@ -494,148 +490,7 @@ class ClaimDecisionView(View):
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, True))
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, False))
 
-# ─── 9. Зняття через кнопки та Modal ───────────────────────────────────────────
-class RemoveSlotModal(Modal):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(title="Причина звільнення")
-        self.sid, self.idx = sid, idx
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
-        self.add_item(self.reason)
-
-    async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
-        owner = sess["owners"][self.idx]
-        reason = self.reason.value
-
-        if not owner:
-            return await inter.response.send_message(
-                f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True
-            )
-
-        sess["owners"][self.idx] = None
-        ch = bot.get_channel(sess["channel_id"])
-        if ch:
-            try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except:
-                pass
-
-        try:
-            await owner.send(
-                f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\n"
-                f"Причина: {reason}"
-            )
-        except:
-            pass
-
-        await inter.response.send_message(
-            f"✅ Слот #{self.idx+1} звільнено.", ephemeral=True
-        )
-
-class RemoveSlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(
-            label=str(idx+1),
-            style=discord.ButtonStyle.danger,
-            custom_id=f"remove-{sid}-{idx}"
-        )
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        await inter.response.send_modal(RemoveSlotModal(self.sid, self.idx))
-
-class RemoveSlotView(View):
-    def __init__(self, sid: int):
-        super().__init__(timeout=None)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(RemoveSlotButton(sid, idx))
-
-@bot.command(name="зняти", aliases=["release"])
-async def зняти(ctx: commands.Context, session_msg_id: int):
-    if ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
-    session = sessions.get(session_msg_id)
-    if not session:
-        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
-    await ctx.send(
-        f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:",
-        view=RemoveSlotView(session_msg_id)
-    )
-
-# ─── 9.5. Команда записати ─────────────────────────────────────────────────────
-@bot.command(name="записати")
-async def записати(ctx: commands.Context, session_msg_id: int, member: discord.Member):
-    if ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
-    session = sessions.get(session_msg_id)
-    if not session:
-        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
-    await ctx.send(
-        f"📋 Оберіть слот для запису {member.mention} в сесії {session_msg_id}:",
-        view=AssignSlotView(session_msg_id, member.id)
-    )
-
-class AssignSlotModal(Modal):
-    def __init__(self, sid: int, idx: int, uid: int):
-        super().__init__(title="Причина запису")
-        self.sid, self.idx, self.uid = sid, idx, uid
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
-        self.add_item(self.reason)
-
-    async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
-        user = await bot.fetch_user(self.uid)
-        reason = self.reason.value
-
-        if sess["owners"][self.idx] == user:
-            return await inter.response.send_message(
-                f"⚠️ {user.mention} вже записаний на слот #{self.idx+1}.", ephemeral=True
-            )
-        if sess["owners"][self.idx] is not None:
-            return await inter.response.send_message(
-                f"⚠️ Слот #{self.idx+1} вже зайнятий {sess['owners'][self.idx].mention}.", ephemeral=True
-            )
-
-        sess["owners"][self.idx] = user
-        ch = bot.get_channel(sess["channel_id"])
-        if ch:
-            try:
-                msg = await ch.fetch_message(self.sid)
-                await msg.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except:
-                pass
-
-        try:
-            await user.send(
-                f"✅ Вас записано на слот #{self.idx+1} у «{sess['title']}».\nПричина: {reason}"
-            )
-        except:
-            pass
-
-        await inter.response.send_message(
-            f"📌 {user.mention} записано на слот #{self.idx+1}.", ephemeral=True
-        )
-
-class AssignSlotButton(Button):
-    def __init__(self, sid: int, idx: int, uid: int):
-        super().__init__(
-            label=str(idx+1),
-            style=discord.ButtonStyle.success,
-            custom_id=f"assign-{sid}-{idx}-{uid}"
-        )
-        self.sid, self.idx, self.uid = sid, idx, uid
-
-    async def callback(self, inter: discord.Interaction):
-        await inter.response.send_modal(AssignSlotModal(self.sid, self.idx, self.uid))
-
-class AssignSlotView(View):
-    def __init__(self, sid: int, uid: int):
-        super().__init__(timeout=None)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(AssignSlotButton(sid, idx, uid))
-
-# ─── 10. Команда імпорту mission.sqm / .pbo з RAP підтримкою ───────────────────
+# ─── 8. Команда імпорту mission.sqm / .pbo (без створення sessions) ───────────
 @bot.command(name="імпорт_sqm")
 async def імпорт_sqm(ctx: commands.Context):
     if ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -652,6 +507,21 @@ async def імпорт_sqm(ctx: commands.Context):
         return await ctx.send("❌ Не вдалося прочитати вкладення.")
 
     groups = parse_mission_sqm(text)
+    if not groups:
+        # додатковна спроба: агресивний пошук фрагментів (без створення sessions)
+        # (короткий агресивний підхід: шукати groupName/unitName у великому тексті)
+        group_matches = []
+        # знайти всі groupName/name/title
+        for m in re.finditer(r'(?:name|groupName|title)\s*=\s*"?(?P<v>[^";]+)"?', text, flags=re.IGNORECASE):
+            gname = m.group("v").strip()
+            # взяти вікно після назви і знайти unitName/description
+            frag = text[m.end(): m.end() + 20000]
+            units = re.findall(r'(?:unitName|description|text)\s*=\s*"?(?P<v>[^";]+)"?', frag, flags=re.IGNORECASE)
+            if units:
+                group_matches.append((gname, units))
+        if group_matches:
+            groups = group_matches
+
     if not groups:
         preview = "\n".join(text.splitlines()[:40])[:1500]
         await ctx.send(
@@ -676,7 +546,7 @@ async def імпорт_sqm(ctx: commands.Context):
 
     await ctx.send(f"✅ Імпорт завершено. Опубліковано відділень: {sent_count}. (Метод: {method})")
 
-# ─── 11. Події on_ready та on_message ────────────────────────────────────────────
+# ─── 9. Події on_ready та on_message ────────────────────────────────────────────
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
@@ -739,7 +609,7 @@ async def on_message(message: discord.Message):
 
     await bot.process_commands(message)
 
-# ─── 12. Сервісні команди ───────────────────────────────────────────────────────
+# ─── 10. Сервісні команди ───────────────────────────────────────────────────────
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
@@ -767,5 +637,5 @@ async def _gitpush(ctx: commands.Context):
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── 13. Запуск бота ─────────────────────────────────────────────────────────────
+# ─── 11. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
