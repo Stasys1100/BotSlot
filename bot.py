@@ -1,13 +1,7 @@
-# bot.py — ОСТАННЯ ФІНАЛЬНА ВЕРСІЯ
+# bot.py — ОСТАННЯ ВЕРСІЯ (виправлення нумерації першого слота та додавання зброї командиру)
 # Discord бот: імпорт mission.sqm, фільтрація шуму, збір слотів, нумерація (тільки якщо потрібно),
 # уникнення дублювання, нормалізація заголовків, перенесення назви зброї у перший слот,
 # UI для слотів, статус/деплой/нагадування, звільнення слотів.
-#
-# Зміни в цій версії:
-# - виправлена логіка додавання назви зброї у перший слот;
-# - жорстка канонічна дедуплікація блоків;
-# - нормалізація пайпів і MED;
-# - оновлений формат повідомлення при старті: короткий заголовок і тільки Commit.
 
 import os
 import re
@@ -391,18 +385,63 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 
 # ─────── Slot formatting ─────────────────────────────────────────────────────
 def format_slots_with_numbers(slots: List[str]) -> List[str]:
+    """
+    Покращена логіка нумерації:
+    - Якщо хоча б один слот має явну нумерацію (N. або N: або N) ), використовуємо ці числа як основу.
+    - Якщо перший слот не має номера, але інші мають (наприклад починаються з 2.), додаємо номер першому як (min_number - 1) або 1.
+    - Нумерація виводиться у форматі 'N. Текст'.
+    - Якщо жоден слот не має номера — додаємо 1., 2., ...
+    """
     if not slots:
         return []
+
+    # Знайти всі явні номери у слотах
+    numbers = []
+    parsed = []
     for s in slots:
-        if s and re.match(r'^\s*\d+[\.:]\s*', s):
-            cleaned = []
-            for x in slots:
-                m = re.match(r'^\s*(\d+)\s*[\.\:\)]\s*(.+)$', x)
-                if m:
-                    cleaned.append(f"{m.group(1)}. {m.group(2).strip()}")
-                else:
-                    cleaned.append(x.strip())
-            return cleaned
+        m = re.match(r'^\s*(\d+)\s*[\.\:\)]\s*(.+)$', s)
+        if m:
+            num = int(m.group(1))
+            numbers.append(num)
+            parsed.append((num, m.group(2).strip()))
+        else:
+            parsed.append((None, s.strip()))
+
+    if numbers:
+        min_num = min(numbers)
+        # Якщо перший слот не має номера — призначити йому min_num-1 (але не менше 1)
+        if parsed[0][0] is None:
+            assign = max(1, min_num - 1)
+            # якщо assign вже використовується, знайдемо найменше вільне число <-> після min_num
+            used = set(numbers)
+            if assign in used:
+                # знайдемо найменше число, яке не використовується, починаючи з 1
+                i = 1
+                while i in used:
+                    i += 1
+                assign = i
+            parsed[0] = (assign, parsed[0][1])
+            numbers.append(assign)
+            numbers.sort()
+        # Тепер пронумеруємо всі слоти: якщо слот мав номер — використаємо його; якщо ні — дамо наступний в порядку
+        result = []
+        # Створимо карту для вже пронумерованих позицій
+        used_nums = set(n for n in numbers)
+        # Для відсутніх номерів пройдемо по порядку і призначимо числа, починаючи з min_num і далі, уникаючи колізій
+        next_num = min_num
+        for num, text in parsed:
+            if num is not None:
+                result.append(f"{num}. {text}")
+            else:
+                # знайти наступний вільний номер
+                while next_num in used_nums:
+                    next_num += 1
+                result.append(f"{next_num}. {text}")
+                used_nums.add(next_num)
+                next_num += 1
+        return result
+
+    # Якщо жодного номера немає — просто додати 1.,2.,...
     return [f"{i+1}. {slot.strip()}" for i, slot in enumerate(slots, 1)]
 
 # ─────── UI helpers ─────────────────────────────────────────────────────
@@ -662,7 +701,6 @@ async def on_ready():
         commit = subprocess.getoutput("git rev-parse --short=7 HEAD")
     except Exception:
         commit = "unknown"
-    # Короткий формат повідомлення при старті (згідно запиту)
     embed = discord.Embed(
         title="🔄 Бот перезапущено",
         description=f"📦\nCommit: `{commit}`",
