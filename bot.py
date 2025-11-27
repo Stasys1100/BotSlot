@@ -1,11 +1,4 @@
-# bot.py — Стабільна фінальна версія
-# - Надійний парсер mission.sqm
-# - Видалення @-маркерів
-# - Перенесення назви зброї у перший слот (командир)
-# - Коректна нумерація слотів
-# - Жорстка дедуплікація (канонічні ключі)
-# - Підтримка фільтрації індексів (1-1, 1–1, 1—1, підрядки)
-
+# bot.py — ОНОВЛЕНИЙ (фінальний патч: жорстка дедуплікація + покращений фільтр)
 import os
 import re
 import html
@@ -44,7 +37,7 @@ _RECENT_IMPORTS_TTL = 60.0
 sessions: Dict[int, dict] = {}
 processed_messages: set[int] = set()
 
-# Keywords for slot detection (multilingual)
+# Slot keywords (multilingual)
 SLOT_KEYWORDS = [
     r'командир відділен', r'командир розрахун', r'командир екіпаж', r'командир сторони',
     r'старший стрілець', r'стрілець', r'гренадер', r'гранатометник', r'кулеметник',
@@ -59,7 +52,7 @@ SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', fl
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 
-# ---------------- Helpers ----------------
+# ---------- Helpers ----------
 def decode_bytes(raw: bytes) -> str:
     try:
         return raw.decode("utf-8")
@@ -133,11 +126,10 @@ def is_valid_slot(s: str) -> bool:
         return False
     return True
 
-# ---------------- Title / weapon extraction ----------------
+# ---------- Title / weapon extraction ----------
 def strip_title_prefixes(title: str) -> str:
     t = (title or "").strip()
-    # remove @... tokens and trailing side markers
-    t = re.sub(r'@[^|\n]+', '', t)
+    t = re.sub(r'@[^|\n]+', '', t)  # remove @... tokens
     t = re.sub(r'^\s*\d+\s*[\.\:]\s*', '', t)
     t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^\s*\|\s*[A-Z]{2,}\s*', '', t)
@@ -147,7 +139,6 @@ def strip_title_prefixes(title: str) -> str:
 
 def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
     t = (title or "").strip()
-    # try parenthetical before @ or |
     m_sep = re.search(r'(@|\|)', t)
     if m_sep:
         left = t[:m_sep.start()]
@@ -157,14 +148,12 @@ def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
             rest = (t[:m_par.start()] + t[m_sep.start():]).strip()
             rest = re.sub(r'^[\s@|:,-]+', '', rest).strip()
             return rest, weapon
-    # leading parenthetical
     m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)?', t)
     if m and m.group(1):
         weapon = m.group(1).strip()
         rest = t.replace(m.group(1), '').strip()
         rest = re.sub(r'^\s*@\S+', '', rest).strip()
         return rest, weapon
-    # leading token before @ or |
     m2 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
     if m2:
         weapon = m2.group(1).strip()
@@ -197,7 +186,7 @@ def process_title_final(title: str) -> Tuple[str, List[str], Optional[str]]:
     clean = re.sub(r'\s{2,}', ' ', clean).strip(' |')
     return clean or DEFAULT_TITLE, slots_from_title, weapon
 
-# ---------------- Canonicalization ----------------
+# ---------- Canonicalization ----------
 def canonical_slot_for_compare(s: str) -> str:
     if not s:
         return ""
@@ -218,13 +207,12 @@ def canonical_title_for_compare(t: str) -> str:
     x = re.sub(r'\s{2,}', ' ', x).strip().lower()
     return x
 
-# ---------------- Parser ----------------
+# ---------- Parser ----------
 def clean_line_for_slot(s: str) -> str:
     s = strip_quotes_semicolons(s)
     s = extract_structured_text(s)
     s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
-    # remove inline @ markers
-    s = re.sub(r'@[\w\-\u0400-\u04FF]+(?:\s*\d+[-–—]?\d*)?', '', s)
+    s = re.sub(r'@[\w\-\u0400-\u04FF]+(?:\s*\d+[-–—]?\d*)?', '', s)  # remove inline @ markers
     s = re.sub(r'(\|\s*){2,}', '|', s)
     s = re.sub(r'\s+\|\s*$', '', s)
     s = re.sub(r'\s+\|\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
@@ -266,7 +254,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             slots: List[str] = []
             for s in all_slots:
                 if is_valid_slot(s) and not looks_like_code_block(s):
-                    clean_s = normalize_slot_name(clean_line_for_slot(s))
+                    clean_s = normalize_pipes(clean_line_for_slot(s))
                     if clean_s:
                         slots.append(clean_s)
 
@@ -281,10 +269,10 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 
             if slots:
                 t_norm = strip_title_prefixes(title_line) or DEFAULT_TITLE
+                # dedupe by canonical key at insertion
                 key_title = canonical_title_for_compare(t_norm)
                 key_slots = tuple(canonical_slot_for_compare(x) for x in slots)
 
-                # dedupe by canonical key
                 exists = False
                 for existing_title, existing_slots in list(groups.items()):
                     if canonical_title_for_compare(existing_title) == key_title:
@@ -337,7 +325,24 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     flush()
     return [(title, slots) for title, slots in groups.items()]
 
-# ---------------- Numbering and output ----------------
+# ---------- Unique canonical map builder (fixes duplicate outputs) ----------
+def build_canonical_map(parsed: List[Tuple[str, List[str]]]) -> Dict[Tuple[str, Tuple[str, ...]], Tuple[str, List[str]]]:
+    """
+    Returns mapping canonical_key -> (display_title, slots)
+    canonical_key = (canonical_title, tuple(canonical_slot_for_compare(slot) ...))
+    Ensures unique canonical entries only.
+    """
+    cmap: Dict[Tuple[str, Tuple[str, ...]], Tuple[str, List[str]]] = {}
+    for title, slots in parsed:
+        display_title = strip_title_prefixes(title) or DEFAULT_TITLE
+        canonical_title = canonical_title_for_compare(display_title)
+        canonical_slots = tuple(canonical_slot_for_compare(s) for s in slots)
+        key = (canonical_title, canonical_slots)
+        if key not in cmap:
+            cmap[key] = (display_title, slots)
+    return cmap
+
+# ---------- Numbering and output ----------
 def format_slots_with_numbers(slots: List[str]) -> List[str]:
     if not slots:
         return []
@@ -393,20 +398,11 @@ def matches_filter(title: str, fid: str) -> bool:
         return True
     return False
 
-async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, List[str]]]]):
-    sent_keys = set()
-    sent_blocks = 0
-    all_blocks: List[Tuple[str, List[str]]] = []
-    for blocks in grouped.values():
-        all_blocks.extend(blocks)
-    for title, slots in all_blocks:
-        key = (canonical_title_for_compare(title), tuple(canonical_slot_for_compare(x) for x in slots))
-        if key in sent_keys:
-            continue
-        sent_keys.add(key)
+async def send_groups(ctx: commands.Context, canonical_map: Dict[Tuple[str, Tuple[str, ...]], Tuple[str, List[str]]]):
+    sent = 0
+    for (canon_title, canon_slots), (display_title, slots) in canonical_map.items():
         numbered = format_slots_with_numbers(slots)
-        out = "\n".join([title] + numbered)
-        # send in one code block (split if very long)
+        out = "\n".join([display_title] + numbered)
         lines = out.splitlines()
         chunk = []
         for i, line in enumerate(lines, 1):
@@ -417,11 +413,11 @@ async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, 
                 await asyncio.sleep(0)
         if chunk:
             await ctx.send(f"```{chr(10).join(chunk)}```")
-        sent_blocks += 1
+        sent += 1
         await asyncio.sleep(0.05)
-    return sent_blocks
+    return sent
 
-# ---------------- Discord UI / Commands ----------------
+# ---------- Discord UI / Commands ----------
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
@@ -506,7 +502,7 @@ class RemoveSlotView(View):
 @bot.command(name="звільнити")
 async def звільнити(ctx: commands.Context, session_msg_id: int):
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
+        return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
     session = sessions.get(session_msg_id)
     if not session:
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
@@ -535,55 +531,26 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
         logger.exception("Failed to read attachment")
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
     try:
-        groups = extract_units_and_slots(text)
+        parsed = extract_units_and_slots(text)
     except Exception:
         logger.exception("Parser crashed")
-        groups = []
-    normalized: Dict[str, List[str]] = {}
-    seen_canonical: set = set()
-    for title, slots in groups:
-        t_clean, slots_from_title, _ = process_title_final(title)
-        t_clean = strip_title_prefixes(t_clean or DEFAULT_TITLE)
-        all_slots = slots_from_title + slots
-        final_slots: List[str] = []
-        for s in all_slots:
-            s2 = clean_line_for_slot(s)
-            if s2 and not is_noise(s2) and not looks_like_code_block(s2):
-                final_slots.append(normalize_pipes(s2))
-        key_title = canonical_title_for_compare(t_clean)
-        key_slots = tuple(canonical_slot_for_compare(x) for x in final_slots)
-        canonical_key = (key_title, key_slots)
-        if canonical_key in seen_canonical:
-            continue
-        seen_canonical.add(canonical_key)
-        # ensure unique display key
-        display_key = t_clean
-        if display_key in normalized:
-            idx = 2
-            new_key = f"{display_key} ({idx})"
-            while new_key in normalized:
-                idx += 1
-                new_key = f"{display_key} ({idx})"
-            normalized[new_key] = final_slots
-        else:
-            normalized[display_key] = final_slots
+        parsed = []
+    # build canonical map to ensure unique canonical entries
+    canonical_map = build_canonical_map(parsed)  # key -> (display_title, slots)
+    # apply filter if provided
     if filter_ids:
-        pats = list(filter_ids)
-        filtered: Dict[str, List[str]] = {}
-        for t, sl in normalized.items():
-            title_for_match = strip_title_prefixes(t)
-            if any(matches_filter(title_for_match, fid) for fid in pats):
-                filtered[t] = sl
-        normalized = filtered
-    if not normalized:
+        filtered_map = {}
+        for key, (display_title, slots) in canonical_map.items():
+            title_for_match = strip_title_prefixes(display_title)
+            if any(matches_filter(title_for_match, fid) for fid in filter_ids):
+                filtered_map[key] = (display_title, slots)
+        canonical_map = filtered_map
+    if not canonical_map:
         _recent_imports.pop(key, None)
         if filter_ids:
             return await ctx.send(f"⚠️ Не знайдено відділень з індексами: {', '.join(filter_ids)}.")
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
-    by_side_like: Dict[str, List[Tuple[str, List[str]]]] = {"all": []}
-    for t, sl in normalized.items():
-        by_side_like["all"].append((t, sl))
-    sent = await send_groups(ctx, by_side_like)
+    sent = await send_groups(ctx, canonical_map)
     _recent_imports.pop(key, None)
     await ctx.send(f"✅ Готово. Опубліковано відділень: {sent}.")
 
