@@ -53,11 +53,84 @@ _recent_imports: Dict[str, float] = {}
 _RECENT_IMPORTS_TTL = 60.0  # сек
 
 # ─────── Slot detection ─────────────────────────────────────────────────────
-SLOT_KEYWORDS = [
-    r'командир', r'командир відділен', r'командир сторони', r'командир екіпажу',
-    r'пілот', r'оператор', r'наводчик', r'санітар', r'медик',
-    r'гренадер', r'гранатометник', r'кулеметник', r'стрілець',
-    r'старший стрілець', r'снайпер', r'коригувальник', r'механік-вод'
+SLOT_KEYWORDS = [SLOT_KEYWORDS = [
+    # 🇺🇦 Українські
+    r'командир відділен', r'командир розрахун', r'командир екіпаж', r'командир сторони',
+    r'старший стрілець', r'стрілець', r'гренадер', r'гранатометник', r'кулеметник',
+    r'помічник кулеметника', r'помічник гранатометника', r'навідник', r'механік-вод',
+    r'медик', r'оператор бпла', r'корегувальник', r'сапер', r'радист', r'снайпер',
+    r'спостерігач', r'інженер', r'водій', r'заряджаючий',
+
+    # 🇷🇺 Російські
+    r'командир отделения', r'командир расч', r'командир экипажа', r'командир стороны',
+    r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
+    r'помощник пулемётчика', r'помощник гранатомётчика', r'наводчик', r'механик-водитель',
+    r'санитар', r'оператор бпла', r'корректировщик', r'связист', r'снайпер',
+    r'наблюдатель', r'инженер', r'водитель', r'заряжающий',
+
+    # 🇬🇧 Англійські / НАТО
+    r'squad leader', r'team leader', r'automatic rifleman', r'rifleman', r'grenadier',
+    r'designated marksman', r'at gunner', r'machine gunner', r'medic',
+    r'drone operator', r'uav operator', r'gunner', r'loader', r'driver',
+    r'comms sergeant', r'sniper', r'spotter', r'engineer', r'radio operator',
+    r'vehicle commander', r'crew commander',
+
+    # 🇩🇪 Німецькі
+    r'gruppenführer', r'truppführer', r'schütze', r'oberschütze', r'grenadier',
+    r'maschinengewehrschütze', r'mg-assistent', r'panzerabwehrschütze',
+    r'sanitäter', r'funker', r'pionier', r'fahrer', r'richtschütze',
+    r'kommandant', r'ladeschütze', r'scharfschütze', r'beobachter',
+
+    # 🇫🇷 Французькі
+    r'chef de groupe', r'chef d’équipe', r'tireur', r'grenadier',
+    r'mitrailleur', r'aide-mitrailleur', r'lance-grenades', r'aide-grenadier',
+    r'médecin', r'infirmier', r'radio', r'conducteur', r'tireur d’élite',
+    r'observateur', r'ingénieur',
+
+    # 🇪🇸 Іспанські
+    r'líder de escuadra', r'líder de equipo', r'fusilero', r'granadero',
+    r'ametrallador', r'asistente de ametrallador', r'lanzagranadas',
+    r'asistente de granadero', r'médico', r'radio', r'comunicaciones',
+    r'conductor', r'francotirador', r'observador', r'ingeniero',
+
+    # 🇷🇸 Сербські
+    r'vođa odeljenja', r'vođa voda', r'strelac', r'grenadir', r'mitraljezac',
+    r'pomoćnik mitraljezca', r'bacač granata', r'pomoćnik bacača', r'sanitetski vojnik',
+    r'radio-operater', r'vozač', r'snajper', r'posmatrač', r'inženjer',
+
+    # 🇭🇺 Угорські
+    r'rajparancsnok', r'csoportvezető', r'lövész', r'gránátos', r'géppuskás',
+    r'géppuskás segéd', r'gránátvetős', r'gránátvető segéd', r'orvos',
+    r'rádiós', r'vezető', r'mesterlövész', r'megfigyelő', r'mérnök',
+
+    # 🇫🇮 Фінські
+    r'ryhmänjohtaja', r'joukkueenjohtaja', r'kivääriampuja', r'kranaatinheitin',
+    r'konekivääriampuja', r'konekiväärin apumies', r'lääkintämies',
+    r'radiomies', r'kuljettaja', r'tarkka-ampuja', r'tähystäjä', r'insinööri',
+
+    # 🇷🇴 Румунські
+    r'comandant de grupă', r'comandant de echipă', r'pușcaș', r'grenadier',
+    r'mitralior', r'ajutor mitralior', r'aruncător de grenade',
+    r'ajutor grenadier', r'medic', r'radiotelefonist', r'șofer',
+    r'lunetist', r'observator', r'inginer',
+
+    # 🇵🇱 Польські
+    r'dowódca drużyny', r'dowódca sekcji', r'strzelec', r'grenadier',
+    r'karabinier', r'karabin maszynowy', r'pomocnik karabinu', r'granatnik',
+    r'pomocnik granatnika', r'medyk', r'radiotelegrafista', r'kierowca',
+    r'snajper', r'obserwator', r'inżynier',
+
+    # 🇨🇿 Чеські
+    r'vedoucí družstva', r'vedoucí sekce', r'střelec', r'granátník',
+    r'kulometčík', r'asistent kulometčíka', r'granátometčík',
+    r'asistent granátometčíka', r'medik', r'radiotelegrafista', r'řidič',
+    r'ostřelovač', r'pozorovatel', r'inženýr',
+
+    # 🇹🇷 Турецькі
+    r'takım lideri', r'grup lideri', r'nişancı', r'bombacı', r'makineli tüfekçi',
+    r'makineli tüfek yardımcısı', r'bomba atar', r'bomba atar yardımcısı',
+    r'sağlıkçı', r'radyo operatörü', r'sürücü', r'keskin nişancı',
+    r'gözlemci', r'mühendis'
 ]
 SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', flags=re.IGNORECASE)
 
