@@ -2,6 +2,12 @@
 # Discord бот: імпорт mission.sqm, фільтрація шуму, збір слотів, нумерація (тільки якщо потрібно),
 # уникнення дублювання, нормалізація заголовків, перенесення назви зброї у перший слот,
 # UI для слотів, статус/деплой/нагадування, звільнення слотів.
+#
+# Зміни в цій версії:
+# - виправлена логіка додавання назви зброї у перший слот;
+# - жорстка канонічна дедуплікація блоків;
+# - нормалізація пайпів і MED;
+# - оновлений формат повідомлення при старті: короткий заголовок і тільки Commit.
 
 import os
 import re
@@ -46,10 +52,8 @@ _stop_sending_global = False
 _stop_sending_by_channel: Dict[int, bool] = {}
 
 DEFAULT_TITLE = "Відділення"
-
-# Debounce для імпорту
 _recent_imports: Dict[str, float] = {}
-_RECENT_IMPORTS_TTL = 60.0  # сек
+_RECENT_IMPORTS_TTL = 60.0
 
 # ─────── SLOT KEYWORDS (multi-language) ───────────────────────────────────────────────
 SLOT_KEYWORDS = [
@@ -340,6 +344,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                         if existing_canonical == key_slots:
                             exists = True
                             break
+
                 if not exists:
                     base = t_norm
                     if base in groups:
@@ -557,6 +562,8 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
         groups = []
 
     normalized: Dict[str, List[str]] = {}
+    seen_canonical: set = set()
+
     for title, slots in groups:
         t_clean, slots_from_title, _ = process_title_final(title)
         t_clean = strip_title_prefixes(t_clean or DEFAULT_TITLE)
@@ -566,24 +573,24 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
             s2 = clean_line_for_slot(s)
             if s2 and not is_noise(s2) and not looks_like_code_block(s2):
                 final_slots.append(normalize_slot_name(s2))
+
         key_title = canonical_title_for_compare(t_clean)
         key_slots = tuple(canonical_slot_for_compare(x) for x in final_slots)
-        already = False
-        for existing_title, existing_slots in list(normalized.items()):
-            if canonical_title_for_compare(existing_title) == key_title:
-                if tuple(canonical_slot_for_compare(x) for x in existing_slots) == key_slots:
-                    already = True
-                    break
-        if not already:
-            if t_clean in normalized:
-                idx = 2
+        canonical_key = (key_title, key_slots)
+
+        if canonical_key in seen_canonical:
+            continue
+
+        seen_canonical.add(canonical_key)
+        if t_clean in normalized:
+            idx = 2
+            new_key = f"{t_clean} ({idx})"
+            while new_key in normalized:
+                idx += 1
                 new_key = f"{t_clean} ({idx})"
-                while new_key in normalized:
-                    idx += 1
-                    new_key = f"{t_clean} ({idx})"
-                normalized[new_key] = final_slots
-            else:
-                normalized[t_clean] = final_slots
+            normalized[new_key] = final_slots
+        else:
+            normalized[t_clean] = final_slots
 
     if filter_ids:
         pats = [re.compile(rf'\b{re.escape(fid)}\b', flags=re.IGNORECASE) for fid in filter_ids]
@@ -629,7 +636,7 @@ async def _оновити(ctx: commands.Context):
 @bot.command(name="статус", aliases=["status"])
 async def _статус(ctx: commands.Context):
     try:
-        commit = subprocess.getoutput("git rev-parse --short HEAD")
+        commit = subprocess.getoutput("git rev-parse --short=7 HEAD")
     except Exception:
         commit = "unknown"
     await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
@@ -652,12 +659,13 @@ async def vtg_reminder():
 async def on_ready():
     logger.info("Bot ready: %s", bot.user)
     try:
-        commit = subprocess.getoutput("git rev-parse --short HEAD")
+        commit = subprocess.getoutput("git rev-parse --short=7 HEAD")
     except Exception:
         commit = "unknown"
+    # Короткий формат повідомлення при старті (згідно запиту)
     embed = discord.Embed(
-        title="🔄 Бот перезапущено (Остання версія)",
-        description=f"📦 Commit: `{commit}`\n✅ Оновлено парсер: нормалізація та уникнення дублювання\n🔧 Зброя додається у перший слот",
+        title="🔄 Бот перезапущено",
+        description=f"📦\nCommit: `{commit}`",
         color=discord.Color.green()
     )
     for guild in bot.guilds:
