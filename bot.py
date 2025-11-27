@@ -1,7 +1,16 @@
-# bot.py — Фінальна версія
+# bot.py — ФІНАЛЬНА ВЕРСІЯ
 # Discord бот: імпорт mission.sqm, фільтрація шуму, вибір відділень по індексу,
-# об’єднання дублікатів заголовків без втрати слотів, повний склад між заголовками,
-# нумерація слотів, UI для слотів, статус/деплой/нагадування, звільнення слотів.
+# об'єднання заголовків без втрати слотів, повний збір слотів між заголовками,
+# нумерація слотів (тільки якщо в місії немає власної нумерації),
+# UI для слотів, статус/деплой/нагадування, звільнення слотів.
+#
+# Зміни у цій версії:
+# - прибрано префікси сторін (ЗСУ/Невідомо) з виводу;
+# - заголовки очищуються від '@', мовних маркерів (ENG, RU тощо) та від провідних назв зброї;
+# - якщо назва зброї стоїть перед '@' (наприклад "(FN FAL)@Альфа 2-3"), вона переноситься в перший слот;
+# - якщо у слотах вже є нумерація (наприклад "2: ...", "3. ..."), бот не додає додаткову нумерацію;
+# - дублікати ролей зберігаються (якщо в відділенні два однакові слоти — це нормально);
+# - розширений багатомовний список SLOT_KEYWORDS.
 
 import os
 import re
@@ -52,80 +61,80 @@ DEFAULT_TITLE = "Відділення"
 _recent_imports: Dict[str, float] = {}
 _RECENT_IMPORTS_TTL = 60.0  # сек
 
-# ─────── Slot detection (multi-language) ─────────────────────────────────────
+# ─────── SLOT KEYWORDS (multi-language) ───────────────────────────────────────────────
 SLOT_KEYWORDS = [
-    # Українські
+    # 🇺🇦 Українські
     r'командир відділен', r'командир розрахун', r'командир екіпаж', r'командир сторони',
     r'старший стрілець', r'стрілець', r'гренадер', r'гранатометник', r'кулеметник',
     r'помічник кулеметника', r'помічник гранатометника', r'навідник', r'оператор-навідник',
     r'механік-вод', r'медик', r'санітар', r'оператор бпла', r'корегувальник',
     r'снайпер', r'спостерігач', r'радист', r'інженер', r'водій', r'заряджаючий',
 
-    # Російські
+    # 🇷🇺 Російські
     r'командир отделения', r'командир расч', r'командир экипаж', r'командир стороны',
     r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
     r'помощник пулемётчика', r'помощник гранатомётчика', r'наводчик',
     r'механик-водитель', r'санитар', r'оператор бпла', r'снайпер', r'наблюдатель',
     r'связист', r'инженер', r'водитель', r'заряжающий',
 
-    # Англійські / НАТО
+    # 🇬🇧 Англійські / НАТО
     r'squad leader', r'team leader', r'automatic rifleman', r'rifleman', r'grenadier',
     r'designated marksman', r'at gunner', r'machine gunner', r'medic',
     r'drone operator', r'uav operator', r'gunner', r'loader', r'driver',
     r'comms', r'radio operator', r'vehicle commander', r'crew commander', r'sniper', r'spotter',
 
-    # Німецькі
+    # 🇩🇪 Німецькі
     r'gruppenführer', r'truppführer', r'schütze', r'grenadier',
     r'maschinengewehrschütze', r'mg-assistent', r'panzerabwehrschütze',
     r'sanitäter', r'funker', r'pionier', r'fahrer', r'richtschütze',
     r'kommandant', r'ladeschütze', r'scharfschütze', r'beobachter',
 
-    # Французькі
+    # 🇫🇷 Французькі
     r'chef de groupe', r'chef d’équipe', r'tireur', r'grenadier',
     r'mitrailleur', r'aide-mitrailleur', r'lance-grenades', r'aide-grenadier',
     r'médecin', r'infirmier', r'radio', r'conducteur', r'tireur d’élite',
     r'observateur', r'ingénieur',
 
-    # Іспанські
+    # 🇪🇸 Іспанські
     r'líder de escuadra', r'líder de equipo', r'fusilero', r'granadero',
     r'ametrallador', r'asistente de ametrallador', r'lanzagranadas',
     r'asistente de granadero', r'médico', r'radio', r'conductor',
     r'francotirador', r'observador', r'ingeniero',
 
-    # Сербські
+    # 🇷🇸 Сербські
     r'vođa odeljenja', r'vođa voda', r'strelac', r'grenadir', r'mitraljezac',
     r'pomoćnik mitraljezca', r'bacač granata', r'pomoćnik bacača', r'sanitetski vojnik',
     r'radio-operater', r'vozač', r'snajper', r'posmatrač', r'inženjer',
 
-    # Угорські
+    # 🇭🇺 Угорські
     r'rajparancsnok', r'csoportvezető', r'lövész', r'gránátos', r'géppuskás',
     r'géppuskás segéd', r'gránátvetős', r'gránátvető segéd', r'orvos',
     r'rádiós', r'vezető', r'mesterlövész', r'megfigyelő', r'mérnök',
 
-    # Фінські
+    # 🇫🇮 Фінські
     r'ryhmänjohtaja', r'joukkueenjohtaja', r'kivääriampuja', r'kranaatinheitin',
     r'konekivääriampuja', r'konekiväärin apumies', r'lääkintämies',
     r'radiomies', r'kuljettaja', r'tarkka-ampuja', r'tähystäjä', r'insinööri',
 
-    # Румунські
+    # 🇷🇴 Румунські
     r'comandant de grupă', r'comandant de echipă', r'pușcaș', r'grenadier',
     r'mitralior', r'ajutor mitralior', r'aruncător de grenade',
     r'ajutor grenadier', r'medic', r'radiotelefonist', r'șofer',
     r'lunetist', r'observator', r'inginer',
 
-    # Польські
+    # 🇵🇱 Польські
     r'dowódca drużyny', r'dowódca sekcji', r'strzelec', r'grenadier',
     r'karabinier', r'karabin maszynowy', r'pomocnik karabinu', r'granatnik',
     r'pomocnik granatnika', r'medyk', r'radiotelegrafista', r'kierowca',
     r'snajper', r'obserwator', r'inżynier',
 
-    # Чеські
+    # 🇨🇿 Чеські
     r'vedoucí družstva', r'vedoucí sekce', r'střelec', r'granátník',
     r'kulometčík', r'asistent kulometčíka', r'granátometčík',
     r'asistent granátometčíka', r'medik', r'radiotelegrafista', r'řidič',
     r'ostřelovač', r'pozorovatel', r'inženýr',
 
-    # Турецькі
+    # 🇹🇷 Турецькі
     r'takım lideri', r'grup lideri', r'nişancı', r'bombacı', r'makineli tüfekçi',
     r'makineli tüfek yardımcısı', r'bomba atar', r'bomba atar yardımcısı',
     r'sağlıkçı', r'radyo operatörü', r'sürücü', r'keskin nişancı',
@@ -136,7 +145,7 @@ SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', fl
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 
-# ─────── Noise filters and helpers ─────────────────────────────────────────────────────
+# ─────── Helpers: noise filters and normalization ─────────────────────────────────────
 def is_noise(s: str) -> bool:
     s = (s or "").strip()
     if not s:
@@ -152,13 +161,11 @@ def is_noise(s: str) -> bool:
     if low in noise_literals:
         return True
 
-    # чисті числа або комбінації з комами
     if re.fullmatch(r'\d+(,\d+)*', s):
         return True
     if re.fullmatch(r'[A-Z0-9_]+', s):
         return True
 
-    # моди/прапори/сервісні
     if ("rhs_" in low) or ("_hide" in low) or ("flag_manager" in low) or ("beacons" in low):
         return True
     if re.search(r'^(crate|wood|door|hide|show)_[\w\-]+(_unhide)?$', low):
@@ -169,7 +176,6 @@ def is_noise(s: str) -> bool:
     if re.search(r'^show\w+', s): return True
     if re.search(r'^[a-zA-Z_]+_unhide$', s): return True
 
-    # техніка без контексту
     if low in {
         "mavicblue1","mavicblue2","mavicred1","mavicred2",
         "m113","m113a3","bmp","bmp-2","бмп-2","мт-лб","gaz-66","газ-66",
@@ -177,11 +183,9 @@ def is_noise(s: str) -> bool:
     }:
         return True
 
-    # імена без ролей
     if s.startswith("Guerilla_") or s.startswith("Male") or re.match(r'^[A-Z][a-z]+_\d+$', s):
         return True
 
-    # текстові події / тригери
     event_noise = [
         r'зс рф захопили', r'зс рф змогли', r'зс рф вдалося',
         r'багатоповерхівка', r'бахмут',
@@ -234,35 +238,23 @@ def looks_like_code_block(s: str) -> bool:
         return True
     return False
 
-def strip_title_prefixes(title: str) -> str:
-    t = title.strip()
-    # Remove leading numbering like "1. " or "1:"
-    t = re.sub(r'^\s*\d+\s*[\.\:]\s*', '', t)
-    # Remove leading language markers and pipes (ENG |, RU |, etc.)
-    t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
-    # Remove leading stray letter and pipe (e.g., "а |")
-    t = re.sub(r'^[A-Za-zА-Яа-я]\s*\|\s*', '', t)
-    # Remove leading '@'
-    if t.startswith('@'):
-        t = t[1:].strip()
-    # Remove leading "| ENG" etc.
-    t = re.sub(r'^\s*\|\s*[A-Z]{2,}\s*', '', t)
-    # Collapse whitespace and trim separators
-    t = re.sub(r'\s{2,}', ' ', t).strip(' |')
-    return t
-
 def clean_line_for_slot(s: str) -> str:
+    """
+    Очищує рядок слота:
+    - прибирає провідні числа/теги;
+    - прибирає мовні маркери (ENG, RU тощо), але нормалізує MED;
+    - повертає чистий текст слота.
+    """
     s = strip_quotes_semicolons(s)
     s = extract_structured_text(s)
     s = re.sub(r'^\s*\d+\.\s*', '', s)
     s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
 
-    # Remove language markers like "ENG", "RU", etc., but keep MED for medics
+    # Remove language markers like "ENG", "RU", etc., but keep MED marker
     s = re.sub(r'\s+\|\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\s+(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
     # Normalize MED marker to " | MED"
     s = re.sub(r'\s+\bMED\b', ' | MED', s, flags=re.IGNORECASE)
-    # Normalize МЕД to " | MED"
     s = re.sub(r'\s+\bМЕД\b', ' | MED', s, flags=re.IGNORECASE)
 
     return s.strip(' "\'')
@@ -280,24 +272,68 @@ def decode_bytes(raw: bytes) -> str:
     except Exception:
         return raw.decode("cp1251", errors="replace")
 
-# ─────── Header detection ─────────────────────────────────────────────────────
-def is_header_line(s: str) -> bool:
-    # Must have an index token like "Альфа 2-2" or "Alpha 2-2" and pipes
-    has_index = re.search(r'\b(Альфа|Alpha)\s*\d+-\d+\b', s, flags=re.IGNORECASE) is not None
-    has_pipe = '|' in s
-    if not (has_index and has_pipe):
-        return False
-    # Do not treat slot-like lines as headers
-    if re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s):
-        return False
-    return True
+# ─────── Header detection and title cleaning ─────────────────────────────────────
+def strip_title_prefixes(title: str) -> str:
+    """
+    Очищає заголовок:
+    - прибирає провідну нумерацію (1. , 1:);
+    - прибирає мовні маркери (ENG, RU тощо);
+    - прибирає провідні літери з pipe (наприклад 'а |');
+    - прибирає '@' на початку;
+    - згортає зайві пробіли.
+    """
+    t = (title or "").strip()
+    t = re.sub(r'^\s*\d+\s*[\.\:]\s*', '', t)
+    t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
+    t = re.sub(r'^[A-Za-zА-Яа-я]\s*\|\s*', '', t)
+    if t.startswith('@'):
+        t = t[1:].strip()
+    t = re.sub(r'^\s*\|\s*[A-Z]{2,}\s*', '', t)
+    t = re.sub(r'\s{2,}', ' ', t).strip(' |')
+    return t
 
-# ─────── Title processing ─────────────────────────────────────────────────────
+def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
+    """
+    Якщо заголовок починається з назви зброї у дужках або без (наприклад "(FN FAL)@Альфа 2-3" або "FN FAL @Альфа"),
+    повертає (title_without_weapon, weapon_text). Інакше weapon_text = None.
+    """
+    t = (title or "").strip()
+    # Pattern: optional leading "(...)" or bare token before '@' or before pipe
+    m = re.match(r'^\s*(\([^\)]+\)|[A-Za-z0-9\-\/\\\s]+?)\s*@', t)
+    if m:
+        weapon = m.group(1).strip()
+        # remove the matched weapon and optional '@'
+        rest = re.sub(re.escape(m.group(0)), '', t, count=1).strip()
+        return rest, weapon
+    # also check pattern like "(FN FAL) Альфа 2-3 | ..." (no @)
+    m2 = re.match(r'^\s*(\([^\)]+\))\s+([^\|]+)', t)
+    if m2:
+        weapon = m2.group(1).strip()
+        rest = t[len(m2.group(1)):].strip()
+        return rest, weapon
+    return t, None
+
 def process_title_final(title: str) -> Tuple[str, List[str]]:
-    clean = strip_title_prefixes(title)
-    slots_from_title: List[str] = []
+    """
+    Final title cleaner:
+    - видаляє провідні маркери, '@', ENG тощо;
+    - якщо в заголовку була назва зброї на початку, повертає її як слот (в slots_from_title);
+    - витягує командирів із заголовка (але не 'Корегувальник').
+    """
+    # First, extract leading weapon if present
+    rest, weapon = extract_leading_weapon_and_strip(title)
+    clean = strip_title_prefixes(rest)
 
-    # Extract commander variants but DO NOT treat 'Корегувальник' as commander
+    slots_from_title: List[str] = []
+    if weapon:
+        # normalize weapon text and add as first slot (do not treat as header)
+        w = weapon.strip()
+        # remove surrounding parentheses if any
+        w = re.sub(r'^\(|\)$', '', w).strip()
+        if w:
+            slots_from_title.append(w)
+
+    # Commander patterns (do not include 'Корегувальник')
     commander_patterns = [
         (r'Командир відділення', 'Командир відділення'),
         (r'Командир отделения', 'Командир відділення'),
@@ -318,15 +354,14 @@ def process_title_final(title: str) -> Tuple[str, List[str]]:
             break
 
     clean = re.sub(r'\s{2,}', ' ', clean).strip(' |')
-    return clean, slots_from_title
+    return clean or DEFAULT_TITLE, slots_from_title
 
 def normalize_group_title(raw_title: str) -> str:
     t = strip_title_prefixes(raw_title or "")
-    # unify common aliases
     t = t.replace("ГУР МОУ", "ГУР МОУ").replace("Kraken", "KRAKEN")
     return t
 
-# ─────── Parser ─────────────────────────────────────────────────────
+# ─────── Parser: extract units and slots ─────────────────────────────────────
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -373,13 +408,17 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         if not s or is_noise(s):
             continue
 
-        if is_header_line(s):
+        # header detection: require pipe and index token (Alpha/Альфа + digits) to avoid false positives
+        has_index = re.search(r'\b(Альфа|Alpha)\s*\d+-\d+\b', s, flags=re.IGNORECASE) is not None
+        is_header = ('|' in s and has_index) and not (re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s))
+
+        if is_header:
             flush()
             cur_title = s
             continue
 
         # slot by numbering or keywords
-        if re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s):
+        if re.match(r'^\s*\d+\.\s*', s) or TRIGGER_RE.match(s) or SLOT_RE.search(s):
             slot = clean_line_for_slot(s)
             if is_valid_slot(slot) and not looks_like_code_block(slot):
                 cur_slots.append(slot)
@@ -392,10 +431,24 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     flush()
     return [(title, slots) for title, slots in groups.items()]
 
+# ─────── Slot formatting: respect mission numbering if present ─────────────────────
 def format_slots_with_numbers(slots: List[str]) -> List[str]:
+    """
+    Якщо слоти вже мають власну нумерацію (рядки починаються з 'N:' або 'N.'), повертаємо їх як є.
+    Інакше додаємо нумерацію 1., 2., ...
+    """
+    if not slots:
+        return []
+    # detect if first non-empty slot starts with numbering like "2:" or "2."
+    for s in slots:
+        if s and re.match(r'^\s*\d+[\.:]\s*', s):
+            # assume mission already numbered — return normalized slots (trim leading numbers)
+            cleaned = [re.sub(r'^\s*\d+[\.:]\s*', '', x).strip() for x in slots]
+            return cleaned
+    # otherwise add numbering
     return [f"{i+1}. {slot}" for i, slot in enumerate(slots, 1)]
 
-# ─────── Side detector ─────────────────────────────────────────────────────
+# ─────── Side detector (kept for internal grouping but not printed) ─────────────
 def detect_side_from_title(title: str) -> str:
     t = title.lower()
     if any(k in t for k in ["омбр", "зсу", "гур", "ссо", "окрема", "бригада", "альфа", "холодний яр", "kraken"]):
@@ -501,46 +554,49 @@ async def звільнити(ctx: commands.Context, session_msg_id: int):
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
     await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
 
-# ─────── Output builder (no duplication, chunking) ─────────────────────────────────────────────────────
+# ─────── Output builder: send all blocks without side headers ─────────────────────
 async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, List[str]]]]):
+    """
+    Відправляє відділення без позначок сторін.
+    grouped: словник з ключами (наприклад 'all' або сторони) і списками (title, slots).
+    """
     sent_titles = set()
     sent = 0
-    for side in ("ЗСУ", "ЗС РФ/ПВК", "Союзники", "Невідомо"):
-        blocks = grouped.get(side, [])
-        if not blocks:
+    # зібрати всі блоки в один список
+    all_blocks: List[Tuple[str, List[str]]] = []
+    for blocks in grouped.values():
+        all_blocks.extend(blocks)
+
+    for title, slots in all_blocks:
+        key = title
+        if key in sent_titles:
             continue
-        await ctx.send(f"```{side}```")
-        for title, slots in blocks:
-            key = (side, title)
-            if key in sent_titles:
-                continue
-            sent_titles.add(key)
-            numbered = format_slots_with_numbers(slots)
-            out = "\n".join([title] + numbered)
-            lines = out.splitlines()
-            chunk = []
-            for i, line in enumerate(lines, 1):
-                chunk.append(line)
-                if i % 40 == 0:
-                    await ctx.send(f"```{chr(10).join(chunk)}```")
-                    chunk = []
-                    await asyncio.sleep(0)
-            if chunk:
+        sent_titles.add(key)
+        numbered = format_slots_with_numbers(slots)
+        out = "\n".join([title] + numbered)
+        lines = out.splitlines()
+        chunk = []
+        for i, line in enumerate(lines, 1):
+            chunk.append(line)
+            if i % 40 == 0:
                 await ctx.send(f"```{chr(10).join(chunk)}```")
-                sent += 1
-            await asyncio.sleep(0.06)
+                chunk = []
+                await asyncio.sleep(0)
+        if chunk:
+            await ctx.send(f"```{chr(10).join(chunk)}```")
+            sent += 1
+        await asyncio.sleep(0.06)
     return sent
 
-# ─────── Final command: !слоти (replaces !імпорт_sqm) ─────────────────────────────────────────────────────
+# ─────── Final command: !слоти (replaces !імпорт_sqm) ─────────────────────────
 @bot.command(name="слоти", aliases=["імпорт_sqm", "import_sqm"])
 async def слоти(ctx: commands.Context, *filter_ids: str):
     """
     Імпорт mission.sqm і друк відділень:
-    - Чистий заголовок без '1.' і '@'
-    - 'Корегувальник' завжди у слотах, не як командир
-    - Повна фільтрація сміття, без дублів блоків
-    - Дублікати ролей зберігаємо
-    - Мітки мов ('ENG', 'RU', ...) прибираємо з заголовків і слотів; 'MED' нормалізуємо
+    - очищення заголовків від '@' і мовних маркерів;
+    - перенос провідної назви зброї у перший слот, якщо вона стоїть перед заголовком;
+    - якщо слоти вже пронумеровані у місії — бот не додає додаткову нумерацію;
+    - дублікати ролей зберігаються.
     """
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
@@ -584,31 +640,32 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
                 final_slots.append(normalize_slot_name(s2))
         normalized.setdefault(t_clean, []).extend(final_slots)
 
-    # Filter by indices (match on cleaned title)
+    # If filter ids provided — exact match on cleaned title (e.g., "2-2")
     if filter_ids:
-        pats = [re.compile(rf'\b{re.escape(fid)}\b') for fid in filter_ids]
-        filt_map: Dict[str, List[str]] = {}
+        pats = [re.compile(rf'\b{re.escape(fid)}\b', flags=re.IGNORECASE) for fid in filter_ids]
+        filtered: Dict[str, List[str]] = {}
         for t, sl in normalized.items():
-            title_clean = strip_title_prefixes(t)
-            if any(p.search(title_clean) for p in pats):
-                filt_map.setdefault(title_clean, []).extend(sl)
-        normalized = filt_map
+            title_for_match = strip_title_prefixes(t)
+            if any(p.search(title_for_match) for p in pats):
+                filtered[t] = sl
+        normalized = filtered
 
     if not normalized:
         _recent_imports.pop(key, None)
+        if filter_ids:
+            return await ctx.send(f"⚠️ Не знайдено відділень з індексами: {', '.join(filter_ids)}.")
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
-    # Group by side
-    by_side: Dict[str, List[Tuple[str, List[str]]]] = {"ЗСУ": [], "ЗС РФ/ПВК": [], "Союзники": [], "Невідомо": []}
+    # Prepare structure for send_groups (single 'all' bucket)
+    by_side_like: Dict[str, List[Tuple[str, List[str]]]] = {"all": []}
     for t, sl in normalized.items():
-        side = detect_side_from_title(t)
-        by_side[side].append((t, sl))
+        by_side_like["all"].append((t, sl))
 
-    sent = await send_groups(ctx, by_side)
+    sent = await send_groups(ctx, by_side_like)
     _recent_imports.pop(key, None)
     await ctx.send(f"✅ Готово. Опубліковано відділень: {sent}.")
 
-# ─────── Admin/util commands ─────────────────────────────────────────────────────
+# ─────── Admin/util commands ─────────────────────────────────────────────
 @bot.command(name="стоп", aliases=["stop"])
 async def стоп(ctx: commands.Context):
     global _stop_sending_global, _stop_sending_by_channel
@@ -624,7 +681,7 @@ async def _оновити(ctx: commands.Context):
         return await ctx.send("❌ DEPLOY_HOOK_URL не встановлено")
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
-    await ctx.send("🔄 Деплой тригерено!")
+    await ctx.send("🔄 Деплой тригеровано!")
 
 @bot.command(name="статус", aliases=["status"])
 async def _статус(ctx: commands.Context):
@@ -657,7 +714,7 @@ async def on_ready():
         commit = "unknown"
     embed = discord.Embed(
         title="🔄 Бот перезапущено (Фінальна версія)",
-        description=f"📦 Commit: `{commit}`\n✅ Формат заголовків виправлено\n🔢 Нумерація слотів\n🧹 Жорстка фільтрація шуму",
+        description=f"📦 Commit: `{commit}`\n✅ Формат заголовків виправлено\n🔢 Нумерація слотів (тільки якщо потрібно)\n🧹 Жорстка фільтрація шуму",
         color=discord.Color.green()
     )
     for guild in bot.guilds:
