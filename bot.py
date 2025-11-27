@@ -1,10 +1,7 @@
-# bot.py — Final stable version with stronger deduplication and header handling
-# - Robust parsing of mission.sqm
-# - Removes @-markers
-# - Moves weapon from title into first slot (commander)
-# - Preserves/normalizes numbering
-# - Strong deduplication (removes repeated identical blocks)
-# - Avoids duplicate candidate lines when extracting from SQM
+# bot.py — Стабільна фінальна версія
+# Мета: надійний парсер mission.sqm, очищення заголовків, перенесення назви зброї у перший слот,
+# коректна нумерація слотів, уникнення дублювання, нормалізація пайпів/MED,
+# UI для слотів, статус/деплой/нагадування, звільнення слотів.
 
 import os
 import re
@@ -14,13 +11,13 @@ import subprocess
 import logging
 from typing import List, Tuple, Dict, Optional
 from zoneinfo import ZoneInfo
+from collections import OrderedDict
 
 import aiohttp
 import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
-from collections import OrderedDict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("botslot")
@@ -325,8 +322,9 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         if not s or is_noise(s):
             continue
 
+        # broader header detection: '|' or common unit words
         has_index = re.search(r'\b(Альфа|Alpha)\s*\d+[-–—]?\d*\b', s, flags=re.IGNORECASE) is not None
-        is_header = ('|' in s and has_index) and not (re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s))
+        is_header = ('|' in s or re.search(r'\b(Battalion|Regiment|Brigade|Squad|Infantry|Mechanized|Armored|M113|BMP|T-34|M2)\b', s, flags=re.IGNORECASE)) and not (re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s))
 
         if is_header:
             flush()
@@ -361,7 +359,6 @@ def build_canonical_map(parsed: List[Tuple[str, List[str]]]) -> "OrderedDict[Tup
         key = (canonical_title, canonical_slots)
         if key in cmap:
             continue
-        # also avoid exact duplicate display_title + identical slots even if canonicalization slightly differs
         display_key = (display_title, tuple(slots))
         if display_key in seen_display:
             continue
@@ -422,6 +419,9 @@ def matches_filter(title: str, fid: str) -> bool:
     fid_comp = re.sub(r'[-–—\s]+', '', fid_norm)
     t_comp = re.sub(r'[-–—\s]+', '', t_norm)
     if fid_comp and fid_comp.lower() in t_comp.lower():
+        return True
+    words = [w for w in re.split(r'[\s\|,]+', fid_norm) if w]
+    if words and all(re.search(re.escape(w), t_norm, flags=re.IGNORECASE) for w in words):
         return True
     return False
 
