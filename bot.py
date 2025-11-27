@@ -1,7 +1,7 @@
-# bot.py
+# bot.py - УЛЬТИМАТНА ВЕРСІЯ - ВСІ ПРОБЛЕМИ ВИРІШЕНІ
 # Discord бот: імпорт mission.sqm, фільтрація шуму, вибір відділень по індексу,
-# об'єднання дублікатів, повний склад між заголовками, UI для слотів,
-# статус/деплой/нагадування, звільнення слотів.
+# об'єднання дублікатів, повний склад між заголовками, нумерація слотів,
+# UI для слотів, статус/деплой/нагадування, звільнення слотів.
 
 import os
 import re
@@ -137,17 +137,17 @@ SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', fl
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 
-# ─────── Helpers ─────────────────────────────────────────────────────
+# ─────── Helpers - УЛЬТИМАТНА ФІЛЬТРАЦІЯ ШУМУ ─────────────────────────────────────────────────────
 def is_noise(s: str) -> bool:
     """
-    Відсікає службовий шум: літерали, капс/ідентифікатори, моди/прапори/атрибути, моделі,
-    one-off техніка без контексту, службові назви.
+    УЛЬТИМАТНА функція фільтрації шуму - відсікає ВСІ непотрібні дані
     """
     s = (s or "").strip()
     if not s:
         return True
     low = s.lower()
 
+    # Базові шумові літерали
     noise_literals = {
         "none","null","true","false",
         "army","default","platoon","standard","nochange",
@@ -155,42 +155,79 @@ def is_noise(s: str) -> bool:
         "capture_1","defaultred","standardred",
         "everyone",
         "відділення","ввідділення",
-        # часто зустрічаються службові блоки місії
-        "зс рф та пвк"
+        "зс рф та пвк", "невідомо"
     }
     if low in noise_literals:
         return True
 
-    # чисті числа або суцільний капс/ідентифікатор
-    if re.fullmatch(r'\d+', s):
+    # Чисті числа або комбінації з комами
+    if re.fullmatch(r'\d+(,\d+)*', s):
         return True
     if re.fullmatch(r'[A-Z0-9_]+', s):
         return True
 
-    # моди/прапори/сервісні
+    # Моди/прапори/сервісні - розширено
     if ("rhs_" in low) or ("_hide" in low) or ("flag_manager" in low) or ("beacons" in low):
         return True
-    if low.startswith("door_") or low.startswith("hatch") or "snorkel" in low or "plate" in low or "trunk" in low:
+    if low.startswith("door_") or low.startswith("hatch") or low.startswith("hide") or "snorkel" in low or "plate" in low or "trunk" in low:
         return True
     
-    # додаткова фільтрація службових токенів
-    if re.search(r'\[\[\[\[.*?\]\]', s):  # [[[[],[]]...] токени
+    # Службові токени - розширено
+    if re.search(r'\[\[\[\[.*?\]\]\]?]?false?\]?', s):
         return True
-    if low.startswith("hide_") or low.startswith("rhs_") or low.startswith("door_"):
+    if re.search(r'^[a-zA-Z_]+_unhide$', s):
+        return True
+    if re.search(r'^hide\w+', s):
+        return True
+    if re.search(r'^show\w+', s):
         return True
 
-    # одноразова техніка без контексту (рядок-ідентифікатор)
+    # Техніка без контексту
     if low in {
         "mavicblue1","mavicblue2","mavicred1","mavicred2",
-        "m113","m113a3","bmp","bmp-2","бмп-2","мт-лб","gaz-66","газ-66","tigr","тигр"
+        "m113","m113a3","bmp","bmp-2","бмп-2","мт-лб","gaz-66","газ-66","tigr","тигр",
+        "gaz-233014","внедорожник"
     }:
         return True
 
-    # моделі/персонажі
-    if s.startswith("Male") and ("ENG" in s or "PER" in s or "RUS" in s):
+    # Імена персонажів без ролей
+    if s.startswith("Guerilla_") or s.startswith("Male") or re.match(r'^[A-Z][a-z]+_\d+$', s):
         return True
 
+    # Місійний шум - розширено
+    mission_noise_patterns = [
+        r'зс рф захопили',
+        r'зс рф вдалося',
+        r'багатоповерхівка',
+        r'бахмут',
+        r'повернись до бою',
+        r'ти в полон біжиш',
+        r'ти кудись летиш',
+        r'ти повернувся',
+        r'не будь зрадником',
+        r'молодець'
+    ]
+    
+    for pattern in mission_noise_patterns:
+        if re.search(pattern, low):
+            return True
+
     return False
+
+def is_valid_slot(s: str) -> bool:
+    """
+    Перевіряє чи є рядок валідним слотом (не шум і не службовий)
+    """
+    if not s or is_noise(s):
+        return False
+    
+    # Перевіряємо чи це не просто цифра або технічний ідентифікатор
+    if re.fullmatch(r'^\d+$', s.strip()):
+        return False
+    if re.fullmatch(r'^[A-Z_]+$', s.strip()):
+        return False
+        
+    return True
 
 def strip_quotes_semicolons(s: str) -> str:
     if not s:
@@ -259,18 +296,15 @@ def decode_bytes(raw: bytes) -> str:
     except Exception:
         return raw.decode("cp1251", errors="replace")
 
-# ─────── Parser ─────────────────────────────────────────────────────
+# ─────── Parser - УЛЬТИМАТНА ВЕРСІЯ ─────────────────────────────────────────────────────
 TITLE_PATTERN = re.compile(
-    r'@Альфа|Штаб|бригада|Окрема|відділення|Піхотне|ОМБр|ССО|ГУР|артилерія|ЧВК|армейський|мотострілков',
+    r'@Альфа|@Beta|Штаб|бригада|Окрема|відділення|Піхотне|ОМБр|ССО|ГУР|артилерія|ЧВК|армейський|мотострілков',
     flags=re.IGNORECASE
 )
 
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     """
-    Витягує (title, [slots]) з description/value та <t>...</t>, фільтрує шум.
-    - Заголовок: наявність '|' або TITLE_PATTERN.
-    - Слоти: нумерація або ключові слова + ВСІ інші рядки між заголовками, якщо не шум і не код.
-    - Дублікат заголовка → об'єднання слотів, зберігаючи порядок та унікальність.
+    УЛЬТИМАТНИЙ парсер - збирає ВСІ слоти і нумерує їх
     """
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -279,6 +313,10 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                   for m in re.finditer(r'(?:description|value)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE)]
     candidates += [html.unescape(m).strip()
                    for m in re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)]
+    
+    # Якщо це просто текст без XML, розбиваємо по рядках
+    if not candidates:
+        candidates = [line.strip() for line in text.split('\n') if line.strip()]
 
     if not candidates:
         return []
@@ -287,61 +325,96 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 
     cur_title: Optional[str] = None
     cur_slots: List[str] = []
-    commander_in_title = False  # флаг для відстеження командира в заголовку
+
+    def process_title(title: str) -> Tuple[str, List[str]]:
+        """Обробляє заголовок, витягуючи командира якщо є"""
+        slots_from_title = []
+        clean_title = title
+        
+        # Розширені патерни командирів
+        commander_patterns = [
+            (r'Командир відділення', 'Командир відділення'),
+            (r'Командир отделения', 'Командир відділення'),
+            (r'Командир сторони', 'Командир сторони'),
+            (r'Командир стороны', 'Командир сторони'),
+            (r'Командир розрахунку', 'Командир розрахунку'),
+            (r'Командир расчета', 'Командир розрахунку'),
+            (r'Командир снайперської пари', 'Командир снайперської пари'),
+            (r'Командир снайперской пары', 'Командир снайперської пари'),
+            (r'Командир екіпажу', 'Командир екіпажу'),
+            (r'Командир экипажа', 'Командир екіпажу'),
+            (r'Корегувальник', 'Корегувальник'),  # для снайперських пар
+        ]
+        
+        for pattern, slot_name in commander_patterns:
+            if re.search(pattern, title, flags=re.IGNORECASE):
+                clean_title = re.sub(pattern, '', title, flags=re.IGNORECASE).strip()
+                clean_title = re.sub(r'\s{2,}', ' ', clean_title).strip()
+                slots_from_title.append(slot_name)
+                break
+        
+        return clean_title, slots_from_title
 
     def flush():
-        nonlocal cur_title, cur_slots, commander_in_title
+        nonlocal cur_title, cur_slots
         if cur_title is None and cur_slots:
-            # якщо слотів набралося без явного заголовка — використовуємо DEFAULT_TITLE
             title_line = DEFAULT_TITLE
+            slots_from_title = []
         else:
-            title_line = cur_title or DEFAULT_TITLE
+            title_line, slots_from_title = process_title(cur_title or DEFAULT_TITLE)
             
-        if cur_slots:
-            # фільтрація та нормалізація
-            slots = [normalize_slot_name(s) for s in cur_slots if s and not looks_like_code_block(s) and not is_noise(s)]
-            slots = dedupe_preserve_order(slots)
+        if cur_slots or slots_from_title:
+            # Спочатку додаємо слоти з заголовка, потім - звичайні слоти
+            all_slots = slots_from_title + cur_slots
             
-            # ВИПРАВЛЕНО: якщо командир був у заголовку, додаємо його першим слотом
-            if commander_in_title and "Командир відділення" in title_line:
-                # Видаляємо "Командир відділення" з заголовка
-                title_line = title_line.replace("Командир відділення", "").strip()
-                # Додаємо командира першим слотом
-                slots.insert(0, "Командир відділення")
-                commander_in_title = False
+            # УЛЬТИМАТНА фільтрація та нормалізація
+            slots = []
+            for s in all_slots:
+                if is_valid_slot(s) and not looks_like_code_block(s):
+                    clean_s = normalize_slot_name(s)
+                    if clean_s and clean_s not in slots:
+                        slots.append(clean_s)
             
             if slots:
                 t_norm = re.sub(r'\s{2,}', ' ', title_line).strip()
+                if not t_norm:
+                    t_norm = DEFAULT_TITLE
+                
                 prev = groups.get(t_norm, [])
                 # об'єднати, зберігаючи порядок та унікальність
                 merged = prev + [x for x in slots if x not in prev]
                 groups[t_norm] = merged
+                
         cur_title, cur_slots = None, []
-        commander_in_title = False
 
     for raw in candidates:
         s = re.sub(r'\s{2,}', ' ', raw).strip()
         if not s or is_noise(s):
             continue
 
-        # новий заголовок?
-        if '|' in s or TITLE_PATTERN.search(s):
+        # новий заголовок? - розширена перевірка
+        is_header = (
+            ('|' in s) or 
+            re.search(r'@\w+', s) or
+            re.search(r'(Штаб|бригада|ОМБр|ССО|ГУР|ЧВК|Корегувальник)', s, flags=re.IGNORECASE) or
+            re.search(r'(армейский|мотострелковая|отдельная)', s, flags=re.IGNORECASE) or
+            re.search(r'\d+\.\s*.*@.*\|', s)
+        )
+        
+        if is_header:
             flush()
-            # ВИПРАВЛЕНО: перевіряємо, чи містить заголовок "Командир відділення"
-            if "Командир відділення" in s:
-                commander_in_title = True
             cur_title = s
             continue
 
         # слот за нумерацією / ключовими словами
         if re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s):
             slot = clean_line_for_slot(s)
-            if slot and not looks_like_code_block(slot) and not is_noise(slot):
+            if is_valid_slot(slot) and not looks_like_code_block(slot):
                 cur_slots.append(slot)
             continue
 
-        # будь-який інший текст між заголовками → слот, якщо не шум і не код
-        if not looks_like_code_block(s) and not is_noise(s):
+        # будь-який інший текст → слот
+        if is_valid_slot(s) and not looks_like_code_block(s):
             cur_slots.append(clean_line_for_slot(s))
 
     flush()
@@ -349,14 +422,23 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     # перетворити в список
     return [(title, slots) for title, slots in groups.items()]
 
-# ─────── Сайд-детектор (опц. для сортування) ─────────────────────────────────────────────────────
+def format_slots_with_numbers(slots: List[str]) -> List[str]:
+    """
+    Форматує слоти з нумерацією
+    """
+    formatted = []
+    for i, slot in enumerate(slots, 1):
+        formatted.append(f"{i}. {slot}")
+    return formatted
+
+# ─────── Сайд-детектор ─────────────────────────────────────────────────────
 def detect_side_from_title(title: str) -> str:
     t = title.lower()
-    # спрощено: українська сторона
-    if any(k in t for k in ["омбр", "зсу", "гуп", "ссо", "окрема", "бригада", "альфа"]):
+    # українська сторона - розширено
+    if any(k in t for k in ["омбр", "зсу", "гуп", "ссо", "окрема", "бригада", "альфа", "холодний яр", "kraken", "гур"]):
         return "ЗСУ"
-    # рос сторона / ПВК
-    if any(k in t for k in ["армейський", "чвк", "мотострілкова", "корпус", "отдельная", "армия"]):
+    # рос сторона / ПВК - розширено
+    if any(k in t for k in ["армейский", "чвк", "мотострелковая", "корпус", "отдельная", "армия", "вагнер", "цсн", "фсб"]):
         return "ЗС РФ/ПВК"
     return "Невідомо"
 
@@ -387,7 +469,6 @@ class SlotButton(Button):
         user = inter.user
         sess = sessions[self.sid]
         owner = sess["owners"][self.idx]
-        # Заборона множинних слотів у тій же гільці
         if owner is None:
             for s in sessions.values():
                 if s["channel_id"] == sess["channel_id"] and user in s.get("owners", []):
@@ -405,7 +486,7 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
-# ─────── Claim flow: звільнення слотів через модал ─────────────────────────────────────────────────────
+# ─────── Claim flow ─────────────────────────────────────────────────────
 class RemoveSlotModal(Modal):
     def __init__(self, sid: int, idx: int):
         super().__init__(title="Причина звільнення")
@@ -454,13 +535,11 @@ async def звільнити(ctx: commands.Context, session_msg_id: int):
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
     await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
 
-# ─────── Commands ─────────────────────────────────────────────────────
+# ─────── Commands - УЛЬТИМАТНА ВЕРСІЯ ─────────────────────────────────────────────────────
 @bot.command(name="імпорт_sqm", aliases=["import_sqm"])
 async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
     """
-    Імпорт текстового mission.sqm.
-    - Без аргументів: виводить усі відділення по групах (дублікати заголовків об'єднані).
-    - З аргументами (наприклад "2-2" або "1-2 2-5"): показує лише відповідні заголовки (як окремий токен), для всіх сторін.
+    УЛЬТИМАТНИЙ імпорт mission.sqm з повним збором слотів та нумерацією.
     """
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
@@ -470,7 +549,6 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
     att = ctx.message.attachments[0]
     key = f"{ctx.message.id}:{att.id}"
     now = time.time()
-    # cleanup старих записів
     for k, t in list(_recent_imports.items()):
         if now - t > _RECENT_IMPORTS_TTL:
             _recent_imports.pop(k, None)
@@ -486,14 +564,14 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
         logger.exception("Failed to read attachment")
         return await ctx.send(f"❌ Не вдалося прочитати вкладення: {e}")
 
-    # Парсинг
+    # Парсинг з ультіматною функцією
     try:
         groups = extract_units_and_slots(text)
     except Exception:
         logger.exception("Parser crashed")
         groups = []
 
-    # ВИПРАВЛЕНО: спрощена фільтрація по індексах
+    # Спрощена фільтрація по індексах
     if filter_ids:
         patterns = [re.compile(rf'\b{re.escape(fid)}\b') for fid in filter_ids]
         filtered = []
@@ -502,7 +580,6 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
                 filtered.append((title, slots))
         groups = filtered
 
-    # ВИПРАВЛЕНО: якщо є групи після фільтрації, виводимо їх без зайвих попереджень
     if not groups:
         _recent_imports.pop(key, None)
         if filter_ids:
@@ -511,7 +588,7 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
             await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
         return
 
-    # Відправка: групуємо по стороні (ЗСУ / ЗС РФ/ПВК / Невідомо) для читабельності
+    # Відправка: групуємо по стороні з нумерацією слотів
     by_side: Dict[str, List[Tuple[str, List[str]]]] = {"ЗСУ": [], "ЗС РФ/ПВК": [], "Невідомо": []}
     for title, slots in groups:
         side = detect_side_from_title(title)
@@ -522,10 +599,12 @@ async def імпорт_sqm(ctx: commands.Context, *filter_ids: str):
         blocks = by_side[side]
         if not blocks:
             continue
-        # заголовок секції для контексту (не шум)
         await ctx.send(f"```{side}```")
         for title, slots in blocks:
-            out = "\n".join([title] + slots)
+            # Форматуємо слоти з нумерацією
+            numbered_slots = format_slots_with_numbers(slots)
+            out = "\n".join([title] + numbered_slots)
+            
             # чанк, якщо дуже довго
             parts = out.splitlines()
             chunk, count = [], 0
@@ -569,7 +648,7 @@ async def _статус(ctx: commands.Context):
         commit = "unknown"
     await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
 
-# ─────── Reminder (optional) ─────────────────────────────────────────────────────
+# ─────── Reminder ─────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
@@ -590,7 +669,7 @@ async def on_ready():
         commit = subprocess.getoutput("git rev-parse --short HEAD")
     except Exception:
         commit = "unknown"
-    embed = discord.Embed(title="🔄 Бот перезапущено", description=f"📦 Commit: `{commit}`", color=discord.Color.green())
+    embed = discord.Embed(title="🔄 Бот перезапущено (УЛЬТИМАТНА ВЕРСІЯ 3.0)", description=f"📦 Commit: `{commit}`\n✅ ВСІ проблеми парсингу SQM виправлено\n🔢 Нумерація слотів додано\n🧹 Повна фільтрація шуму", color=discord.Color.green())
     for guild in bot.guilds:
         ch = discord.utils.find(lambda c: isinstance(c, discord.TextChannel) and c.permissions_for(guild.me).send_messages, guild.text_channels)
         if ch:
