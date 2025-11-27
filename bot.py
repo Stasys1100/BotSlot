@@ -3,14 +3,6 @@
 # об'єднання заголовків без втрати слотів, повний збір слотів між заголовками,
 # нумерація слотів (тільки якщо в місії немає власної нумерації),
 # UI для слотів, статус/деплой/нагадування, звільнення слотів.
-#
-# Зміни у цій версії:
-# - прибрано префікси сторін (ЗСУ/Невідомо) з виводу;
-# - заголовки очищуються від '@', мовних маркерів (ENG, RU тощо) та від провідних назв зброї;
-# - якщо назва зброї стоїть перед '@' (наприклад "(FN FAL)@Альфа 2-3"), вона переноситься в перший слот;
-# - якщо у слотах вже є нумерація (наприклад "2: ...", "3. ..."), бот не додає додаткову нумерацію;
-# - дублікати ролей зберігаються (якщо в відділенні два однакові слоти — це нормально);
-# - розширений багатомовний список SLOT_KEYWORDS.
 
 import os
 import re
@@ -298,18 +290,20 @@ def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
     повертає (title_without_weapon, weapon_text). Інакше weapon_text = None.
     """
     t = (title or "").strip()
-    # Pattern: optional leading "(...)" or bare token before '@' or before pipe
-    m = re.match(r'^\s*(\([^\)]+\)|[A-Za-z0-9\-\/\\\s]+?)\s*@', t)
+    # Pattern: leading "(...)" immediately before '@' or before pipe or before Alpha token
+    m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)', t)
     if m:
         weapon = m.group(1).strip()
-        # remove the matched weapon and optional '@'
-        rest = re.sub(re.escape(m.group(0)), '', t, count=1).strip()
+        rest = t.replace(m.group(0), '').strip()
         return rest, weapon
-    # also check pattern like "(FN FAL) Альфа 2-3 | ..." (no @)
-    m2 = re.match(r'^\s*(\([^\)]+\))\s+([^\|]+)', t)
+    # pattern like "FN FAL @Alpha" or "FN FAL | Alpha"
+    m2 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
     if m2:
         weapon = m2.group(1).strip()
-        rest = t[len(m2.group(1)):].strip()
+        rest = m2.group(2).strip()
+        # sanity: if weapon contains words like 'Альфа' then ignore
+        if re.search(r'\b(Альфа|Alpha)\b', weapon, flags=re.IGNORECASE):
+            return t, None
         return rest, weapon
     return t, None
 
@@ -320,20 +314,16 @@ def process_title_final(title: str) -> Tuple[str, List[str]]:
     - якщо в заголовку була назва зброї на початку, повертає її як слот (в slots_from_title);
     - витягує командирів із заголовка (але не 'Корегувальник').
     """
-    # First, extract leading weapon if present
     rest, weapon = extract_leading_weapon_and_strip(title)
     clean = strip_title_prefixes(rest)
 
     slots_from_title: List[str] = []
     if weapon:
-        # normalize weapon text and add as first slot (do not treat as header)
         w = weapon.strip()
-        # remove surrounding parentheses if any
         w = re.sub(r'^\(|\)$', '', w).strip()
         if w:
             slots_from_title.append(w)
 
-    # Commander patterns (do not include 'Корегувальник')
     commander_patterns = [
         (r'Командир відділення', 'Командир відділення'),
         (r'Командир отделения', 'Командир відділення'),
@@ -392,13 +382,12 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 if is_valid_slot(s) and not looks_like_code_block(s):
                     clean_s = normalize_slot_name(clean_line_for_slot(s))
                     if clean_s:
-                        # keep duplicates intentionally
                         slots.append(clean_s)
 
             if slots:
                 t_norm = normalize_group_title(title_line) or DEFAULT_TITLE
                 prev = groups.get(t_norm, [])
-                merged = prev + slots  # no dedupe
+                merged = prev + slots  # keep duplicates
                 groups[t_norm] = merged
 
         cur_title, cur_slots = None, []
@@ -439,13 +428,10 @@ def format_slots_with_numbers(slots: List[str]) -> List[str]:
     """
     if not slots:
         return []
-    # detect if first non-empty slot starts with numbering like "2:" or "2."
     for s in slots:
         if s and re.match(r'^\s*\d+[\.:]\s*', s):
-            # assume mission already numbered — return normalized slots (trim leading numbers)
             cleaned = [re.sub(r'^\s*\d+[\.:]\s*', '', x).strip() for x in slots]
             return cleaned
-    # otherwise add numbering
     return [f"{i+1}. {slot}" for i, slot in enumerate(slots, 1)]
 
 # ─────── Side detector (kept for internal grouping but not printed) ─────────────
@@ -562,7 +548,6 @@ async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, 
     """
     sent_titles = set()
     sent = 0
-    # зібрати всі блоки в один список
     all_blocks: List[Tuple[str, List[str]]] = []
     for blocks in grouped.values():
         all_blocks.extend(blocks)
@@ -627,7 +612,6 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
         logger.exception("Parser crashed")
         groups = []
 
-    # Normalize titles and ensure commander extraction does not swallow 'Корегувальник'
     normalized: Dict[str, List[str]] = {}
     for title, slots in groups:
         t_clean, slots_from_title = process_title_final(title)
@@ -640,7 +624,6 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
                 final_slots.append(normalize_slot_name(s2))
         normalized.setdefault(t_clean, []).extend(final_slots)
 
-    # If filter ids provided — exact match on cleaned title (e.g., "2-2")
     if filter_ids:
         pats = [re.compile(rf'\b{re.escape(fid)}\b', flags=re.IGNORECASE) for fid in filter_ids]
         filtered: Dict[str, List[str]] = {}
@@ -656,7 +639,6 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
             return await ctx.send(f"⚠️ Не знайдено відділень з індексами: {', '.join(filter_ids)}.")
         return await ctx.send("⚠️ Не знайдено відділень або слотів у цьому файлі.")
 
-    # Prepare structure for send_groups (single 'all' bucket)
     by_side_like: Dict[str, List[Tuple[str, List[str]]]] = {"all": []}
     for t, sl in normalized.items():
         by_side_like["all"].append((t, sl))
