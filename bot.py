@@ -1,9 +1,9 @@
-# bot.py — ВИПРАВЛЕНА ВЕРСІЯ v2
-# Виправлення:
-# 1. Видалення символу "@" з назв відділень
-# 2. Коректне перенесення зброї командира з назви відділення в слот командира
-# 3. Усунення дублювання "MED" та зброї
-# 4. Покращена логіка розпізнавання командира
+# bot.py — ВИПРАВЛЕНА ВЕРСІЯ v3 - ФІНАЛЬНА
+# Виправлення всіх критичних помилок:
+# 1. Видалення "@" та "\\" з назв відділень та слотів
+# 2. Видалення командира з заголовка і додавання його як перший слот
+# 3. Усунення дублювання "MED", зброї, та відділень
+# 4. Очищення роздільників "| |"
 
 import os
 import re
@@ -51,19 +51,20 @@ DEFAULT_TITLE = "Відділення"
 _recent_imports: Dict[str, float] = {}
 _RECENT_IMPORTS_TTL = 60.0
 
-# Slot keywords (multilingual, truncated to common roles)
+# Slot keywords (multilingual)
 SLOT_KEYWORDS = [
-    r'командир відділен', r'командир розрахун', r'командир екіпаж', r'командир сторони',
+    r'командир відділен', r'командир розрахун', r'командир екіпаж', r'командир сторони', r'командир взводу',
     r'старший стрілець', r'стрілець', r'гренадер', r'гранатометник', r'кулеметник',
     r'помічник кулеметника', r'помічник гранатометника', r'навідник', r'оператор-навідник',
     r'механік-вод', r'медик', r'санітар', r'оператор бпла', r'корегувальник',
-    r'снайпер', r'радист', r'інженер', r'водій', r'заряджаючий',
-    r'командир отделения', r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
+    r'снайпер', r'радист', r'інженер', r'водій', r'заряджаючий', r'пілот',
+    r'командир отделения', r'командир расчёта', r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
+    r'помощник пулемётчика', r'помощник гранатомётчика', r'наводчик-оператор', r'наводчик', r'механик-водитель',
+    r'второй-пилот', r'пилот',
     r'squad leader', r'team leader', r'rifleman', r'grenadier', r'machine gunner', r'medic',
-    r'drone operator', r'gunner', r'loader', r'driver', r'sniper',
+    r'drone operator', r'gunner', r'loader', r'driver', r'sniper', r'at gunner', r'comms sergeant',
     r'komandas vadītājs', r'pieredzējis šāvējs', r'ložmetējnieks', r'ložmetēja asistents',
-    r'granātnieks', r'granātnieka asistents', r'mediķis', r'šāvējs',
-    r'помощник пулемётчика', r'помощник гранатомётчика', r'наводчик-оператор'
+    r'granātnieks', r'granātnieka asistents', r'mediķis', r'šāvējs'
 ]
 
 SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', flags=re.IGNORECASE)
@@ -137,11 +138,13 @@ def looks_like_code_block(s: str) -> bool:
         return True
     if re.search(r'\\n|\\r|\\t', s):
         return True
-    if re.search(r'[{}()\[\];=<>!|&\\]', s) and len(re.findall(r'[A-Za-zА-Яа-яЁёЇїІіЄєҐґ]', s)) < 5:
+    if re.search(r'[{}()\[\];=<>!|&\\]', s) and len(re.findall(r'[A-Za-zА-Яа-яЁёЏїІіЄєҐґ]', s)) < 5:
         return True
     return False
 
 def normalize_pipes(s: str) -> str:
+    # Remove empty pipe sections
+    s = re.sub(r'\|\s*\|', '|', s)
     s = re.sub(r'\s*\|\s*', ' | ', s)
     s = re.sub(r'(?:\s*\|\s*){2,}', ' | ', s)
     s = re.sub(r'^\s*\|\s*', '', s)
@@ -154,24 +157,37 @@ def clean_line_for_slot(s: str) -> str:
     s = extract_structured_text(s)
     s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
     
+    # Remove backslashes used as separators
+    s = re.sub(r'\\', ' ', s)
+    
     # Remove language tags
     s = re.sub(r'\s*\|\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO|LV)\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\s+(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO|LV)\b', '', s, flags=re.IGNORECASE)
     
-    # Normalize MED variants to single MED
-    s = re.sub(r'\b(MED|МЕД|Медик|Mediķis|Санітар|Санитар|Польовий медик)\b', 'MED', s, flags=re.IGNORECASE)
+    # Normalize MED variants
+    s = re.sub(r'\b(MED|МЕД|Медик|Mediķis|Medic|Санітар|Санитар|Польовий медик)\b', 'MED', s, flags=re.IGNORECASE)
     
     # Remove duplicate MED patterns
     s = re.sub(r'\bMED\s*\\?\s*MED\b', 'MED', s, flags=re.IGNORECASE)
     s = re.sub(r'\bMED\s+MED\b', 'MED', s, flags=re.IGNORECASE)
     
-    # Remove duplicate weapons in parentheses
-    s = re.sub(r'\(([^)]+)\)\s*\(\1\)', r'(\1)', s)
+    # Remove duplicate weapons in parentheses: (G36A3) (G36A3\AG-40) -> (G36A3\AG-40)
+    # Find all weapons in parentheses
+    weapons = re.findall(r'\([^)]+\)', s)
+    if len(weapons) > 1:
+        # Keep only the most detailed one (longest)
+        longest_weapon = max(weapons, key=len)
+        # Remove all weapons
+        for w in weapons:
+            s = s.replace(w, '', 1)
+        # Add back the longest one
+        s = s.strip() + ' ' + longest_weapon
     
     s = normalize_pipes(s)
     
-    # Ensure MED is separated by pipe
-    s = re.sub(r'\s+MED$', ' | MED', s)
+    # Ensure MED is separated by pipe if it's at the end
+    s = re.sub(r'\s+MED\s*$', ' | MED', s)
+    
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'')
     
     return s
@@ -189,44 +205,45 @@ def decode_bytes(raw: bytes) -> str:
     except Exception:
         return raw.decode("cp1251", errors="replace")
 
-# Title cleaning and weapon extraction - IMPROVED v2
+# Title cleaning - IMPROVED v3
 def strip_title_prefixes(title: str) -> str:
     t = (title or "").strip()
-    # Remove @ tokens anywhere in the title
+    
+    # Remove @ tokens anywhere
     t = re.sub(r'@[^\s|]+', '', t)
+    
+    # Remove backslashes
+    t = re.sub(r'\\+', ' ', t)
+    
     # Remove leading numbers
     t = re.sub(r'^\s*\d+\s*[\.\:]\s*', '', t)
+    
     # Remove language codes
     t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO|LV)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^[A-Za-zА-Яа-я]\s*\|\s*', '', t)
-    # Remove leading @ if still present
-    if t.startswith('@'):
-        t = t[1:].strip()
+    
     t = re.sub(r'^\s*\|\s*[A-Z]{2,}\s*', '', t)
-    t = re.sub(r'\s{2,}', ' ', t).strip(' |')
-    # Remove trailing pipes
+    t = re.sub(r'\s{2,}', ' ', t).strip(' |@\\')
     t = re.sub(r'\s*\|\s*$', '', t)
+    
     return t
 
 def extract_commander_and_weapon_from_title(title: str) -> Tuple[str, Optional[str], Optional[str]]:
     """
     Extract commander role and weapon from title.
     Returns: (clean_title, commander_slot, weapon)
-    
-    Handles patterns like:
-    - "Командир взводу (АКМС) @Альфа 1-1 | ..."
-    - "Komandas vadītājs (G36A3 AG-40) @Alpha 1-4 | ..."
     """
     t = (title or "").strip()
     commander_slot = None
     weapon = None
     
-    # Commander patterns with multilingual support
+    # Commander patterns
     commander_patterns = [
         (r'Komandas vadītājs', 'Командир відділення'),
         (r'Командир взводу', 'Командир взводу'),
         (r'Командир відділення', 'Командир відділення'),
         (r'Командир отделения', 'Командир відділення'),
+        (r'Командир расчёта', 'Командир розрахунку'),
         (r'Командир сторони', 'Командир сторони'),
         (r'Командир стороны', 'Командир сторони'),
         (r'Командир розрахун', 'Командир розрахунку'),
@@ -238,37 +255,34 @@ def extract_commander_and_weapon_from_title(title: str) -> Tuple[str, Optional[s
         (r'Vehicle Commander', 'Vehicle Commander'),
     ]
     
-    # Try to find commander with weapon pattern: "Commander (Weapon) @..."
+    # Try to find commander with weapon: "Commander (Weapon)"
     for pat, slot_name in commander_patterns:
-        # Pattern: "Commander (Weapon) @Index"
-        m = re.search(rf'{pat}\s*\(([^)]+)\)\s*(?:@|\\)', t, flags=re.IGNORECASE)
+        # Pattern with weapon
+        m = re.search(rf'{pat}\s*\(([^)]+)\)', t, flags=re.IGNORECASE)
         if m:
             commander_slot = slot_name
             weapon = m.group(1).strip()
             # Remove commander and weapon from title
-            t = re.sub(rf'{pat}\s*\([^)]+\)\s*', '', t, flags=re.IGNORECASE)
+            t = re.sub(rf'{pat}\s*\([^)]+\)', '', t, flags=re.IGNORECASE)
             break
         
-        # Pattern: "Commander @Index" (no weapon in title)
-        m2 = re.search(rf'{pat}\s*(?:@|\\)', t, flags=re.IGNORECASE)
+        # Pattern without weapon
+        m2 = re.search(rf'{pat}(?:\s|$)', t, flags=re.IGNORECASE)
         if m2:
             commander_slot = slot_name
             # Remove commander from title
-            t = re.sub(rf'{pat}\s*', '', t, flags=re.IGNORECASE)
+            t = re.sub(rf'{pat}', '', t, flags=re.IGNORECASE)
             break
     
-    # Clean up the title
+    # Clean up
     t = strip_title_prefixes(t)
-    t = re.sub(r'\s{2,}', ' ', t).strip(' |@')
+    t = re.sub(r'\s{2,}', ' ', t).strip(' |@\\')
     
     return t or DEFAULT_TITLE, commander_slot, weapon
 
 def process_title_final(title: str) -> Tuple[str, List[str], Optional[str]]:
     """
-    Process title to extract:
-    1. Clean title without weapon and commander role
-    2. Commander slot (if found in title)
-    3. Weapon (if found in title)
+    Process title to extract clean title, commander slot, and weapon.
     """
     clean_title, commander_slot, weapon = extract_commander_and_weapon_from_title(title)
     
@@ -283,9 +297,12 @@ def canonical_slot_for_compare(s: str) -> str:
     if not s:
         return ""
     t = s
+    # Remove weapons
     t = re.sub(r'\([^)]*\)', '', t)
+    # Remove MED
     t = re.sub(r'\b\|\s*MED\b', '', t, flags=re.IGNORECASE)
     t = re.sub(r'\bMED\b', '', t, flags=re.IGNORECASE)
+    # Remove special chars
     t = re.sub(r'[^A-Za-z0-9\u0400-\u04FF\s\-]', '', t)
     t = re.sub(r'\s{2,}', ' ', t).strip().lower()
     return t
@@ -299,7 +316,7 @@ def canonical_title_for_compare(t: str) -> str:
     x = re.sub(r'\s{2,}', ' ', x).strip().lower()
     return x
 
-# Parser - IMPROVED v2
+# Parser - IMPROVED v3
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -318,34 +335,40 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 
     def flush():
         nonlocal cur_title, cur_slots
-        if cur_title is None and cur_slots:
-            title_line, slots_from_title, weapon = DEFAULT_TITLE, [], None
-        else:
-            title_line, slots_from_title, weapon = process_title_final(cur_title or DEFAULT_TITLE)
+        if cur_title is None and not cur_slots:
+            return
+            
+        title_line, slots_from_title, weapon = process_title_final(cur_title or DEFAULT_TITLE)
 
         if cur_slots or slots_from_title:
             all_slots = slots_from_title + cur_slots
             slots: List[str] = []
+            
             for s in all_slots:
                 if is_valid_slot(s) and not looks_like_code_block(s):
                     clean_s = normalize_slot_name(clean_line_for_slot(s))
                     if clean_s:
                         slots.append(clean_s)
 
-            # Add weapon to first slot (commander) if weapon exists
+            # Add weapon to first slot (commander) if weapon exists and slots exist
             if weapon and slots:
-                # Check if weapon already in first slot
-                if not re.search(r'\([^)]*' + re.escape(weapon) + r'[^)]*\)', slots[0]):
+                # Check if weapon not already in first slot
+                if not re.search(r'\([^)]*\)', slots[0]):
                     slots[0] = f"{slots[0]} ({weapon})"
 
             if slots:
                 t_norm = strip_title_prefixes(title_line) or DEFAULT_TITLE
+                
+                # Deduplicate by canonical form
                 key_title = canonical_title_for_compare(t_norm)
                 key_slots = tuple(canonical_slot_for_compare(x) for x in slots)
+                canonical_key = (key_title, key_slots)
 
+                # Check if this exact squad already exists
                 exists = False
-                for existing_title, existing_slots in list(groups.items()):
+                for existing_title in list(groups.keys()):
                     if canonical_title_for_compare(existing_title) == key_title:
+                        existing_slots = groups[existing_title]
                         existing_canonical = tuple(canonical_slot_for_compare(x) for x in existing_slots)
                         if existing_canonical == key_slots:
                             exists = True
@@ -370,6 +393,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
         if not s or is_noise(s):
             continue
 
+        # Check if this is a header line
         has_index = re.search(r'\b(Альфа|Alpha)\s*\d+-\d+\b', s, flags=re.IGNORECASE) is not None
         is_header = ('|' in s and has_index) and not (re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s))
 
@@ -378,12 +402,14 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             cur_title = s
             continue
 
+        # Check if this is a slot line
         if re.match(r'^\s*\d+\.\s*', s) or TRIGGER_RE.match(s) or SLOT_RE.search(s):
             slot = clean_line_for_slot(s)
             if is_valid_slot(slot) and not looks_like_code_block(slot):
                 cur_slots.append(slot)
             continue
 
+        # Otherwise treat as potential slot
         if is_valid_slot(s) and not looks_like_code_block(s):
             cur_slots.append(clean_line_for_slot(s))
 
@@ -394,7 +420,8 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 def format_slots_with_numbers(slots: List[str]) -> List[str]:
     if not slots:
         return []
-    # detect explicit numbers
+    
+    # Parse existing numbers
     numbers = []
     parsed = []
     for s in slots:
@@ -405,22 +432,23 @@ def format_slots_with_numbers(slots: List[str]) -> List[str]:
             parsed.append((num, m.group(2).strip()))
         else:
             parsed.append((None, s.strip()))
+    
+    # If we have explicit numbers, use them
     if numbers:
         min_num = min(numbers)
+        # If first slot has no number, assign it
         if parsed[0][0] is None:
-            assign = max(1, min_num - 1)
+            assign = 1
             used = set(numbers)
-            if assign in used:
-                i = 1
-                while i in used:
-                    i += 1
-                assign = i
+            while assign in used:
+                assign += 1
             parsed[0] = (assign, parsed[0][1])
             numbers.append(assign)
-            numbers.sort()
+        
         result = []
-        used_nums = set(n for n in numbers)
-        next_num = min_num
+        used_nums = set(numbers)
+        next_num = 1
+        
         for num, text in parsed:
             if num is not None:
                 result.append(f"{num}. {text}")
@@ -431,6 +459,8 @@ def format_slots_with_numbers(slots: List[str]) -> List[str]:
                 used_nums.add(next_num)
                 next_num += 1
         return result
+    
+    # No explicit numbers, just number sequentially from 1
     return [f"{i+1}. {slot.strip()}" for i, slot in enumerate(slots)]
 
 # UI helpers
@@ -535,11 +565,14 @@ async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, 
     all_blocks: List[Tuple[str, List[str]]] = []
     for blocks in grouped.values():
         all_blocks.extend(blocks)
+    
     for title, slots in all_blocks:
+        # Create canonical key for deduplication
         key = (canonical_title_for_compare(title), tuple(canonical_slot_for_compare(x) for x in slots))
         if key in sent_keys:
             continue
         sent_keys.add(key)
+        
         numbered = format_slots_with_numbers(slots)
         out = "\n".join([title] + numbered)
         lines = out.splitlines()
@@ -596,11 +629,13 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
         t_clean = strip_title_prefixes(t_clean or DEFAULT_TITLE)
         all_slots = slots_from_title + slots
         final_slots: List[str] = []
+        
         for s in all_slots:
             s2 = clean_line_for_slot(s)
             if s2 and not is_noise(s2) and not looks_like_code_block(s2):
                 final_slots.append(normalize_slot_name(s2))
 
+        # Deduplicate
         key_title = canonical_title_for_compare(t_clean)
         key_slots = tuple(canonical_slot_for_compare(x) for x in final_slots)
         canonical_key = (key_title, key_slots)
@@ -609,6 +644,7 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
             continue
 
         seen_canonical.add(canonical_key)
+        
         if t_clean in normalized:
             idx = 2
             new_key = f"{t_clean} ({idx})"
@@ -642,7 +678,7 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
     _recent_imports.pop(key, None)
     await ctx.send(f"✅ Готово. Опубліковано відділень: {sent}.")
 
-# Admin commands, reminders, events
+# Admin commands
 @bot.command(name="стоп", aliases=["stop"])
 async def стоп(ctx: commands.Context):
     global _stop_sending_global, _stop_sending_by_channel
