@@ -446,7 +446,9 @@ class RemoveSlotButton(Button):
 class RemoveSlotView(View):
     def __init__(self, sid: int):
         super().__init__(timeout=None)
-        # ─────── Admin UI command ───────────────────────────────────────────────
+        for idx in range(len(sessions[sid]["lines"])):
+            self.add_item(RemoveSlotButton(sid, idx))
+            # ─────── Admin UI command ───────────────────────────────────────────────
 @bot.command(name="звільнити")
 async def звільнити(ctx: commands.Context, session_msg_id: int):
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -691,5 +693,3 @@ if not TOKEN:
     logger.error("DISCORD_TOKEN not set in environment")
     raise SystemExit(1)
 bot.run(TOKEN)
-        for idx in range(len(sessions[sid]["lines"])):
-            self.add_item(RemoveSlotButton(sid, idx))
