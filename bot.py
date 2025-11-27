@@ -1,7 +1,9 @@
-# bot.py — ОСТАННЯ ФІНАЛЬНА ВЕРСІЯ
-# Мета: імпорт mission.sqm, очищення заголовків, перенесення назви зброї у перший слот,
-# коректна нумерація слотів (включно з командиром), уникнення дублювання, нормалізація пайпів/MED,
-# UI для слотів, статус/деплой/нагадування, звільнення слотів.
+# bot.py — ВИПРАВЛЕНА ВЕРСІЯ
+# Виправлення:
+# 1. Видалення символу "@" з назв відділень
+# 2. Коректне перенесення зброї командира з назви відділення в слот командира
+# 3. Усунення дублювання "MED"
+# 4. Покращена нормалізація слотів
 
 import os
 import re
@@ -58,7 +60,9 @@ SLOT_KEYWORDS = [
     r'снайпер', r'радист', r'інженер', r'водій', r'заряджаючий',
     r'командир отделения', r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
     r'squad leader', r'team leader', r'rifleman', r'grenadier', r'machine gunner', r'medic',
-    r'drone operator', r'gunner', r'loader', r'driver', r'sniper'
+    r'drone operator', r'gunner', r'loader', r'driver', r'sniper',
+    r'komandas vadītājs', r'pieredzējis šāvējs', r'ložmetējnieks', r'ložmetēja asistents',
+    r'granātnieks', r'granātnieka asistents', r'mediķis', r'šāvējs'
 ]
 
 SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', flags=re.IGNORECASE)
@@ -148,10 +152,15 @@ def clean_line_for_slot(s: str) -> str:
     s = strip_quotes_semicolons(s)
     s = extract_structured_text(s)
     s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
-    s = re.sub(r'\s+\|\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
-    s = re.sub(r'\s+(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
-    s = re.sub(r'\b(MED|МЕД|Медик|Польовий медик)\b', 'MED', s, flags=re.IGNORECASE)
+    # Remove language tags
+    s = re.sub(r'\s*\|\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO|LV)\b', '', s, flags=re.IGNORECASE)
+    s = re.sub(r'\s+(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO|LV)\b', '', s, flags=re.IGNORECASE)
+    # Normalize MED - avoid duplication
+    s = re.sub(r'\b(MED|МЕД|Медик|Mediķis|Польовий медик)\b', 'MED', s, flags=re.IGNORECASE)
+    # Remove duplicate MED
+    s = re.sub(r'\bMED\s+MED\b', 'MED', s, flags=re.IGNORECASE)
     s = normalize_pipes(s)
+    # Ensure MED is separated by pipe
     s = re.sub(r'\s+MED$', ' | MED', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'')
     return s
@@ -169,69 +178,90 @@ def decode_bytes(raw: bytes) -> str:
     except Exception:
         return raw.decode("cp1251", errors="replace")
 
-# Title cleaning and weapon extraction
+# Title cleaning and weapon extraction - IMPROVED
 def strip_title_prefixes(title: str) -> str:
     t = (title or "").strip()
-    # remove any @... tokens (e.g., "@Alpha 1-1") anywhere
-    t = re.sub(r'@[^|\n]+', '', t)
+    # Remove @ tokens anywhere in the title
+    t = re.sub(r'@[^\s|]+', '', t)
+    # Remove leading numbers
     t = re.sub(r'^\s*\d+\s*[\.\:]\s*', '', t)
-    t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
+    # Remove language codes
+    t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO|LV)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^[A-Za-zА-Яа-я]\s*\|\s*', '', t)
+    # Remove leading @ if still present
     if t.startswith('@'):
         t = t[1:].strip()
     t = re.sub(r'^\s*\|\s*[A-Z]{2,}\s*', '', t)
     t = re.sub(r'\s{2,}', ' ', t).strip(' |')
-    # remove stray trailing pipes
+    # Remove trailing pipes
     t = re.sub(r'\s*\|\s*$', '', t)
     return t
 
 def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
     """
-    Robust extraction:
-    - If there's a parenthetical weapon anywhere before an '@' or before a '|' that looks like part of the header,
-      extract that parenthetical as weapon and remove it from title.
-    - Otherwise, if the title starts with a parenthetical weapon, extract it.
-    - Otherwise, if pattern like 'WEAPON @Alpha' or 'WEAPON | Alpha' exists, extract leading token as weapon.
+    Enhanced extraction that handles patterns like:
+    - "Komandas vadītājs (G36A3 AG-40) @Alpha 1-4"
+    - "Командир (АКМС) | ENG @Альфа 2-3"
+    - "(FN FAL) @Alpha 1-1"
     """
     t = (title or "").strip()
-    # If there's an '@' or '|' indicating index, try to find parentheses before it
-    sep_pos = None
-    m_sep = re.search(r'(@| \| )', t)
-    if m_sep:
-        sep_pos = m_sep.start()
-    if sep_pos is not None:
-        left = t[:sep_pos]
-        # find last parenthetical in left
-        m_par = re.search(r'\([^\)]*\)\s*$', left)
-        if m_par:
-            weapon = m_par.group(0).strip()
-            rest = (t[:m_par.start()] + t[sep_pos:]).strip()
-            # remove any leading separators from rest
-            rest = re.sub(r'^[\s@|:,-]+', '', rest).strip()
+    weapon = None
+    
+    # Pattern 1: Extract weapon in parentheses before @ or |
+    # This handles: "Role (Weapon) @Index" or "Role (Weapon) | Description"
+    m = re.search(r'([^\(\)]+?)\s*\(([^\)]+)\)\s*(?:@|\\|\|)', t)
+    if m:
+        role_part = m.group(1).strip()
+        weapon = f"({m.group(2).strip()})"
+        # Check if role_part looks like a commander role
+        commander_patterns = [
+            r'командир', r'komandas vadītājs', r'squad leader', 
+            r'team leader', r'crew commander', r'vehicle commander'
+        ]
+        is_commander = any(re.search(p, role_part, flags=re.IGNORECASE) for p in commander_patterns)
+        
+        if is_commander:
+            # Remove the role and weapon from title, keep the rest
+            rest = t.replace(m.group(0), '').strip()
+            # Clean up any leading separators
+            rest = re.sub(r'^[@|:\s]+', '', rest).strip()
             return rest, weapon
-    # fallback: leading parenthetical
-    m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)?', t)
-    if m and m.group(1):
-        weapon = m.group(1).strip()
-        rest = t.replace(m.group(1), '').strip()
-        rest = re.sub(r'^\s*@\S+', '', rest).strip()
-        return rest, weapon
-    # fallback: leading token before @ or |
-    m2 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
+    
+    # Pattern 2: Weapon at the very beginning
+    m2 = re.match(r'^\s*\(([^\)]+)\)\s*(?:@|\\|\|)', t)
     if m2:
-        weapon = m2.group(1).strip()
-        rest = m2.group(2).strip()
-        if re.search(r'\b(Альфа|Alpha)\b', weapon, flags=re.IGNORECASE):
-            return t, None
+        weapon = f"({m2.group(1).strip()})"
+        rest = t[m2.end():].strip()
+        rest = re.sub(r'^[@|:\s]+', '', rest).strip()
         return rest, weapon
+    
+    # Pattern 3: Leading token before @ or | (without parentheses)
+    m3 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
+    if m3:
+        potential_weapon = m3.group(1).strip()
+        rest = m3.group(2).strip()
+        # Check if it's not a squad identifier
+        if not re.search(r'\b(Альфа|Alpha|Браво|Bravo)\b', potential_weapon, flags=re.IGNORECASE):
+            weapon = potential_weapon
+            return rest, weapon
+    
     return t, None
 
 def process_title_final(title: str) -> Tuple[str, List[str], Optional[str]]:
+    """
+    Process title to extract:
+    1. Clean title without weapon and commander role
+    2. Commander slot (if found in title)
+    3. Weapon (if found in title)
+    """
     rest, weapon = extract_leading_weapon_and_strip(title)
     clean = strip_title_prefixes(rest)
 
     slots_from_title: List[str] = []
+    
+    # Commander patterns with multilingual support
     commander_patterns = [
+        (r'Komandas vadītājs', 'Командир відділення'),
         (r'Командир відділення', 'Командир відділення'),
         (r'Командир отделения', 'Командир відділення'),
         (r'Командир сторони', 'Командир сторони'),
@@ -244,13 +274,14 @@ def process_title_final(title: str) -> Tuple[str, List[str], Optional[str]]:
         (r'Crew Commander', 'Crew Commander'),
         (r'Vehicle Commander', 'Vehicle Commander'),
     ]
+    
     for pat, slot_name in commander_patterns:
         if re.search(pat, clean, flags=re.IGNORECASE):
             clean = re.sub(pat, '', clean, flags=re.IGNORECASE).strip()
             slots_from_title.append(slot_name)
             break
 
-    clean = re.sub(r'\s{2,}', ' ', clean).strip(' |')
+    clean = re.sub(r'\s{2,}', ' ', clean).strip(' |@')
     return clean or DEFAULT_TITLE, slots_from_title, weapon
 
 # Canonicalization for dedupe
@@ -274,7 +305,7 @@ def canonical_title_for_compare(t: str) -> str:
     x = re.sub(r'\s{2,}', ' ', x).strip().lower()
     return x
 
-# Parser
+# Parser - IMPROVED
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -311,15 +342,14 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                     if clean_s:
                         slots.append(clean_s)
 
-            if weapon:
+            # Add weapon to first slot (commander)
+            if weapon and slots:
                 w = re.sub(r'^\(|\)$', '', weapon).strip()
                 if w:
-                    if slots:
-                        # ensure weapon appended to first slot (commander)
-                        if w not in slots[0]:
-                            slots[0] = f"{slots[0]} ({w})"
-                    else:
-                        slots.append(w)
+                    # Check if weapon already in first slot
+                    if w not in slots[0]:
+                        # Add weapon in parentheses format
+                        slots[0] = f"{slots[0]} ({w})"
 
             if slots:
                 t_norm = strip_title_prefixes(title_line) or DEFAULT_TITLE
@@ -420,7 +450,7 @@ def format_slots_with_numbers(slots: List[str]) -> List[str]:
                 used_nums.add(next_num)
                 next_num += 1
         return result
-    return [f"{i+1}. {slot.strip()}" for i, slot in enumerate(slots, 1)]
+    return [f"{i+1}. {slot.strip()}" for i, slot in enumerate(slots)]
 
 # UI helpers
 def build_embed(sess: dict) -> discord.Embed:
