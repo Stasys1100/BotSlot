@@ -1,4 +1,11 @@
-# bot.py — ОНОВЛЕНИЙ (фінальний патч: жорстка дедуплікація + покращений фільтр)
+# bot.py — Final stable version with stronger deduplication and header handling
+# - Robust parsing of mission.sqm
+# - Removes @-markers
+# - Moves weapon from title into first slot (commander)
+# - Preserves/normalizes numbering
+# - Strong deduplication (removes repeated identical blocks)
+# - Avoids duplicate candidate lines when extracting from SQM
+
 import os
 import re
 import html
@@ -13,6 +20,7 @@ import discord
 from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
+from collections import OrderedDict
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("botslot")
@@ -139,6 +147,7 @@ def strip_title_prefixes(title: str) -> str:
 
 def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
     t = (title or "").strip()
+    # try parenthetical before @ or |
     m_sep = re.search(r'(@|\|)', t)
     if m_sep:
         left = t[:m_sep.start()]
@@ -148,12 +157,14 @@ def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
             rest = (t[:m_par.start()] + t[m_sep.start():]).strip()
             rest = re.sub(r'^[\s@|:,-]+', '', rest).strip()
             return rest, weapon
+    # leading parenthetical
     m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)?', t)
     if m and m.group(1):
         weapon = m.group(1).strip()
         rest = t.replace(m.group(1), '').strip()
         rest = re.sub(r'^\s*@\S+', '', rest).strip()
         return rest, weapon
+    # leading token before @ or |
     m2 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
     if m2:
         weapon = m2.group(1).strip()
@@ -225,16 +236,30 @@ def clean_line_for_slot(s: str) -> str:
 
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
-    candidates = [html.unescape(m.group(1)).strip()
-                  for m in re.finditer(r'(?:description|value)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE)]
-    candidates += [html.unescape(m).strip()
-                   for m in re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL)]
-    if not candidates:
-        candidates = [line.strip() for line in text.split('\n') if line.strip()]
+
+    # Collect candidates but avoid duplicates at source (same string twice)
+    seen_candidates = OrderedDict()
+    for m in re.finditer(r'(?:description|value)\s*=\s*"([^"]+)"', text, flags=re.IGNORECASE):
+        val = html.unescape(m.group(1)).strip()
+        if val:
+            seen_candidates[val] = None
+    for m in re.findall(r'<\s*t\b[^>]*>(.*?)<\s*/\s*t\s*>', text, flags=re.IGNORECASE | re.DOTALL):
+        val = html.unescape(m).strip()
+        if val:
+            seen_candidates[val] = None
+
+    # fallback: split lines but dedupe identical lines
+    if not seen_candidates:
+        for line in text.splitlines():
+            ln = line.strip()
+            if ln:
+                seen_candidates[ln] = None
+
+    candidates = list(seen_candidates.keys())
     if not candidates:
         return []
 
-    groups: Dict[str, List[str]] = {}
+    groups: Dict[str, List[str]] = OrderedDict()
     cur_title: Optional[str] = None
     cur_slots: List[str] = []
     pending_weapon: Optional[str] = None
@@ -269,10 +294,10 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
 
             if slots:
                 t_norm = strip_title_prefixes(title_line) or DEFAULT_TITLE
-                # dedupe by canonical key at insertion
                 key_title = canonical_title_for_compare(t_norm)
                 key_slots = tuple(canonical_slot_for_compare(x) for x in slots)
 
+                # dedupe by canonical key
                 exists = False
                 for existing_title, existing_slots in list(groups.items()):
                     if canonical_title_for_compare(existing_title) == key_title:
@@ -309,7 +334,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             continue
 
         if cur_title and not cur_slots:
-            if re.fullmatch(r'[\(\)A-Za-z0-9\-\s\/\\\+]{2,60}', s) and not SLOT_RE.search(s) and len(s) <= 60:
+            if re.fullmatch(r'[\(\)A-Za-z0-9\-\s\/\\\+]{2,80}', s) and not SLOT_RE.search(s) and len(s) <= 80:
                 pending_weapon = s
                 continue
 
@@ -325,21 +350,23 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     flush()
     return [(title, slots) for title, slots in groups.items()]
 
-# ---------- Unique canonical map builder (fixes duplicate outputs) ----------
-def build_canonical_map(parsed: List[Tuple[str, List[str]]]) -> Dict[Tuple[str, Tuple[str, ...]], Tuple[str, List[str]]]:
-    """
-    Returns mapping canonical_key -> (display_title, slots)
-    canonical_key = (canonical_title, tuple(canonical_slot_for_compare(slot) ...))
-    Ensures unique canonical entries only.
-    """
-    cmap: Dict[Tuple[str, Tuple[str, ...]], Tuple[str, List[str]]] = {}
+# ---------- Build canonical map (strong dedupe) ----------
+def build_canonical_map(parsed: List[Tuple[str, List[str]]]) -> "OrderedDict[Tuple[str, Tuple[str,...]], Tuple[str, List[str]]]":
+    cmap: "OrderedDict[Tuple[str, Tuple[str,...]], Tuple[str, List[str]]]" = OrderedDict()
+    seen_display: set = set()
     for title, slots in parsed:
         display_title = strip_title_prefixes(title) or DEFAULT_TITLE
         canonical_title = canonical_title_for_compare(display_title)
         canonical_slots = tuple(canonical_slot_for_compare(s) for s in slots)
         key = (canonical_title, canonical_slots)
-        if key not in cmap:
-            cmap[key] = (display_title, slots)
+        if key in cmap:
+            continue
+        # also avoid exact duplicate display_title + identical slots even if canonicalization slightly differs
+        display_key = (display_title, tuple(slots))
+        if display_key in seen_display:
+            continue
+        seen_display.add(display_key)
+        cmap[key] = (display_title, slots)
     return cmap
 
 # ---------- Numbering and output ----------
@@ -398,7 +425,7 @@ def matches_filter(title: str, fid: str) -> bool:
         return True
     return False
 
-async def send_groups(ctx: commands.Context, canonical_map: Dict[Tuple[str, Tuple[str, ...]], Tuple[str, List[str]]]):
+async def send_groups(ctx: commands.Context, canonical_map: "OrderedDict[Tuple[str, Tuple[str,...]], Tuple[str, List[str]]]"):
     sent = 0
     for (canon_title, canon_slots), (display_title, slots) in canonical_map.items():
         numbered = format_slots_with_numbers(slots)
@@ -535,11 +562,9 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
     except Exception:
         logger.exception("Parser crashed")
         parsed = []
-    # build canonical map to ensure unique canonical entries
-    canonical_map = build_canonical_map(parsed)  # key -> (display_title, slots)
-    # apply filter if provided
+    canonical_map = build_canonical_map(parsed)
     if filter_ids:
-        filtered_map = {}
+        filtered_map = OrderedDict()
         for key, (display_title, slots) in canonical_map.items():
             title_for_match = strip_title_prefixes(display_title)
             if any(matches_filter(title_for_match, fid) for fid in filter_ids):
