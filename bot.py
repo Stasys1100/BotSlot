@@ -1,6 +1,6 @@
-# bot.py — ОСТАННЯ ВЕРСІЯ (виправлення нумерації першого слота та додавання зброї командиру)
-# Discord бот: імпорт mission.sqm, фільтрація шуму, збір слотів, нумерація (тільки якщо потрібно),
-# уникнення дублювання, нормалізація заголовків, перенесення назви зброї у перший слот,
+# bot.py — ОСТАННЯ ФІНАЛЬНА ВЕРСІЯ
+# Мета: імпорт mission.sqm, очищення заголовків, перенесення назви зброї у перший слот,
+# коректна нумерація слотів (включно з командиром), уникнення дублювання, нормалізація пайпів/MED,
 # UI для слотів, статус/деплой/нагадування, звільнення слотів.
 
 import os
@@ -20,11 +20,11 @@ from discord.ext import commands, tasks
 from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 
-# ─────── Logging ─────────────────────────────────────────────────────
+# Logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("botslot")
 
-# ─────── ENV / INIT ─────────────────────────────────────────────────────
+# Env
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
@@ -49,83 +49,50 @@ DEFAULT_TITLE = "Відділення"
 _recent_imports: Dict[str, float] = {}
 _RECENT_IMPORTS_TTL = 60.0
 
-# ─────── SLOT KEYWORDS (multi-language) ───────────────────────────────────────────────
+# Slot keywords (multilingual, truncated to common roles)
 SLOT_KEYWORDS = [
     r'командир відділен', r'командир розрахун', r'командир екіпаж', r'командир сторони',
     r'старший стрілець', r'стрілець', r'гренадер', r'гранатометник', r'кулеметник',
     r'помічник кулеметника', r'помічник гранатометника', r'навідник', r'оператор-навідник',
     r'механік-вод', r'медик', r'санітар', r'оператор бпла', r'корегувальник',
-    r'снайпер', r'спостерігач', r'радист', r'інженер', r'водій', r'заряджаючий',
-
-    r'командир отделения', r'командир расч', r'командир экипаж', r'командир стороны',
-    r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
-    r'помощник пулемётчика', r'помощник гранатомётчика', r'наводчик',
-    r'механик-водитель', r'санитар', r'оператор бпла', r'снайпер', r'наблюдатель',
-    r'связист', r'инженер', r'водитель', r'заряжающий',
-
-    r'squad leader', r'team leader', r'automatic rifleman', r'rifleman', r'grenadier',
-    r'designated marksman', r'at gunner', r'machine gunner', r'medic',
-    r'drone operator', r'uav operator', r'gunner', r'loader', r'driver',
-    r'comms', r'radio operator', r'vehicle commander', r'crew commander', r'sniper', r'spotter',
+    r'снайпер', r'радист', r'інженер', r'водій', r'заряджаючий',
+    r'командир отделения', r'старший стрелок', r'стрелок', r'гранатомётчик', r'пулемётчик',
+    r'squad leader', r'team leader', r'rifleman', r'grenadier', r'machine gunner', r'medic',
+    r'drone operator', r'gunner', r'loader', r'driver', r'sniper'
 ]
 
 SLOT_RE = re.compile(r'^\s*(?:\d+\.\s*)?(' + r'|'.join(SLOT_KEYWORDS) + r')', flags=re.IGNORECASE)
 TRIGGER_RE = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE = re.compile(r'<@!?(?P<id>\d+)>')
 
-# ─────── Helpers: noise filters and normalization ─────────────────────────────────────
+# Helpers
 def is_noise(s: str) -> bool:
     s = (s or "").strip()
     if not s:
         return True
     low = s.lower()
-
-    noise_literals = {
-        "none","null","true","false",
-        "army","default","platoon","standard","nochange",
-        "uk","ukr","honor","everyone",
-        "відділення","ввідділення","зс рф та пвк","невідомо"
-    }
+    noise_literals = {"none","null","true","false","army","default","platoon","standard","nochange","uk","ukr","honor","everyone","відділення","ввідділення","зс рф та пвк","невідомо"}
     if low in noise_literals:
         return True
-
     if re.fullmatch(r'\d+(,\d+)*', s):
         return True
     if re.fullmatch(r'[A-Z0-9_]+', s):
         return True
-
-    if ("rhs_" in low) or ("_hide" in low) or ("flag_manager" in low) or ("beacons" in low):
+    if ("_hide" in low) or ("flag_manager" in low) or ("beacons" in low) or ("rhs_" in low):
         return True
     if re.search(r'^(crate|wood|door|hide|show)_[\w\-]+(_unhide)?$', low):
         return True
     if re.search(r'\[\[\[\[.*?\]\]\]?]?false?\]?', s):
         return True
-    if re.search(r'^hide\w+', s): return True
-    if re.search(r'^show\w+', s): return True
-    if re.search(r'^[a-zA-Z_]+_unhide$', s): return True
-
-    if low in {
-        "mavicblue1","mavicblue2","mavicred1","mavicred2",
-        "m113","m113a3","bmp","bmp-2","бмп-2","мт-лб","gaz-66","газ-66",
-        "tigr","тигр","gaz-233014","внедорожник"
-    }:
+    if low in {"mavicblue1","mavicblue2","mavicred1","mavicred2","m113","m113a3","bmp","bmp-2","бмп-2","мт-лб","gaz-66","газ-66","tigr","тигр","gaz-233014","внедорожник"}:
         return True
-
     if s.startswith("Guerilla_") or s.startswith("Male") or re.match(r'^[A-Z][a-z]+_\d+$', s):
         return True
-
-    event_noise = [
-        r'зс рф захопили', r'зс рф змогли', r'зс рф вдалося',
-        r'багатоповерхівка', r'бахмут',
-        r'повернись до бою', r'ти в полон біжиш', r'ти кудись летиш',
-        r'ти повернувся', r'не будь зрадником', r'молодець'
-    ]
+    event_noise = [r'зс рф захопили', r'зс рф змогли', r'зс рф вдалося', r'багатоповерхівка', r'бахмут', r'повернись до бою', r'ти в полон біжиш', r'ти кудись летиш', r'ти повернувся', r'не будь зрадником', r'молодець']
     if any(re.search(p, low) for p in event_noise):
         return True
-
     if re.fullmatch(r'[\|\s]+', s):
         return True
-
     return False
 
 def is_valid_slot(s: str) -> bool:
@@ -181,11 +148,9 @@ def clean_line_for_slot(s: str) -> str:
     s = strip_quotes_semicolons(s)
     s = extract_structured_text(s)
     s = re.sub(r'^(value|description)\s*=\s*', '', s, flags=re.IGNORECASE)
-
     s = re.sub(r'\s+\|\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\s+(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\b', '', s, flags=re.IGNORECASE)
     s = re.sub(r'\b(MED|МЕД|Медик|Польовий медик)\b', 'MED', s, flags=re.IGNORECASE)
-
     s = normalize_pipes(s)
     s = re.sub(r'\s+MED$', ' | MED', s)
     s = re.sub(r'\s{2,}', ' ', s).strip(' "\'')
@@ -204,9 +169,11 @@ def decode_bytes(raw: bytes) -> str:
     except Exception:
         return raw.decode("cp1251", errors="replace")
 
-# ─────── Title cleaning and weapon extraction ─────────────────────────────────────
+# Title cleaning and weapon extraction
 def strip_title_prefixes(title: str) -> str:
     t = (title or "").strip()
+    # remove any @... tokens (e.g., "@Alpha 1-1") anywhere
+    t = re.sub(r'@[^|\n]+', '', t)
     t = re.sub(r'^\s*\d+\s*[\.\:]\s*', '', t)
     t = re.sub(r'^\s*(ENG|RU|UA|UKR|PL|DE|FR|ES|TR|CZ|FI|HU|RO)\s*(\|\s*)?', '', t, flags=re.IGNORECASE)
     t = re.sub(r'^[A-Za-zА-Яа-я]\s*\|\s*', '', t)
@@ -214,15 +181,42 @@ def strip_title_prefixes(title: str) -> str:
         t = t[1:].strip()
     t = re.sub(r'^\s*\|\s*[A-Z]{2,}\s*', '', t)
     t = re.sub(r'\s{2,}', ' ', t).strip(' |')
+    # remove stray trailing pipes
+    t = re.sub(r'\s*\|\s*$', '', t)
     return t
 
 def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
+    """
+    Robust extraction:
+    - If there's a parenthetical weapon anywhere before an '@' or before a '|' that looks like part of the header,
+      extract that parenthetical as weapon and remove it from title.
+    - Otherwise, if the title starts with a parenthetical weapon, extract it.
+    - Otherwise, if pattern like 'WEAPON @Alpha' or 'WEAPON | Alpha' exists, extract leading token as weapon.
+    """
     t = (title or "").strip()
-    m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)', t)
-    if m:
+    # If there's an '@' or '|' indicating index, try to find parentheses before it
+    sep_pos = None
+    m_sep = re.search(r'(@| \| )', t)
+    if m_sep:
+        sep_pos = m_sep.start()
+    if sep_pos is not None:
+        left = t[:sep_pos]
+        # find last parenthetical in left
+        m_par = re.search(r'\([^\)]*\)\s*$', left)
+        if m_par:
+            weapon = m_par.group(0).strip()
+            rest = (t[:m_par.start()] + t[sep_pos:]).strip()
+            # remove any leading separators from rest
+            rest = re.sub(r'^[\s@|:,-]+', '', rest).strip()
+            return rest, weapon
+    # fallback: leading parenthetical
+    m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)?', t)
+    if m and m.group(1):
         weapon = m.group(1).strip()
-        rest = t.replace(m.group(0), '').strip()
+        rest = t.replace(m.group(1), '').strip()
+        rest = re.sub(r'^\s*@\S+', '', rest).strip()
         return rest, weapon
+    # fallback: leading token before @ or |
     m2 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
     if m2:
         weapon = m2.group(1).strip()
@@ -259,7 +253,7 @@ def process_title_final(title: str) -> Tuple[str, List[str], Optional[str]]:
     clean = re.sub(r'\s{2,}', ' ', clean).strip(' |')
     return clean or DEFAULT_TITLE, slots_from_title, weapon
 
-# ─────── Canonicalization for dedupe ─────────────────────────────────────────────
+# Canonicalization for dedupe
 def canonical_slot_for_compare(s: str) -> str:
     if not s:
         return ""
@@ -280,7 +274,7 @@ def canonical_title_for_compare(t: str) -> str:
     x = re.sub(r'\s{2,}', ' ', x).strip().lower()
     return x
 
-# ─────── Parser ─────────────────────────────────────────────────────
+# Parser
 def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     text = text.replace('\r\n', '\n').replace('\r', '\n')
 
@@ -321,6 +315,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
                 w = re.sub(r'^\(|\)$', '', weapon).strip()
                 if w:
                     if slots:
+                        # ensure weapon appended to first slot (commander)
                         if w not in slots[0]:
                             slots[0] = f"{slots[0]} ({w})"
                     else:
@@ -366,6 +361,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             cur_title = s
             continue
 
+        # weapon line immediately after header (short token like "FN FAL" or "(FN FAL)")
         if cur_title and not cur_slots:
             if re.fullmatch(r'[\(\)A-Za-z0-9\-\s\/\\\+]{2,40}', s) and not SLOT_RE.search(s) and len(s) <= 40:
                 pending_weapon = s
@@ -383,19 +379,11 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
     flush()
     return [(title, slots) for title, slots in groups.items()]
 
-# ─────── Slot formatting ─────────────────────────────────────────────────────
+# Slot numbering
 def format_slots_with_numbers(slots: List[str]) -> List[str]:
-    """
-    Покращена логіка нумерації:
-    - Якщо хоча б один слот має явну нумерацію (N. або N: або N) ), використовуємо ці числа як основу.
-    - Якщо перший слот не має номера, але інші мають (наприклад починаються з 2.), додаємо номер першому як (min_number - 1) або 1.
-    - Нумерація виводиться у форматі 'N. Текст'.
-    - Якщо жоден слот не має номера — додаємо 1., 2., ...
-    """
     if not slots:
         return []
-
-    # Знайти всі явні номери у слотах
+    # detect explicit numbers
     numbers = []
     parsed = []
     for s in slots:
@@ -406,16 +394,12 @@ def format_slots_with_numbers(slots: List[str]) -> List[str]:
             parsed.append((num, m.group(2).strip()))
         else:
             parsed.append((None, s.strip()))
-
     if numbers:
         min_num = min(numbers)
-        # Якщо перший слот не має номера — призначити йому min_num-1 (але не менше 1)
         if parsed[0][0] is None:
             assign = max(1, min_num - 1)
-            # якщо assign вже використовується, знайдемо найменше вільне число <-> після min_num
             used = set(numbers)
             if assign in used:
-                # знайдемо найменше число, яке не використовується, починаючи з 1
                 i = 1
                 while i in used:
                     i += 1
@@ -423,28 +407,22 @@ def format_slots_with_numbers(slots: List[str]) -> List[str]:
             parsed[0] = (assign, parsed[0][1])
             numbers.append(assign)
             numbers.sort()
-        # Тепер пронумеруємо всі слоти: якщо слот мав номер — використаємо його; якщо ні — дамо наступний в порядку
         result = []
-        # Створимо карту для вже пронумерованих позицій
         used_nums = set(n for n in numbers)
-        # Для відсутніх номерів пройдемо по порядку і призначимо числа, починаючи з min_num і далі, уникаючи колізій
         next_num = min_num
         for num, text in parsed:
             if num is not None:
                 result.append(f"{num}. {text}")
             else:
-                # знайти наступний вільний номер
                 while next_num in used_nums:
                     next_num += 1
                 result.append(f"{next_num}. {text}")
                 used_nums.add(next_num)
                 next_num += 1
         return result
-
-    # Якщо жодного номера немає — просто додати 1.,2.,...
     return [f"{i+1}. {slot.strip()}" for i, slot in enumerate(slots, 1)]
 
-# ─────── UI helpers ─────────────────────────────────────────────────────
+# UI helpers
 def build_embed(sess: dict) -> discord.Embed:
     embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
     lines = []
@@ -488,7 +466,7 @@ class SlotView(View):
         for idx in range(len(sessions[sid]["lines"])):
             self.add_item(SlotButton(sid, idx))
 
-# ─────── Claim flow ─────────────────────────────────────────────────────
+# Claim flow
 class RemoveSlotModal(Modal):
     def __init__(self, sid: int, idx: int):
         super().__init__(title="Причина звільнення")
@@ -539,14 +517,13 @@ async def звільнити(ctx: commands.Context, session_msg_id: int):
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
     await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
 
-# ─────── Output builder: send all blocks without side headers ─────────────────────
+# Output builder
 async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, List[str]]]]):
     sent_keys = set()
     sent = 0
     all_blocks: List[Tuple[str, List[str]]] = []
     for blocks in grouped.values():
         all_blocks.extend(blocks)
-
     for title, slots in all_blocks:
         key = (canonical_title_for_compare(title), tuple(canonical_slot_for_compare(x) for x in slots))
         if key in sent_keys:
@@ -568,7 +545,7 @@ async def send_groups(ctx: commands.Context, grouped: Dict[str, List[Tuple[str, 
         await asyncio.sleep(0.06)
     return sent
 
-# ─────── Final command: !слоти (replaces !імпорт_sqm) ─────────────────────────
+# Command: !слоти
 @bot.command(name="слоти", aliases=["імпорт_sqm", "import_sqm"])
 async def слоти(ctx: commands.Context, *filter_ids: str):
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
@@ -654,7 +631,7 @@ async def слоти(ctx: commands.Context, *filter_ids: str):
     _recent_imports.pop(key, None)
     await ctx.send(f"✅ Готово. Опубліковано відділень: {sent}.")
 
-# ─────── Admin/util commands ─────────────────────────────────────────────
+# Admin commands, reminders, events
 @bot.command(name="стоп", aliases=["stop"])
 async def стоп(ctx: commands.Context):
     global _stop_sending_global, _stop_sending_by_channel
@@ -680,7 +657,6 @@ async def _статус(ctx: commands.Context):
         commit = "unknown"
     await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
 
-# ─────── Reminder ─────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def vtg_reminder():
     now = datetime.datetime.now(KYIV_TZ)
@@ -693,7 +669,6 @@ async def vtg_reminder():
                 except Exception:
                     logger.exception("vtg_reminder send failed")
 
-# ─────── Events ─────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     logger.info("Bot ready: %s", bot.user)
@@ -701,16 +676,9 @@ async def on_ready():
         commit = subprocess.getoutput("git rev-parse --short=7 HEAD")
     except Exception:
         commit = "unknown"
-    embed = discord.Embed(
-        title="🔄 Бот перезапущено",
-        description=f"📦\nCommit: `{commit}`",
-        color=discord.Color.green()
-    )
+    embed = discord.Embed(title="🔄 Бот перезапущено", description=f"📦\nCommit: `{commit}`", color=discord.Color.green())
     for guild in bot.guilds:
-        ch = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel) and c.permissions_for(guild.me).send_messages,
-            guild.text_channels
-        )
+        ch = discord.utils.find(lambda c: isinstance(c, discord.TextChannel) and c.permissions_for(guild.me).send_messages, guild.text_channels)
         if ch:
             try:
                 await ch.send(embed=embed)
@@ -747,7 +715,7 @@ async def on_message(message: discord.Message):
         await sent.edit(view=SlotView(sent.id))
     await bot.process_commands(message)
 
-# ─────── Run ─────────────────────────────────────────────────────
+# Run
 if not TOKEN:
     logger.error("DISCORD_TOKEN not set in environment")
     raise SystemExit(1)
