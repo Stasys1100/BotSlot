@@ -1,8 +1,4 @@
-# bot.py — Стабільна фінальна версія
-# Мета: надійний парсер mission.sqm, очищення заголовків, перенесення назви зброї у перший слот,
-# коректна нумерація слотів, уникнення дублювання, нормалізація пайпів/MED,
-# UI для слотів, статус/деплой/нагадування, звільнення слотів.
-
+# bot.py — ОСТАННЯ ВЕРСІЯ (фікси: ширше визначення заголовків, покращений фільтр 1-1, жорстка дедуплікація)
 import os
 import re
 import html
@@ -144,7 +140,6 @@ def strip_title_prefixes(title: str) -> str:
 
 def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
     t = (title or "").strip()
-    # try parenthetical before @ or |
     m_sep = re.search(r'(@|\|)', t)
     if m_sep:
         left = t[:m_sep.start()]
@@ -154,14 +149,12 @@ def extract_leading_weapon_and_strip(title: str) -> Tuple[str, Optional[str]]:
             rest = (t[:m_par.start()] + t[m_sep.start():]).strip()
             rest = re.sub(r'^[\s@|:,-]+', '', rest).strip()
             return rest, weapon
-    # leading parenthetical
     m = re.match(r'^\s*(\([^\)]+\))\s*(?:@|\||\b(Альфа|Alpha)\b)?', t)
     if m and m.group(1):
         weapon = m.group(1).strip()
         rest = t.replace(m.group(1), '').strip()
         rest = re.sub(r'^\s*@\S+', '', rest).strip()
         return rest, weapon
-    # leading token before @ or |
     m2 = re.match(r'^\s*([A-Za-z0-9\-\s\/\\\+]+?)\s*(?:@|\|)\s*(.+)$', t)
     if m2:
         weapon = m2.group(1).strip()
@@ -323,8 +316,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             continue
 
         # broader header detection: '|' or common unit words
-        has_index = re.search(r'\b(Альфа|Alpha)\s*\d+[-–—]?\d*\b', s, flags=re.IGNORECASE) is not None
-        is_header = ('|' in s or re.search(r'\b(Battalion|Regiment|Brigade|Squad|Infantry|Mechanized|Armored|M113|BMP|T-34|M2)\b', s, flags=re.IGNORECASE)) and not (re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s))
+        is_header = ('|' in s or re.search(r'\b(Battalion|Regiment|Brigade|Squad|Infantry|Mechanized|Armored|M113|BMP|T-34|M2|Reserve|Company)\b', s, flags=re.IGNORECASE)) and not (re.match(r'^\s*\d+\.\s*', s) or SLOT_RE.search(s))
 
         if is_header:
             flush()
@@ -332,7 +324,7 @@ def extract_units_and_slots(text: str) -> List[Tuple[str, List[str]]]:
             continue
 
         if cur_title and not cur_slots:
-            if re.fullmatch(r'[\(\)A-Za-z0-9\-\s\/\\\+]{2,80}', s) and not SLOT_RE.search(s) and len(s) <= 80:
+            if re.fullmatch(r'[\(\)A-Za-z0-9\-\s\/\\\+]{2,100}', s) and not SLOT_RE.search(s) and len(s) <= 100:
                 pending_weapon = s
                 continue
 
@@ -414,15 +406,36 @@ def matches_filter(title: str, fid: str) -> bool:
     t = title or ""
     t_norm = re.sub(r'[\s–—]+', ' ', t)
     fid_norm = fid.strip()
+
+    # direct substring
     if re.search(re.escape(fid_norm), t_norm, flags=re.IGNORECASE):
         return True
+
+    # compact compare (remove hyphens/spaces)
     fid_comp = re.sub(r'[-–—\s]+', '', fid_norm)
     t_comp = re.sub(r'[-–—\s]+', '', t_norm)
     if fid_comp and fid_comp.lower() in t_comp.lower():
         return True
+
+    # if filter looks like "1-1" or "1:1" or "1 1", try numeric matching:
+    nums = re.findall(r'\d+', fid_norm)
+    if nums:
+        # match any of the numbers in title (e.g., "1st", "1", "67th", "M113A3" contains digits too)
+        title_nums = re.findall(r'\d+', t_norm)
+        # if any numeric token matches any numeric token from fid, accept
+        for n in nums:
+            if any(n == tn or tn.startswith(n) or tn.endswith(n) for tn in title_nums):
+                return True
+        # also try ordinal forms: "1st" etc.
+        for n in nums:
+            if re.search(r'\b' + re.escape(n) + r'(st|nd|rd|th)?\b', t_norm, flags=re.IGNORECASE):
+                return True
+
+    # match by words: all words in fid appear in title (useful for "Reserve squad")
     words = [w for w in re.split(r'[\s\|,]+', fid_norm) if w]
     if words and all(re.search(re.escape(w), t_norm, flags=re.IGNORECASE) for w in words):
         return True
+
     return False
 
 async def send_groups(ctx: commands.Context, canonical_map: "OrderedDict[Tuple[str, Tuple[str,...]], Tuple[str, List[str]]]"):
@@ -529,7 +542,7 @@ class RemoveSlotView(View):
 @bot.command(name="звільнити")
 async def звільнити(ctx: commands.Context, session_msg_id: int):
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Команда доступна лише в адміністративному каналі.")
+        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
     session = sessions.get(session_msg_id)
     if not session:
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
