@@ -26,17 +26,16 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ─── 3. Конфігурація ────────────────────────────────────────────────────────────
 KYIV_TZ          = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID   = 1160843618433630228
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID") or 0)
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 
 processed_messages: set[int] = set()
-# sessions: message_id → { title, lines, owners, channel_id, forbidden }
-sessions: dict[int, dict] = {}            
-claims: dict[tuple[int,int], list] = {}   # (message_id, idx) → [User, ...]
-request_counter = 0                       # лічильник заявок
+sessions: dict[int, dict] = {}            # message_id → { title, lines, owners, channel_id, forbidden }
+claims: dict[tuple[int,int], list] = {}   # (message_id, idx) → [User, ...] [cite: 2]
+request_counter = 0                       # лічильник заявок [cite: 2]
 
 TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
-DEFAULT_TITLE = "3. Prikaati 'Karhu' | Jalkaväen haara"
+DEFAULT_TITLE = "3. Prikaati 'Karhu' | Jalkaväen haara" [cite: 3]
 
 # ─── 4. Щотижневий нагадувач VTG ────────────────────────────────────────────────
 @tasks.loop(minutes=1)
@@ -48,7 +47,7 @@ async def vtg_reminder():
             try:
                 await ch.send("||@everyone||\n**Сбор VTG**")
             except:
-                pass
+                pass [cite: 4]
 
 # ─── 5. Генератор Embed для слотів ─────────────────────────────────────────────
 def build_embed(sess: dict) -> discord.Embed:
@@ -56,11 +55,11 @@ def build_embed(sess: dict) -> discord.Embed:
     lines = []
     # Тут використовується вже очищений текст з sess["lines"]
     for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-        prefix = f"{i+1}. "
+        prefix = f"{i+1}. " [cite: 5]
         if owner:
-            lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
+            lines.append(f"{prefix}{text} – Зайнято {owner.mention}") [cite: 5]
         else:
-            lines.append(f"{prefix}{text}")
+            lines.append(f"{prefix}{text}") [cite: 5]
     embed.description = "\n".join(lines)
     return embed
 
@@ -71,7 +70,7 @@ class SlotButton(Button):
         owner = sess["owners"][idx]
         free = owner is None
        
-        label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
+        label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}" [cite: 6]
         style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
         super().__init__(label=label, style=style, custom_id=f"slot-{sid}-{idx}")
         self.sid, self.idx = sid, idx
@@ -90,27 +89,27 @@ class SlotButton(Button):
             )
 
         # 6.1) Вільний слот → зайняти
-        if owner is None:
+        if owner is None: [cite: 7]
             for s in sessions.values():
-                if s["channel_id"] == ch_id and user in s["owners"]:
+                if s["channel_id"] == ch_id and user in s["owners"]: [cite: 7]
                     return await inter.response.send_message(
-                        "⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True
+                        "⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True [cite: 8]
                     )
             sess["owners"][self.idx] = user
             return await inter.response.edit_message(
-                embed=build_embed(sess), view=SlotView(self.sid)
+                embed=build_embed(sess), view=SlotView(self.sid) [cite: 8]
             )
 
         # 6.2) Свій слот → звільнити
-        if owner == user:
+        if owner == user: [cite: 9]
             sess["owners"][self.idx] = None
             return await inter.response.edit_message(
-                embed=build_embed(sess), view=SlotView(self.sid)
+                embed=build_embed(sess), view=SlotView(self.sid) [cite: 9]
             )
 
         # 6.3) Чужий слот → пропонуємо претендувати
         return await inter.response.send_message(
-            f"⚠️ Цей слот зайнято {owner.mention}.",
+            f"⚠️ Цей слот зайнято {owner.mention}.", [cite: 10]
             view=ClaimSlotView(self.sid, self.idx),
             ephemeral=True
         )
@@ -120,7 +119,7 @@ class SlotView(View):
         super().__init__(timeout=None)
         if sid in sessions:
             for idx in range(len(sessions[sid]["lines"])):
-                self.add_item(SlotButton(sid, idx))
+                self.add_item(SlotButton(sid, idx)) [cite: 10]
 
 # ─── 7. “Претендувати” на слот ─────────────────────────────────────────────────
 class ClaimSlotButton(Button):
@@ -128,7 +127,7 @@ class ClaimSlotButton(Button):
         super().__init__(
             label="❗ Претендувати",
             style=discord.ButtonStyle.primary,
-            custom_id=f"claim-slot-{sid}-{idx}"
+            custom_id=f"claim-slot-{sid}-{idx}" [cite: 11]
         )
         self.sid, self.idx = sid, idx
 
@@ -143,17 +142,17 @@ class ClaimSlotButton(Button):
                 "⛔ Ви не можете претендувати на цей слот (заборонено).", ephemeral=True
             )
 
-        for s in sessions.values():
-            if s["channel_id"] == sess["channel_id"] and user in s["owners"]:
+        for s in sessions.values(): [cite: 12]
+            if s["channel_id"] == sess["channel_id"] and user in s["owners"]: [cite: 12]
                 return await inter.response.send_message(
                     "⚠️ Ви вже маєте слот в цій гілці.", ephemeral=True
                 )
 
         key = (self.sid, self.idx)
-        lst = claims.setdefault(key, [])
+        lst = claims.setdefault(key, []) [cite: 13]
         if user in lst:
             return await inter.response.send_message(
-                "ℹ️ Ви вже подали заявку.", ephemeral=True
+                "ℹ️ Ви вже подали заявку.", ephemeral=True [cite: 13]
             )
         lst.append(user)
         await inter.response.send_message("✅ Заявка прийнята.", ephemeral=True)
@@ -164,21 +163,21 @@ class ClaimSlotButton(Button):
         embed = discord.Embed(
             title=f"📝 Заявка #{request_counter}",
             description=sess["title"],
-            color=discord.Color.orange()
+            color=discord.Color.orange() [cite: 14]
         )
         embed.add_field(name="Слот #", value=str(self.idx+1), inline=True)
         embed.add_field(
             name="Власник",
             value=(sess["owners"][self.idx].mention
-                  if sess["owners"][self.idx] else "Вільний"),
+                  if sess["owners"][self.idx] else "Вільний"), [cite: 15]
             inline=True
         )
         embed.add_field(name="Кандидат", value=user.mention, inline=False)
 
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
+        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID) [cite: 15]
         if admin_ch:
             msg = await admin_ch.send(embed=embed)
-            await msg.edit(view=ClaimDecisionView(self.sid, self.idx, user.id, msg.id))
+            await msg.edit(view=ClaimDecisionView(self.sid, self.idx, user.id, msg.id)) [cite: 16]
 
 class ClaimSlotView(View):
     def __init__(self, sid: int, idx: int):
@@ -195,18 +194,18 @@ class DecisionModal(Modal):
         admin_msg_id: int,
         accept: bool
     ):
-        title = "Причина призначення" if accept else "Причина відмови"
+        title = "Причина призначення" if accept else "Причина відмови" [cite: 17]
         super().__init__(title=title)
         self.sid = sid
         self.idx = idx
         self.claimant_id = claimant_id
         self.admin_msg_id = admin_msg_id
         self.accept = accept
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph) [cite: 17]
         self.add_item(self.reason)
 
     async def on_submit(self, inter: discord.Interaction):
-        sess = sessions[self.sid]
+        sess = sessions[self.sid] [cite: 18]
         key = (self.sid, self.idx)
         claimant = await bot.fetch_user(self.claimant_id)
         old_owner = sess["owners"][self.idx]
@@ -216,16 +215,16 @@ class DecisionModal(Modal):
             sess["owners"][self.idx] = claimant
             claims.pop(key, None)
         else:
-            lst = claims.get(key, [])
+            lst = claims.get(key, []) [cite: 19]
             if claimant in lst:
-                lst.remove(claimant)
+                lst.remove(claimant) [cite: 19]
 
         # Оновлюємо головне повідомлення
         ch = bot.get_channel(sess["channel_id"])
         if ch:
             try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
+                main = await ch.fetch_message(self.sid) [cite: 20]
+                await main.edit(embed=build_embed(sess), view=SlotView(self.sid)) [cite: 20]
             except:
                 pass
 
@@ -234,31 +233,31 @@ class DecisionModal(Modal):
             if self.accept:
                 await claimant.send(
                     f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}».\n"
-                    f"Причина: {reason}"
+                    f"Причина: {reason}" [cite: 21]
                 )
                 if old_owner and old_owner != claimant:
-                    await old_owner.send(
+                    await old_owner.send( [cite: 22]
                         f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention}.\n"
-                        f"Причина: {reason}"
+                        f"Причина: {reason}" [cite: 22]
                     )
             else:
                 await claimant.send(
                     f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\n"
-                    f"Причина: {reason}"
+                    f"Причина: {reason}" [cite: 23]
                 )
         except:
             pass
 
         # Видаляємо адмін-повідомлення
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
+        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID) [cite: 24]
         if admin_ch:
             try:
                 admin_msg = await admin_ch.fetch_message(self.admin_msg_id)
-                await admin_msg.delete()
+                await admin_msg.delete() [cite: 24]
             except:
                 pass
 
-        await inter.response.send_message("✔️ Готово.", ephemeral=True)
+        await inter.response.send_message("✔️ Готово.", ephemeral=True) [cite: 25]
 
 class ClaimDecisionButton(Button):
     def __init__(
@@ -271,7 +270,7 @@ class ClaimDecisionButton(Button):
     ):
         label = "✅ Призначити" if accept else "❌ Відхилити"
         style = discord.ButtonStyle.success if accept else discord.ButtonStyle.danger
-        tag = "accept" if accept else "deny"
+        tag = "accept" if accept else "deny" [cite: 26]
         super().__init__(
             label=label,
             style=style,
@@ -280,7 +279,7 @@ class ClaimDecisionButton(Button):
         self.sid = sid
         self.idx = idx
         self.claimant_id = claimant_id
-        self.admin_msg_id = admin_msg_id
+        self.admin_msg_id = admin_msg_id [cite: 27]
         self.accept = accept
 
     async def callback(self, inter: discord.Interaction):
@@ -291,7 +290,7 @@ class ClaimDecisionButton(Button):
             self.admin_msg_id,
             self.accept
         )
-        await inter.response.send_modal(modal)
+        await inter.response.send_modal(modal) [cite: 28]
 
 class ClaimDecisionView(View):
     def __init__(
@@ -305,7 +304,7 @@ class ClaimDecisionView(View):
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, True))
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, False))
 
-# ─── 9. Зняття через кнопки та Modal ───────────────────────────────────────────
+# ─── 9. Зняття через кнопки та Modal ─────────────────────────────────────────── [cite: 29]
 class RemoveSlotModal(Modal):
     def __init__(self, sid: int, idx: int):
         super().__init__(title="Причина звільнення")
@@ -318,7 +317,7 @@ class RemoveSlotModal(Modal):
         owner = sess["owners"][self.idx]
         reason = self.reason.value
 
-        if not owner:
+        if not owner: [cite: 30]
             return await inter.response.send_message(
                 f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True
             )
@@ -327,15 +326,15 @@ class RemoveSlotModal(Modal):
         ch = bot.get_channel(sess["channel_id"])
         if ch:
             try:
-                main = await ch.fetch_message(self.sid)
-                await main.edit(embed=build_embed(sess), view=SlotView(self.sid))
+                main = await ch.fetch_message(self.sid) [cite: 31]
+                await main.edit(embed=build_embed(sess), view=SlotView(self.sid)) [cite: 31]
             except:
                 pass
 
         try:
             await owner.send(
                 f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\n"
-                f"Причина: {reason}"
+                f"Причина: {reason}" [cite: 32]
             )
         except:
             pass
@@ -347,7 +346,7 @@ class RemoveSlotModal(Modal):
 class RemoveSlotButton(Button):
     def __init__(self, sid: int, idx: int):
         super().__init__(
-            label=str(idx+1),
+            label=str(idx+1), [cite: 33]
             style=discord.ButtonStyle.danger,
             custom_id=f"remove-{sid}-{idx}"
         )
@@ -359,9 +358,8 @@ class RemoveSlotButton(Button):
 class RemoveSlotView(View):
     def __init__(self, sid: int):
         super().__init__(timeout=None)
-        if sid in sessions:
-            for idx in range(len(sessions[sid]["lines"])):
-                self.add_item(RemoveSlotButton(sid, idx))
+        for idx in range(len(sessions[sid]["lines"])):
+            self.add_item(RemoveSlotButton(sid, idx)) [cite: 34]
 
 @bot.command(name="зняти", aliases=["release"])
 async def зняти(ctx: commands.Context, session_msg_id: int):
@@ -372,7 +370,7 @@ async def зняти(ctx: commands.Context, session_msg_id: int):
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
     await ctx.send(
         f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:",
-        view=RemoveSlotView(session_msg_id)
+        view=RemoveSlotView(session_msg_id) [cite: 35]
     )
 
 # ─── 9.5. Команда !записати ─────────────────────────────────────────────────────
@@ -388,18 +386,18 @@ async def записати(ctx: commands.Context, session_msg_id: int, member: d
         view=AssignSlotView(session_msg_id, member.id)
     )
 
-class AssignSlotModal(Modal):
+class AssignSlotModal(Modal): [cite: 36]
     def __init__(self, sid: int, idx: int, uid: int):
         super().__init__(title="Причина запису")
         self.sid, self.idx, self.uid = sid, idx, uid
-        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph)
+        self.reason = TextInput(label="Причина", style=discord.TextStyle.paragraph) [cite: 36]
         self.add_item(self.reason)
 
     async def on_submit(self, inter: discord.Interaction):
         sess = sessions[self.sid]
         user = await bot.fetch_user(self.uid)
         reason = self.reason.value
-
+        
         # [NEW] Перевірка на заборону
         forbidden_ids = sess.get("forbidden", [])[self.idx]
         if user.id in forbidden_ids:
@@ -407,11 +405,11 @@ class AssignSlotModal(Modal):
                 f"⛔ {user.mention} заборонений для цього слота.", ephemeral=True
             )
 
-        if sess["owners"][self.idx] == user:
+        if sess["owners"][self.idx] == user: [cite: 37]
             return await inter.response.send_message(
                 f"⚠️ {user.mention} вже записаний на слот #{self.idx+1}.", ephemeral=True
             )
-        if sess["owners"][self.idx] is not None:
+        if sess["owners"][self.idx] is not None: [cite: 38]
             return await inter.response.send_message(
                 f"⚠️ Слот #{self.idx+1} вже зайнятий {sess['owners'][self.idx].mention}.", 
                 ephemeral=True
@@ -423,7 +421,7 @@ class AssignSlotModal(Modal):
             try:
                 msg = await ch.fetch_message(self.sid)
                 await msg.edit(embed=build_embed(sess), view=SlotView(self.sid))
-            except:
+            except: [cite: 39]
                 pass
 
         try:
@@ -434,7 +432,7 @@ class AssignSlotModal(Modal):
             pass
 
         await inter.response.send_message(
-            f"📌 {user.mention} записано на слот #{self.idx+1}.", ephemeral=True
+            f"📌 {user.mention} записано на слот #{self.idx+1}.", ephemeral=True [cite: 40]
         )
 
 class AssignSlotButton(Button):
@@ -444,7 +442,7 @@ class AssignSlotButton(Button):
             style=discord.ButtonStyle.success,
             custom_id=f"assign-{sid}-{idx}-{uid}"
         )
-        self.sid, self.idx, self.uid = sid, idx, uid
+        self.sid, self.idx, self.uid = sid, idx, uid [cite: 41]
 
     async def callback(self, inter: discord.Interaction):
         await inter.response.send_modal(AssignSlotModal(self.sid, self.idx, self.uid))
@@ -452,9 +450,8 @@ class AssignSlotButton(Button):
 class AssignSlotView(View):
     def __init__(self, sid: int, uid: int):
         super().__init__(timeout=None)
-        if sid in sessions:
-            for idx in range(len(sessions[sid]["lines"])):
-                self.add_item(AssignSlotButton(sid, idx, uid))
+        for idx in range(len(sessions[sid]["lines"])):
+            self.add_item(AssignSlotButton(sid, idx, uid))
 
 # ─── 10. Події on_ready та on_message ────────────────────────────────────────────
 @bot.event
@@ -464,13 +461,13 @@ async def on_ready():
     embed = discord.Embed(
         title="🔄 Бот перезапущено",
         description=f"📦 Commit: `{commit}`",
-        color=discord.Color.green()
+        color=discord.Color.green() [cite: 42]
     )
     for guild in bot.guilds:
         ch = discord.utils.find(
             lambda c: isinstance(c, discord.TextChannel)
                       and c.permissions_for(guild.me).send_messages,
-            guild.text_channels
+            guild.text_channels [cite: 43]
         )
         if ch:
             try:
@@ -483,7 +480,7 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     if message.author.bot or message.id in processed_messages:
-        return
+        return [cite: 44]
 
     if "запис слоти" in message.content.lower():
         processed_messages.add(message.id)
@@ -492,14 +489,14 @@ async def on_message(message: discord.Message):
         owners = []
         forbidden_matrix = [] # Список списків ID (per slot)
         
-        # Регулярний вираз для пошуку "заборонити @люди" в кінці рядка
-        # Це допомагає ідентифікувати саме ту частину, яку треба видалити з тексту слота
+        # Регулярний вираз для пошуку "заборонити @люди" (case-insensitive)
+        # Цей RE захоплює "заборонити" + усі наступні згадки + розділові знаки до кінця рядка
         FORBIDDEN_CLEAN_RE = re.compile(r'\s*заборонити\s*(\s*(?:<@!?(?P<id>\d+)>|\s|,|[^,>])+\s*)$', re.I)
 
         for line in message.content.splitlines():
             txt = line.strip()
             if not txt or "запис слоти" in txt.lower() or "everyone" in txt.lower():
-                continue
+                continue [cite: 45]
             m = TRIGGER_RE.match(txt)
             if m:
                 # Отримуємо чистий текст (без номера)
@@ -509,7 +506,7 @@ async def on_message(message: discord.Message):
                 line_forbidden = []
                 final_text = raw_content
                 
-                # 1. Парсинг заборони та видалення тексту
+                # 1. Парсинг заборони та ВИДАЛЕННЯ тексту
                 match_forbidden = FORBIDDEN_CLEAN_RE.search(raw_content)
                 
                 if match_forbidden:
@@ -518,15 +515,16 @@ async def on_message(message: discord.Message):
                     for id_match in MENTION_RE.finditer(forbidden_part):
                         line_forbidden.append(int(id_match.group('id')))
                         
-                    # 1.2. Видаляємо частину з "заборонити" з тексту слота (якщо вона в кінці)
+                    # 1.2. Видаляємо частину з "заборонити" з тексту слота (використовуємо початок збігу)
                     final_text = raw_content[:match_forbidden.start()]
                 
-                # 2. Визначення власника (вже з очищеного тексту)
-                # Оскільки згадка власника може бути в будь-якому місці тексту, шукаємо його по всій лінії
-                for u in message.mentions:
-                    if f"<@{u.id}>" in raw_content or f"<@!{u.id}>" in raw_content:
-                        line_owner = u
-                        break
+                # 2. Визначення власника 
+                # Шукаємо згадку власника по всій лінії (raw_content), оскільки вона може бути до або після "заборонити"
+                line_owner = next(
+                    (u for u in message.mentions
+                     if f"<@{u.id}>" in raw_content or f"<@!{u.id}>" in raw_content),
+                    None [cite: 46]
+                )
                 
                 # 3. Видалення згадки власника (якщо знайдено)
                 if line_owner:
@@ -535,13 +533,12 @@ async def on_message(message: discord.Message):
 
                 # 4. Фінальна зачистка від зайвих пробілів/ком
                 final_text = final_text.strip()
-                final_text = re.sub(r'\s{2,}', ' ', final_text) 
+                final_text = re.sub(r'\s{2,}', ' ', final_text) # прибрати подвійні пробіли
                 # Прибираємо зайві розділові знаки в кінці, якщо вони лишились після видалення
                 final_text = re.sub(r'[\s,.:;]+$', '', final_text)
 
-
                 slots.append(final_text)
-                owners.append(line_owner)
+                owners.append(line_owner) [cite: 47]
                 forbidden_matrix.append(line_forbidden)
 
             elif header is None:
@@ -555,7 +552,7 @@ async def on_message(message: discord.Message):
         sess = {
             "title":      header or DEFAULT_TITLE,
             "lines":      slots,
-            "owners":     owners,
+            "owners":     owners, [cite: 48]
             "channel_id": message.channel.id,
             "forbidden":  forbidden_matrix  # зберігаємо список заборонених
         }
@@ -570,7 +567,7 @@ async def on_message(message: discord.Message):
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
     if not DEPLOY_HOOK_URL:
-        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено")
+        return await ctx.send("❌ DEPLOY_HOOK_URL не встановено") [cite: 49]
     async with aiohttp.ClientSession() as sess:
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
@@ -586,12 +583,12 @@ async def _статус(ctx: commands.Context):
 
 @bot.command(name="gitpush")
 async def _gitpush(ctx: commands.Context):
-    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
+    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange()) [cite: 50]
     emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
     emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
     emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
     emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
-    emb.set_footer(text="Після push → !оновити")
+    emb.set_footer(text="Після push → !оновити") [cite: 51]
     await ctx.send(embed=emb)
 
 # ─── 12. Запуск бота ─────────────────────────────────────────────────────────────
