@@ -230,20 +230,20 @@ class DecisionModal(Modal):
         # DM користувачам
         try:
             if self.accept:
-                # ЗМІНА: Призначеному користувачу (claimant) причина не відправляється
+                # ЗМІНА: Додано ID сесії, причину не відправляємо призначеному
                 await claimant.send(
-                    f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}»."
+                    f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}» (ID: {self.sid})."
                 )
                 if old_owner and old_owner != claimant:
-                    # Знятому користувачу (old_owner) причина відправляється
+                    # ЗМІНА: Додано ID сесії, причину відправляємо знятому
                     await old_owner.send(
-                        f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention}.\n"
+                        f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention} у «{sess['title']}» (ID: {self.sid}).\n"
                         f"Причина: {reason}"
                     )
             else:
-                # При відмові причина все одно відправляється
+                # ЗМІНА: Додано ID сесії
                 await claimant.send(
-                    f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\n"
+                    f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» (ID: {self.sid}) відхилена.\n"
                     f"Причина: {reason}"
                 )
         except:
@@ -333,8 +333,9 @@ class RemoveSlotModal(Modal):
                 pass
 
         try:
+            # ЗМІНА: Додано ID сесії
             await owner.send(
-                f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\n"
+                f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}» (ID: {self.sid}).\n"
                 f"Причина: {reason}"
             )
         except:
@@ -399,9 +400,7 @@ class AssignSlotModal(Modal):
         sess = sessions[self.sid]
         user = await bot.fetch_user(self.uid)
         reason = self.reason.value
-        
-        # Перевірку на заборону видалено, щоб адміністратор міг записати користувача.
-        
+
         if sess["owners"][self.idx] == user:
             return await inter.response.send_message(
                 f"⚠️ {user.mention} вже записаний на слот #{self.idx+1}.", ephemeral=True
@@ -422,9 +421,9 @@ class AssignSlotModal(Modal):
                 pass
 
         try:
-            # ЗМІНА: Призначеному користувачу причина не відправляється
+            # ЗМІНА: Додано ID сесії, причину не відправляємо
             await user.send(
-                f"✅ Вас записано на слот #{self.idx+1} у «{sess['title']}»."
+                f"✅ Вас записано на слот #{self.idx+1} у «{sess['title']}» (ID: {self.sid})."
             )
         except:
             pass
