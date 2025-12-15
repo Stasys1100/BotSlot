@@ -66,7 +66,6 @@ def build_embed(sess: dict) -> discord.Embed:
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
 class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
-        # ВИПРАВЛЕНО: Запобігаємо KeyError якщо sessions[sid] не існує
         owner = sessions.get(sid, {}).get("owners", [None])[idx]
         free = owner is None
        
@@ -81,7 +80,7 @@ class SlotButton(Button):
         owner = sess["owners"][self.idx]
         ch_id = sess["channel_id"]
 
-        # ПЕРЕВІРКА НА ЗАБОРОНУ
+        # ПЕРЕВІРКА НА ЗАБОРОНУ (для звичайних користувачів)
         forbidden_ids = sess.get("forbidden", [])[self.idx]
         if user.id in forbidden_ids:
             return await inter.response.send_message(
@@ -135,7 +134,7 @@ class ClaimSlotButton(Button):
         user = inter.user
         sess = sessions[self.sid]
 
-        # ПЕРЕВІРКА НА ЗАБОРОНУ
+        # ПЕРЕВІРКА НА ЗАБОРОНУ (для звичайних користувачів)
         forbidden_ids = sess.get("forbidden", [])[self.idx]
         if user.id in forbidden_ids:
             return await inter.response.send_message(
@@ -399,13 +398,9 @@ class AssignSlotModal(Modal):
         user = await bot.fetch_user(self.uid)
         reason = self.reason.value
         
-        # ПЕРЕВІРКА НА ЗАБОРОНУ
-        forbidden_ids = sess.get("forbidden", [])[self.idx]
-        if user.id in forbidden_ids:
-            return await inter.response.send_message(
-                f"⛔ {user.mention} заборонений для цього слота.", ephemeral=True
-            )
-
+        # ВИДАЛЕНО: Перевірку на заборону видалено, щоб адміністратор міг записати 
+        # користувача на заборонений слот через команду !записати.
+        
         if sess["owners"][self.idx] == user:
             return await inter.response.send_message(
                 f"⚠️ {user.mention} вже записаний на слот #{self.idx+1}.", ephemeral=True
@@ -492,7 +487,6 @@ async def on_message(message: discord.Message):
         forbidden_matrix = [] # Список списків ID (per slot)
         
         # Регулярний вираз для пошуку "заборонити @люди" (case-insensitive)
-        # Цей RE захоплює "заборонити" + усі наступні згадки + розділові знаки до кінця рядка
         FORBIDDEN_CLEAN_RE = re.compile(r'\s*заборонити\s*(\s*(?:<@!?(?P<id>\d+)>|\s|,|[^,>])+\s*)$', re.I)
 
         for line in message.content.splitlines():
@@ -520,10 +514,7 @@ async def on_message(message: discord.Message):
                     final_text = raw_content[:match_forbidden.start()]
                 
                 # 2. Визначення власника (шукаємо згадку в оригінальному *raw_content*)
-                # Це згадка, яка не знаходиться безпосередньо в частині "заборонити"
-                # Тут ми знаходимо ВСІ згадки у вихідному тексті
-                mentions_in_slot = list(MENTION_RE.finditer(raw_content))
-
+                
                 # Визначаємо, чи є в слоті згадка користувача, який НЕ є в списку заборонених
                 potential_owner_mentions = [
                     u for u in message.mentions 
@@ -532,7 +523,6 @@ async def on_message(message: discord.Message):
                 ]
                 
                 # Якщо є явна згадка користувача, який не в списку заборон, робимо його власником.
-                # Якщо згадки лише заборонених, власником ніхто не стає (слот вільний).
                 if potential_owner_mentions:
                     line_owner = potential_owner_mentions[0]
 
@@ -547,7 +537,6 @@ async def on_message(message: discord.Message):
                 final_text = re.sub(r'[\s,.:;]+$', '', final_text)
 
                 slots.append(final_text)
-                # Якщо власник був визначений, зберігаємо його. Інакше залишаємо None (слот вільний)
                 owners.append(line_owner) 
                 forbidden_matrix.append(line_forbidden)
 
