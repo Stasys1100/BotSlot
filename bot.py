@@ -21,12 +21,16 @@ DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
 intents = discord.Intents.default()
 intents.guilds = True
 intents.message_content = True
+# Якщо бот не отримує DM, можливо, потрібно додати intents.direct_messages = True
+# і перевірити налаштування на порталі розробника.
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─── 3. Конфігурація ────────────────────────────────────────────────────────────
 KYIV_TZ          = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID   = 1160843618433630228
 ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
+# ЗЧИТУЄМО ВАШ ОСОБИСТИЙ ID ДЛЯ ПЕРЕСИЛАННЯ DM
+ADMIN_USER_ID    = int(os.getenv("ADMIN_USER_ID"))
 
 processed_messages: set[int] = set()
 # sessions: message_id → { title, lines, owners, channel_id, forbidden }
@@ -230,18 +234,18 @@ class DecisionModal(Modal):
         # DM користувачам
         try:
             if self.accept:
-                # ЗМІНА: Додано ID сесії, причину не відправляємо призначеному
+                # Вас призначено: ID сесії, без причини
                 await claimant.send(
                     f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}» (ID: {self.sid})."
                 )
                 if old_owner and old_owner != claimant:
-                    # ЗМІНА: Додано ID сесії, причину відправляємо знятому
+                    # Знято зі слота: ID сесії + причина
                     await old_owner.send(
                         f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention} у «{sess['title']}» (ID: {self.sid}).\n"
                         f"Причина: {reason}"
                     )
             else:
-                # ЗМІНА: Додано ID сесії
+                # Відмова: ID сесії + причина
                 await claimant.send(
                     f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» (ID: {self.sid}) відхилена.\n"
                     f"Причина: {reason}"
@@ -333,7 +337,7 @@ class RemoveSlotModal(Modal):
                 pass
 
         try:
-            # ЗМІНА: Додано ID сесії
+            # Знято зі слота: ID сесії + причина
             await owner.send(
                 f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}» (ID: {self.sid}).\n"
                 f"Причина: {reason}"
@@ -421,7 +425,7 @@ class AssignSlotModal(Modal):
                 pass
 
         try:
-            # ЗМІНА: Додано ID сесії, причину не відправляємо
+            # Вас записано: ID сесії, без причини
             await user.send(
                 f"✅ Вас записано на слот #{self.idx+1} у «{sess['title']}» (ID: {self.sid})."
             )
@@ -477,9 +481,40 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot or message.id in processed_messages:
+    # 1. Перевірка на ботів
+    if message.author.bot:
         return
 
+    # 2. ПЕРЕСИЛАННЯ DM В ОСОБИСТІ АДМІНА (ADMIN_USER_ID)
+    if isinstance(message.channel, discord.DMChannel):
+        admin_user = bot.get_user(ADMIN_USER_ID)
+        
+        if admin_user:
+            embed = discord.Embed(
+                title="✉️ Нове DM повідомлення",
+                description=message.content,
+                color=discord.Color.red()
+            )
+            # Перевірка на наявність аватара перед доступом до URL
+            avatar_url = message.author.avatar.url if message.author.avatar else discord.Embed.Empty
+            embed.set_author(name=f"{message.author.display_name} ({message.author})", icon_url=avatar_url)
+            embed.set_footer(text=f"ID користувача: {message.author.id}")
+            
+            try:
+                # Надсилаємо DM адміністратору
+                await admin_user.send(embed=embed)
+            except Exception as e:
+                # Це може статися, якщо у адміна закриті DM
+                print(f"Помилка пересилання DM адміністратору: {e}")
+                
+        # Важливо: зупиняємо тут, щоб DM не намагалися обробитися як команди або створення слотів
+        return
+
+    # 3. Обробка повідомлень у каналах (для створення слотів)
+    if message.id in processed_messages:
+        await bot.process_commands(message)
+        return
+        
     if "запис слоти" in message.content.lower():
         processed_messages.add(message.id)
         header = None
