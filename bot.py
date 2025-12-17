@@ -43,152 +43,64 @@ DEFAULT_TITLE = "3. Prikaati 'Karhu' | Jalkaväen haara"
 # ─── [NEW] SQM PARSER LOGIC ─────────────────────────────────────────────────────
 class SqmParser:
     def __init__(self):
-        # Паттерни для пошуку Командира (SL) різними мовами
         self.sl_patterns = [
             r"командир", r"squad leader", r"komandir", r"nodalas komandieris", 
             r"sl", r"sql", r"officer", r"офіцер", r"lidem"
         ]
-        # Паттерн для пошуку індексу групи (наприклад, "1-4")
         self.index_pattern = re.compile(r"\b(\d+-\d+)\b")
-        # Паттерн для пошуку сторони (side="WEST";)
         self.side_pattern = re.compile(r'side="?(\w+)"?;', re.IGNORECASE)
 
     def _normalize_slot(self, text):
-        """
-        Очищає текст слота: залишає найдовшу зброю в дужках, прибирає сміття.
-        """
-        # 1. Обробка зброї в дужках (G36A3\AG-40)
-        weapons = re.findall(r'\((.*?)\)', text)
-        
-        # Видаляємо всі дужки з тексту тимчасово, щоб очистити ім'я
+        weapons = re.findall(r'\(.*?\)', text)
         text_no_weapons = re.sub(r'\(.*?\)', '', text)
-        
-        # Вибираємо найдовшу назву зброї (якщо є кілька варіантів)
-        best_weapon = ""
-        if weapons:
-            best_weapon = max(weapons, key=len)
-        
-        # 2. Чистимо текст від зайвих символів, номерів на початку (1. 2. тощо) та пайпів
-        text_clean = re.sub(r'^\d+[\.\)]\s*', '', text_no_weapons) # Видаляє "1. " або "2)"
-        text_clean = text_clean.replace('|', '').strip()
-        text_clean = re.sub(r'\s+', ' ', text_clean) # Прибирає подвійні пробіли
-        
-        # 3. Збираємо фінальний рядок
-        final_parts = [text_clean]
-        if best_weapon:
-            final_parts.append(f"({best_weapon})")
-            
-        return " ".join(final_parts)
+        best_weapon = max(weapons, key=len) if weapons else ""
+        text_clean = re.sub(r'^\d+[\.\)]\s*', '', text_no_weapons).replace('|', '').strip()
+        text_clean = re.sub(r'\s+', ' ', text_clean)
+        return f"{text_clean} ({best_weapon})" if best_weapon else text_clean
 
     def _extract_group_index(self, slot_text):
-        """Шукає індекс типу 1-4 у тексті."""
         match = self.index_pattern.search(slot_text)
         return match.group(1) if match else None
 
     def process_file(self, file_content_str):
-        """
-        Основний метод обробки.
-        Повертає список словників груп, розділених по сторонах.
-        """
         lines = file_content_str.splitlines()
-        
-        raw_units = [] # Список усіх знайдених юнітів: {'side': 'WEST', 'text': 'SL...'}
-        current_side = "UNKNOWN"
-        
-        # Етап 1: Лінійний прохід, збір юнітів із прив'язкою до поточної сторони
+        raw_units, current_side = [], "UNKNOWN"
         for line in lines:
             line = line.strip()
-            
-            # Визначаємо зміну сторони (в SQM side йде перед юнітами групи)
             side_match = self.side_pattern.search(line)
-            if side_match:
-                current_side = side_match.group(1).upper()
-                
-            # Пошук тексту слота
+            if side_match: current_side = side_match.group(1).upper()
             if line.startswith('text=') or line.startswith('description='):
                 match = re.search(r'"(.*)"', line)
-                if match:
-                    raw_text = match.group(1)
-                    # Ігноруємо порожні або системні слоти
-                    if raw_text and not raw_text.startswith("__"):
-                        raw_units.append({
-                            'side': current_side,
-                            'text': raw_text
-                        })
+                if match and match.group(1) and not match.group(1).startswith("__"):
+                    raw_units.append({'side': current_side, 'text': match.group(1)})
 
-        # Етап 2: Розбиття суцільного списку юнітів на Відділення (Squads)
-        groups_data = {} # Key: (Side, Index), Value: GroupDict
-        
-        current_squad_slots = []
-        current_squad_side = None
-        
-        # Додаємо фіктивний елемент в кінець
+        groups_data = {}
+        current_squad_slots, current_squad_side = [], None
         raw_units.append({'side': 'END', 'text': 'END_MARKER'})
-
         for unit in raw_units:
-            text = unit['text']
-            side = unit['side']
-            
-            # Перевіряємо, чи цей слот - командир
+            text, side = unit['text'], unit['side']
             is_sl = any(re.search(pat, text, re.IGNORECASE) for pat in self.sl_patterns)
-            
-            # Якщо знайшли SL (і це не перший прохід) АБО якщо змінилася сторона
             if (is_sl and current_squad_slots) or (current_squad_side is not None and side != current_squad_side):
-                
-                # Обробляємо накопичене відділення
                 if current_squad_slots:
-                    first_slot = current_squad_slots[0]
-                    # Перевіряємо ще раз, чи перший слот - це SL
-                    first_is_sl = any(re.search(pat, first_slot, re.IGNORECASE) for pat in self.sl_patterns)
-                    
-                    if first_is_sl:
-                        g_idx = self._extract_group_index(first_slot)
-                        # Ключ унікальності: Сторона + Індекс.
-                        unique_key = (current_squad_side, g_idx if g_idx else first_slot)
-                        
-                        # Формуємо красиву назву
-                        name_buffer = first_slot
-                        for pat in self.sl_patterns:
-                            name_buffer = re.sub(pat, "", name_buffer, flags=re.IGNORECASE)
-                        name_buffer = re.sub(r'\(.*?\)', '', name_buffer)
-                        group_name = name_buffer.strip().strip("-").strip()
-                        
-                        if not group_name:
-                            group_name = f"Squad {g_idx}" if g_idx else "Command"
-                        
-                        full_group_name = f"[{current_squad_side}] {group_name}"
-
-                        # Нормалізуємо слоти
-                        final_slots = []
-                        for i, raw_s in enumerate(current_squad_slots):
-                            final_slots.append(f"{i+1}. {self._normalize_slot(raw_s)}")
-                        
-                        # Логіка анти-дублікатів
-                        should_add = True
-                        if unique_key in groups_data:
-                            if len(group_name) < len(groups_data[unique_key]['pure_name']):
-                                should_add = False
-                        
-                        if should_add:
-                            groups_data[unique_key] = {
-                                'title': full_group_name,
-                                'pure_name': group_name,
-                                'slots': final_slots,
-                                'side': current_squad_side
-                            }
-
+                    first = current_squad_slots[0]
+                    g_idx = self._extract_group_index(first)
+                    name_buffer = first
+                    for pat in self.sl_patterns: name_buffer = re.sub(pat, "", name_buffer, flags=re.IGNORECASE)
+                    group_name = re.sub(r'\(.*?\)', '', name_buffer).strip().strip("-").strip()
+                    if not group_name: group_name = f"Squad {g_idx}" if g_idx else "Command"
+                    final_slots = [f"{i+1}. {self._normalize_slot(s)}" for i, s in enumerate(current_squad_slots)]
+                    groups_data[(current_squad_side, g_idx or first)] = {
+                        'title': f"[{current_squad_side}] {group_name}",
+                        'slots': final_slots,
+                        'side': current_squad_side,
+                        'index': g_idx
+                    }
                 current_squad_slots = []
-            
             if text != 'END_MARKER':
                 current_squad_slots.append(text)
-                if len(current_squad_slots) == 1:
-                    current_squad_side = side
+                if len(current_squad_slots) == 1: current_squad_side = side
+        return sorted(groups_data.values(), key=lambda x: (x['side'], x['title']))
 
-        # Сортуємо: спочатку за стороною, потім за назвою
-        sorted_groups = sorted(groups_data.values(), key=lambda x: (x['side'], x['title']))
-        return sorted_groups
-
-# Створюємо екземпляр парсера
 sqm_parser = SqmParser()
 
 # ─── 4. Щотижневий нагадувач VTG ────────────────────────────────────────────────
@@ -714,24 +626,43 @@ async def _оновити(ctx: commands.Context):
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
 
-@bot.command(name="статус", aliases=["status"])
-async def _статус(ctx: commands.Context):
-    commit = subprocess.getoutput("git rev-parse --short HEAD")
-    await ctx.send(
-        f"🧠 Commit: `{commit}`\n"
-        f"📊 Sessions: {len(sessions)}\n"
-        f"📋 Claims: {sum(len(v) for v in claims.values())}"
-    )
+@bot.command(name='import_sqm')
+async def import_sqm(ctx, group_index: str = None):
+    """
+    Імпортує відділення з файлу mission.sqm.
+    Використання: !import_sqm 1-1 (і прикріпити файл)
+    """
+    if not ctx.message.attachments:
+        return await ctx.send("❌ Ти забув прикріпити файл `mission.sqm`!")
+    
+    if not group_index:
+        return await ctx.send("❌ Треба вказати індекс, наприклад: `!import_sqm 1-1`")
 
-@bot.command(name="gitpush")
-async def _gitpush(ctx: commands.Context):
-    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
-    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
-    emb.add_field(name="2. git add",       value="`git add .`",                         inline=False)
-    emb.add_field(name="3. git commit",    value='`git commit -m "Оновлення слота"`', inline=False)
-    emb.add_field(name="4. git push",      value="`git push origin main`",             inline=False)
-    emb.set_footer(text="Після push → !оновити")
-    await ctx.send(embed=emb)
+    attachment = ctx.message.attachments[0]
+    try:
+        file_bytes = await attachment.read()
+        # Декодуємо текст із файлу
+        content = file_bytes.decode('utf-8', errors='ignore')
+        
+        # Запускаємо наш парсер
+        all_groups = sqm_parser.process_file(content)
+        
+        # Шукаємо потрібне відділення
+        target = None
+        for g in all_groups:
+            if group_index in g['title'] or (g['index'] == group_index):
+                target = g
+                break
+        
+        if not target:
+            return await ctx.send(f"❌ Не знайшов відділення `{group_index}` у цьому файлі.")
+
+        # Виводимо готовий список слотів текстом
+        output = f"**{target['title']}**\n" + "\n".join(target['slots'])
+        await ctx.send(output)
+
+    except Exception as e:
+        await ctx.send(f"❌ Щось пішло не так: {e}")
 
 # ─── 12. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
