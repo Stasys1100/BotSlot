@@ -3,7 +3,7 @@ import re
 import subprocess
 import aiohttp
 import datetime
-import io  # [NEW] Додано для роботи з файлами в пам'яті
+import io
 from zoneinfo import ZoneInfo
 
 import discord
@@ -17,6 +17,8 @@ keep_alive()
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
+# Якщо потрібно: ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID"))
 
 # ─── 2. Інтенти та ініціалізація бота ───────────────────────────────────────────
 intents = discord.Intents.default()
@@ -27,9 +29,6 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # ─── 3. Конфігурація ────────────────────────────────────────────────────────────
 KYIV_TZ          = ZoneInfo("Europe/Kyiv")
 VTG_CHANNEL_ID   = 1160843618433630228
-ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
-# Якщо ви використовуєте функцію пересилання DM, розкоментуйте рядок нижче та додайте ID в .env
-# ADMIN_USER_ID    = int(os.getenv("ADMIN_USER_ID")) 
 
 processed_messages: set[int] = set()
 sessions: dict[int, dict] = {}            # message_id → { title, lines, owners, channel_id }
@@ -38,69 +37,174 @@ request_counter = 0                       # лічильник заявок
 
 TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
-DEFAULT_TITLE = "3. Prikaati 'Karhu' | Jalkaväen haara"
+DEFAULT_TITLE = "Prikaati 'Karhu' | Jalkaväen haara"
 
 # ─── [NEW] SQM PARSER LOGIC ─────────────────────────────────────────────────────
 class SqmParser:
     def __init__(self):
+        # 1. Паттерни для пошуку Командира (SL) різними мовами
+        # Додано: vadītājs (лат), sergeant, komandieris
         self.sl_patterns = [
             r"командир", r"squad leader", r"komandir", r"nodalas komandieris", 
-            r"sl", r"sql", r"officer", r"офіцер", r"lidem"
+            r"sl", r"sql", r"officer", r"офіцер", r"lidem", r"vadītājs", r"sergeant"
         ]
+        
+        # 2. Паттерн для пошуку індексу групи (наприклад, "1-4", "2-1")
         self.index_pattern = re.compile(r"\b(\d+-\d+)\b")
+        
+        # 3. Паттерн сторони
         self.side_pattern = re.compile(r'side="?(\w+)"?;', re.IGNORECASE)
 
     def _normalize_slot(self, text):
-        weapons = re.findall(r'\(.*?\)', text)
+        """
+        Очищає текст слота: 
+        - Залишає лише найдовшу зброю в дужках.
+        - Прибирає нумерацію на початку.
+        """
+        # Знаходимо всі варіанти тексту в дужках (зброю)
+        weapons = re.findall(r'\((.*?)\)', text)
+        
+        # Тимчасово видаляємо всі дужки з тексту, щоб очистити назву ролі
         text_no_weapons = re.sub(r'\(.*?\)', '', text)
-        best_weapon = max(weapons, key=len) if weapons else ""
-        text_clean = re.sub(r'^\d+[\.\)]\s*', '', text_no_weapons).replace('|', '').strip()
-        text_clean = re.sub(r'\s+', ' ', text_clean)
-        return f"{text_clean} ({best_weapon})" if best_weapon else text_clean
+        
+        # Вибираємо найдовшу назву зброї (логіка: (G36A3\AG-40) довше ніж (G36))
+        best_weapon = ""
+        if weapons:
+            best_weapon = max(weapons, key=len)
+        
+        # Чистимо текст від "1.", "2)", "|", зайвих пробілів
+        text_clean = re.sub(r'^\s*\d+[\.\)]\s*', '', text_no_weapons) 
+        text_clean = text_clean.replace('|', '').strip()
+        text_clean = re.sub(r'\s+', ' ', text_clean) 
+        
+        # Збираємо фінальний рядок
+        final_parts = [text_clean]
+        if best_weapon:
+            final_parts.append(f"({best_weapon})")
+            
+        return " ".join(final_parts)
 
-    def _extract_group_index(self, slot_text):
-        match = self.index_pattern.search(slot_text)
+    def _extract_group_index(self, text):
+        """Шукає індекс типу 1-4 у тексті."""
+        match = self.index_pattern.search(text)
         return match.group(1) if match else None
 
     def process_file(self, file_content_str):
+        """
+        Основний метод парсингу.
+        Повертає відсортований список груп без дублікатів.
+        """
         lines = file_content_str.splitlines()
-        raw_units, current_side = [], "UNKNOWN"
+        
+        raw_units = [] 
+        current_side = "UNKNOWN"
+        
+        # --- Етап 1: Лінійний прохід, збір всіх юнітів ---
         for line in lines:
             line = line.strip()
+            
+            # Зміна сторони
             side_match = self.side_pattern.search(line)
-            if side_match: current_side = side_match.group(1).upper()
+            if side_match:
+                current_side = side_match.group(1).upper()
+            
+            # Пошук тексту слота
             if line.startswith('text=') or line.startswith('description='):
                 match = re.search(r'"(.*)"', line)
-                if match and match.group(1) and not match.group(1).startswith("__"):
-                    raw_units.append({'side': current_side, 'text': match.group(1)})
+                if match:
+                    raw_text = match.group(1)
+                    # Ігноруємо порожні або системні слоти
+                    if raw_text and not raw_text.startswith("__"):
+                        raw_units.append({
+                            'side': current_side,
+                            'text': raw_text
+                        })
 
-        groups_data = {}
-        current_squad_slots, current_squad_side = [], None
+        # --- Етап 2: Формування відділень (Squads) ---
+        groups_map = {} # Key: (Side, Index), Value: GroupDict
+        
+        current_squad_slots = []
+        current_squad_side = None
+        
+        # Додаємо маркер кінця
         raw_units.append({'side': 'END', 'text': 'END_MARKER'})
+
         for unit in raw_units:
-            text, side = unit['text'], unit['side']
+            text = unit['text']
+            side = unit['side']
+            
+            # Перевіряємо, чи цей слот схожий на SL (початок нової групи)
             is_sl = any(re.search(pat, text, re.IGNORECASE) for pat in self.sl_patterns)
-            if (is_sl and current_squad_slots) or (current_squad_side is not None and side != current_squad_side):
+            
+            # Умова розриву групи: SL знайден або зміна сторони
+            should_close_group = (is_sl and current_squad_slots) or \
+                                 (current_squad_side is not None and side != current_squad_side)
+
+            if should_close_group:
+                # Обробляємо накопичене відділення
                 if current_squad_slots:
-                    first = current_squad_slots[0]
-                    g_idx = self._extract_group_index(first)
-                    name_buffer = first
-                    for pat in self.sl_patterns: name_buffer = re.sub(pat, "", name_buffer, flags=re.IGNORECASE)
-                    group_name = re.sub(r'\(.*?\)', '', name_buffer).strip().strip("-").strip()
-                    if not group_name: group_name = f"Squad {g_idx}" if g_idx else "Command"
-                    final_slots = [f"{i+1}. {self._normalize_slot(s)}" for i, s in enumerate(current_squad_slots)]
-                    groups_data[(current_squad_side, g_idx or first)] = {
-                        'title': f"[{current_squad_side}] {group_name}",
-                        'slots': final_slots,
-                        'side': current_squad_side,
-                        'index': g_idx
-                    }
+                    first_slot_raw = current_squad_slots[0]
+                    
+                    # --- ФІЛЬТР 1: Перший слот МАЄ БУТИ командиром ---
+                    first_is_sl = any(re.search(pat, first_slot_raw, re.IGNORECASE) for pat in self.sl_patterns)
+                    
+                    if first_is_sl:
+                        # Шукаємо індекс групи (наприклад "1-4")
+                        g_idx = self._extract_group_index(first_slot_raw)
+                        
+                        # Формуємо чисту назву групи
+                        name_buffer = first_slot_raw
+                        for pat in self.sl_patterns:
+                            name_buffer = re.sub(pat, "", name_buffer, flags=re.IGNORECASE)
+                        
+                        name_buffer = re.sub(r'\(.*?\)', '', name_buffer)
+                        group_name = name_buffer.replace('|', '').strip().strip("-").strip()
+                        
+                        if not group_name:
+                            group_name = f"Squad {g_idx}" if g_idx else "Infantry"
+                        
+                        full_title = f"[{current_squad_side}] {group_name}"
+
+                        # Нормалізуємо слоти
+                        formatted_slots = []
+                        for i, raw_s in enumerate(current_squad_slots):
+                            formatted_slots.append(f"{i+1}. {self._normalize_slot(raw_s)}")
+                        
+                        # --- ФІЛЬТР 2: Обробка дублікатів ---
+                        # Якщо індексу немає, використовуємо хеш, щоб не втратити унікальні
+                        if g_idx:
+                            unique_key = (current_squad_side, g_idx)
+                        else:
+                            unique_key = (current_squad_side, f"NO_IDX_{len(groups_map)}")
+
+                        new_group_data = {
+                            'title': full_title,
+                            'pure_name': group_name,
+                            'slots': formatted_slots,
+                            'side': current_squad_side,
+                            'group_index': g_idx  # Зберігаємо для фільтрації в команді
+                        }
+
+                        # Логіка заміни дубліката: залишаємо ту назву, яка довша
+                        if unique_key in groups_map:
+                            existing = groups_map[unique_key]
+                            if len(new_group_data['pure_name']) > len(existing['pure_name']):
+                                groups_map[unique_key] = new_group_data
+                        else:
+                            groups_map[unique_key] = new_group_data
+
                 current_squad_slots = []
+            
             if text != 'END_MARKER':
                 current_squad_slots.append(text)
-                if len(current_squad_slots) == 1: current_squad_side = side
-        return sorted(groups_data.values(), key=lambda x: (x['side'], x['title']))
+                if len(current_squad_slots) == 1:
+                    current_squad_side = side
 
+        # Сортуємо
+        sorted_groups = sorted(groups_map.values(), key=lambda x: (x['side'], x['title']))
+        return sorted_groups
+
+# Створюємо глобальний екземпляр
 sqm_parser = SqmParser()
 
 # ─── 4. Щотижневий нагадувач VTG ────────────────────────────────────────────────
@@ -133,7 +237,6 @@ class SlotButton(Button):
     def __init__(self, sid: int, idx: int):
         owner = sessions[sid]["owners"][idx]
         free = owner is None
-       
         label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
         style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
         super().__init__(label=label, style=style, custom_id=f"slot-{sid}-{idx}")
@@ -174,7 +277,7 @@ class SlotButton(Button):
 class SlotView(View):
     def __init__(self, sid: int):
         super().__init__(timeout=None)
-        if sid in sessions: # Додана перевірка для безпеки
+        if sid in sessions:
             for idx in range(len(sessions[sid]["lines"])):
                 self.add_item(SlotButton(sid, idx))
 
@@ -236,14 +339,7 @@ class ClaimSlotView(View):
 
 # ─── 8. Modal для рішення ───────────────────────────────────────────────────────
 class DecisionModal(Modal):
-    def __init__(
-        self,
-        sid: int,
-        idx: int,
-        claimant_id: int,
-        admin_msg_id: int,
-        accept: bool
-    ):
+    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
         title = "Причина призначення" if accept else "Причина відмови"
         super().__init__(title=title)
         self.sid = sid
@@ -269,7 +365,6 @@ class DecisionModal(Modal):
             if claimant in lst:
                 lst.remove(claimant)
 
-        # Оновлюємо головне повідомлення
         ch = bot.get_channel(sess["channel_id"])
         if ch:
             try:
@@ -278,27 +373,16 @@ class DecisionModal(Modal):
             except:
                 pass
 
-        # DM користувачам
         try:
             if self.accept:
-                await claimant.send(
-                    f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}».\n"
-                    f"Причина: {reason}"
-                )
+                await claimant.send(f"✅ Вас призначено на слот #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
                 if old_owner and old_owner != claimant:
-                    await old_owner.send(
-                        f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention}.\n"
-                        f"Причина: {reason}"
-                    )
+                    await old_owner.send(f"⚠️ Ваш слот #{self.idx+1} передано {claimant.mention}.\nПричина: {reason}")
             else:
-                await claimant.send(
-                    f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\n"
-                    f"Причина: {reason}"
-                )
+                await claimant.send(f"❌ Ваша заявка на слот #{self.idx+1} у «{sess['title']}» відхилена.\nПричина: {reason}")
         except:
             pass
 
-        # Видаляємо адмін-повідомлення
         admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
         if admin_ch:
             try:
@@ -310,14 +394,7 @@ class DecisionModal(Modal):
         await inter.response.send_message("✔️ Готово.", ephemeral=True)
 
 class ClaimDecisionButton(Button):
-    def __init__(
-        self,
-        sid: int,
-        idx: int,
-        claimant_id: int,
-        admin_msg_id: int,
-        accept: bool
-    ):
+    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int, accept: bool):
         label = "✅ Призначити" if accept else "❌ Відхилити"
         style = discord.ButtonStyle.success if accept else discord.ButtonStyle.danger
         tag = "accept" if accept else "deny"
@@ -326,35 +403,20 @@ class ClaimDecisionButton(Button):
             style=style,
             custom_id=f"dec-{tag}-{sid}-{idx}-{claimant_id}-{admin_msg_id}"
         )
-        self.sid = sid
-        self.idx = idx
-        self.claimant_id = claimant_id
-        self.admin_msg_id = admin_msg_id
-        self.accept = accept
+        self.sid, self.idx = sid, idx
+        self.claimant_id, self.admin_msg_id, self.accept = claimant_id, admin_msg_id, accept
 
     async def callback(self, inter: discord.Interaction):
-        modal = DecisionModal(
-            self.sid,
-            self.idx,
-            self.claimant_id,
-            self.admin_msg_id,
-            self.accept
-        )
+        modal = DecisionModal(self.sid, self.idx, self.claimant_id, self.admin_msg_id, self.accept)
         await inter.response.send_modal(modal)
 
 class ClaimDecisionView(View):
-    def __init__(
-        self,
-        sid: int,
-        idx: int,
-        claimant_id: int,
-        admin_msg_id: int
-    ):
+    def __init__(self, sid: int, idx: int, claimant_id: int, admin_msg_id: int):
         super().__init__(timeout=None)
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, True))
         self.add_item(ClaimDecisionButton(sid, idx, claimant_id, admin_msg_id, False))
 
-# ─── 9. Зняття через кнопки та Modal ───────────────────────────────────────────
+# ─── 9. Зняття та запис (Admin) ────────────────────────────────────────────────
 class RemoveSlotModal(Modal):
     def __init__(self, sid: int, idx: int):
         super().__init__(title="Причина звільнення")
@@ -368,9 +430,7 @@ class RemoveSlotModal(Modal):
         reason = self.reason.value
 
         if not owner:
-            return await inter.response.send_message(
-                f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True
-            )
+            return await inter.response.send_message(f"⚠️ Слот #{self.idx+1} вже вільний.", ephemeral=True)
 
         sess["owners"][self.idx] = None
         ch = bot.get_channel(sess["channel_id"])
@@ -382,24 +442,15 @@ class RemoveSlotModal(Modal):
                 pass
 
         try:
-            await owner.send(
-                f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\n"
-                f"Причина: {reason}"
-            )
+            await owner.send(f"❗ Ви звільнені зі слоту #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
         except:
             pass
 
-        await inter.response.send_message(
-            f"✅ Слот #{self.idx+1} звільнено.", ephemeral=True
-        )
+        await inter.response.send_message(f"✅ Слот #{self.idx+1} звільнено.", ephemeral=True)
 
 class RemoveSlotButton(Button):
     def __init__(self, sid: int, idx: int):
-        super().__init__(
-            label=str(idx+1),
-            style=discord.ButtonStyle.danger,
-            custom_id=f"remove-{sid}-{idx}"
-        )
+        super().__init__(label=str(idx+1), style=discord.ButtonStyle.danger, custom_id=f"remove-{sid}-{idx}")
         self.sid, self.idx = sid, idx
 
     async def callback(self, inter: discord.Interaction):
@@ -408,7 +459,7 @@ class RemoveSlotButton(Button):
 class RemoveSlotView(View):
     def __init__(self, sid: int):
         super().__init__(timeout=None)
-        if sid in sessions: # Додана перевірка
+        if sid in sessions:
             for idx in range(len(sessions[sid]["lines"])):
                 self.add_item(RemoveSlotButton(sid, idx))
 
@@ -419,23 +470,7 @@ async def зняти(ctx: commands.Context, session_msg_id: int):
     session = sessions.get(session_msg_id)
     if not session:
         return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
-    await ctx.send(
-        f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:",
-        view=RemoveSlotView(session_msg_id)
-    )
-
-# ─── 9.5. Команда !записати ─────────────────────────────────────────────────────
-@bot.command(name="записати")
-async def записати(ctx: commands.Context, session_msg_id: int, member: discord.Member):
-    if ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
-    session = sessions.get(session_msg_id)
-    if not session:
-        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
-    await ctx.send(
-        f"📋 Оберіть слот для запису {member.mention} в сесії {session_msg_id}:",
-        view=AssignSlotView(session_msg_id, member.id)
-    )
+    await ctx.send(f"📋 Оберіть слот для звільнення в сесії {session_msg_id}:", view=RemoveSlotView(session_msg_id))
 
 class AssignSlotModal(Modal):
     def __init__(self, sid: int, idx: int, uid: int):
@@ -450,14 +485,9 @@ class AssignSlotModal(Modal):
         reason = self.reason.value
 
         if sess["owners"][self.idx] == user:
-            return await inter.response.send_message(
-                f"⚠️ {user.mention} вже записаний на слот #{self.idx+1}.", ephemeral=True
-            )
+            return await inter.response.send_message(f"⚠️ {user.mention} вже записаний.", ephemeral=True)
         if sess["owners"][self.idx] is not None:
-            return await inter.response.send_message(
-                f"⚠️ Слот #{self.idx+1} вже зайнятий {sess['owners'][self.idx].mention}.", 
-                ephemeral=True
-            )
+            return await inter.response.send_message(f"⚠️ Слот #{self.idx+1} зайнятий.", ephemeral=True)
 
         sess["owners"][self.idx] = user
         ch = bot.get_channel(sess["channel_id"])
@@ -467,25 +497,15 @@ class AssignSlotModal(Modal):
                 await msg.edit(embed=build_embed(sess), view=SlotView(self.sid))
             except:
                 pass
-
         try:
-            await user.send(
-                f"✅ Вас записано на слот #{self.idx+1} у «{sess['title']}».\nПричина: {reason}"
-            )
+            await user.send(f"✅ Вас записано на слот #{self.idx+1} у «{sess['title']}».\nПричина: {reason}")
         except:
             pass
-
-        await inter.response.send_message(
-            f"📌 {user.mention} записано на слот #{self.idx+1}.", ephemeral=True
-        )
+        await inter.response.send_message(f"📌 {user.mention} записано на слот #{self.idx+1}.", ephemeral=True)
 
 class AssignSlotButton(Button):
     def __init__(self, sid: int, idx: int, uid: int):
-        super().__init__(
-            label=str(idx+1),
-            style=discord.ButtonStyle.success,
-            custom_id=f"assign-{sid}-{idx}-{uid}"
-        )
+        super().__init__(label=str(idx+1), style=discord.ButtonStyle.success, custom_id=f"assign-{sid}-{idx}-{uid}")
         self.sid, self.idx, self.uid = sid, idx, uid
 
     async def callback(self, inter: discord.Interaction):
@@ -498,6 +518,15 @@ class AssignSlotView(View):
             for idx in range(len(sessions[sid]["lines"])):
                 self.add_item(AssignSlotButton(sid, idx, uid))
 
+@bot.command(name="записати")
+async def записати(ctx: commands.Context, session_msg_id: int, member: discord.Member):
+    if ctx.channel.id != ADMIN_CHANNEL_ID:
+        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
+    session = sessions.get(session_msg_id)
+    if not session:
+        return await ctx.send(f"❌ Сесія з ID {session_msg_id} не знайдена.")
+    await ctx.send(f"📋 Оберіть слот для запису {member.mention} в сесії {session_msg_id}:", view=AssignSlotView(session_msg_id, member.id))
+
 # ─── 10. Події on_ready та on_message ────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -509,11 +538,7 @@ async def on_ready():
         color=discord.Color.green()
     )
     for guild in bot.guilds:
-        ch = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel)
-                      and c.permissions_for(guild.me).send_messages,
-            guild.text_channels
-        )
+        ch = discord.utils.find(lambda c: isinstance(c, discord.TextChannel) and c.permissions_for(guild.me).send_messages, guild.text_channels)
         if ch:
             try:
                 await ch.send(embed=embed)
@@ -524,9 +549,6 @@ async def on_ready():
 
 @bot.event
 async def on_message(message: discord.Message):
-    # [NEW] Тут можна додати логіку пересилання DM, якщо ви хочете
-    # (якщо ви хочете об'єднати з кодом із попередньої розмови)
-    
     if message.author.bot or message.id in processed_messages:
         return
 
@@ -539,11 +561,7 @@ async def on_message(message: discord.Message):
                 continue
             m = TRIGGER_RE.match(txt)
             if m:
-                owner = next(
-                    (u for u in message.mentions
-                     if f"<@{u.id}>" in txt or f"<@!{u.id}>" in txt),
-                    None
-                )
+                owner = next((u for u in message.mentions if f"<@{u.id}>" in txt or f"<@!{u.id}>" in txt), None)
                 clean = MENTION_RE.sub("", m.group(2)).strip()
                 slots.append(clean)
                 owners.append(owner)
@@ -552,71 +570,88 @@ async def on_message(message: discord.Message):
 
         slots, owners = slots[:25], owners[:len(slots)]
         sess = {
-            "title":      header or DEFAULT_TITLE,
-            "lines":      slots,
-            "owners":     owners,
+            "title": header or DEFAULT_TITLE,
+            "lines": slots,
+            "owners": owners,
             "channel_id": message.channel.id
         }
         embed = build_embed(sess)
-        sent  = await message.channel.send(embed=embed)
+        sent = await message.channel.send(embed=embed)
         sessions[sent.id] = sess
         await sent.edit(view=SlotView(sent.id))
 
     await bot.process_commands(message)
 
-# ─── 11. Сервісні команди ───────────────────────────────────────────────────────
-# [NEW] КОМАНДА ДЛЯ ІМПОРТУ SQM
+# ─── 11. Сервісні команди та Імпорт ─────────────────────────────────────────────
 @bot.command(name='import_sqm')
-async def import_sqm(ctx):
-    # Перевірка на наявність файлу
+async def import_sqm(ctx, filter_idx: str = None):
+    """
+    Імпорт слотів з файлу mission.sqm.
+    Можна вказати фільтр: !import_sqm 1-4
+    """
     if not ctx.message.attachments:
-        await ctx.send("❌ Будь ласка, прикріпіть файл mission.sqm до повідомлення.")
+        await ctx.send("❌ Будь ласка, прикріпіть файл `mission.sqm` до повідомлення.")
         return
 
     attachment = ctx.message.attachments[0]
-    if not attachment.filename.endswith('.sqm'):
-        await ctx.send("❌ Це не .sqm файл (має бути mission.sqm).")
+    valid_ext = ('.sqm', '.txt', '.cpp')
+    if not attachment.filename.lower().endswith(valid_ext):
+        await ctx.send("❌ Файл повинен мати розширення .sqm (або .txt).")
         return
 
-    await ctx.send("⏳ Обробка файлу (це може зайняти кілька секунд)...")
+    status_msg = await ctx.send("⏳ Завантаження та обробка файлу...")
 
     try:
-        # Завантажуємо файл
         file_bytes = await attachment.read()
         content = file_bytes.decode('utf-8', errors='ignore')
 
         # Запускаємо парсер
         groups = sqm_parser.process_file(content)
 
+        # Логіка фільтрації, якщо вказано аргумент
+        if filter_idx:
+            filtered_groups = []
+            filter_lower = filter_idx.lower()
+            for g in groups:
+                # Перевіряємо точний збіг індексу АБО входження в назву
+                match_index = g.get('group_index') and g['group_index'] == filter_idx
+                match_title = filter_lower in g['title'].lower()
+                
+                if match_index or match_title:
+                    filtered_groups.append(g)
+            
+            if not filtered_groups:
+                await status_msg.edit(content=f"❌ За запитом `{filter_idx}` відділень не знайдено.")
+                return
+            groups = filtered_groups
+
         if not groups:
-            await ctx.send("⚠️ Відділень не знайдено. Перевірте, чи є у файлі слоти з назвами 'Командир', 'SL' тощо.")
+            await status_msg.edit(content="⚠️ Відділень не знайдено.")
             return
 
-        # Формування та відправка повідомлень
-        current_message = ""
+        await status_msg.edit(content=f"✅ Знайдено відділень: {len(groups)}. Генерую списки...")
+
+        current_message_content = ""
         
         for group in groups:
-            # Формуємо блок тексту для одного відділення
-            block = f"**{group['title']}**\n"
-            block += "\n".join(group['slots'])
-            block += "\n\n"
+            header = f"**{group['title']}**"
+            slots_block = "\n".join(group['slots'])
+            full_block = f"{header}\n```\n{slots_block}\n```\n"
             
-            # Перевірка ліміту Discord (2000 символів)
-            if len(current_message) + len(block) > 1900:
-                await ctx.send(f"```{current_message}```")
-                current_message = ""
+            if len(current_message_content) + len(full_block) > 1900:
+                await ctx.send(current_message_content)
+                current_message_content = ""
             
-            current_message += block
+            current_message_content += full_block
 
-        # Відправка залишку
-        if current_message:
-            await ctx.send(f"```{current_message}```")
+        if current_message_content:
+            await ctx.send(current_message_content)
             
-        await ctx.send(f"✅ Імпорт завершено. Знайдено відділень: {len(groups)}")
+        await ctx.send("🏁 Імпорт завершено!")
 
     except Exception as e:
         print(f"Error parsing SQM: {e}")
-        await ctx.send(f"❌ Сталася критична помилка при обробці: {e}")
+        await ctx.send(f"❌ Помилка: {e}")
 
 @bot.command(name="оновити", aliases=["update"])
 async def _оновити(ctx: commands.Context):
@@ -626,43 +661,19 @@ async def _оновити(ctx: commands.Context):
         await sess.post(DEPLOY_HOOK_URL)
     await ctx.send("🔄 Деплой тригерено!")
 
-@bot.command(name='import_sqm')
-async def import_sqm(ctx, group_index: str = None):
-    """
-    Імпортує відділення з файлу mission.sqm.
-    Використання: !import_sqm 1-1 (і прикріпити файл)
-    """
-    if not ctx.message.attachments:
-        return await ctx.send("❌ Ти забув прикріпити файл `mission.sqm`!")
-    
-    if not group_index:
-        return await ctx.send("❌ Треба вказати індекс, наприклад: `!import_sqm 1-1`")
+@bot.command(name="статус", aliases=["status"])
+async def _статус(ctx: commands.Context):
+    commit = subprocess.getoutput("git rev-parse --short HEAD")
+    await ctx.send(f"🧠 Commit: `{commit}`\n📊 Sessions: {len(sessions)}\n📋 Claims: {sum(len(v) for v in claims.values())}")
 
-    attachment = ctx.message.attachments[0]
-    try:
-        file_bytes = await attachment.read()
-        # Декодуємо текст із файлу
-        content = file_bytes.decode('utf-8', errors='ignore')
-        
-        # Запускаємо наш парсер
-        all_groups = sqm_parser.process_file(content)
-        
-        # Шукаємо потрібне відділення
-        target = None
-        for g in all_groups:
-            if group_index in g['title'] or (g['index'] == group_index):
-                target = g
-                break
-        
-        if not target:
-            return await ctx.send(f"❌ Не знайшов відділення `{group_index}` у цьому файлі.")
-
-        # Виводимо готовий список слотів текстом
-        output = f"**{target['title']}**\n" + "\n".join(target['slots'])
-        await ctx.send(output)
-
-    except Exception as e:
-        await ctx.send(f"❌ Щось пішло не так: {e}")
+@bot.command(name="gitpush")
+async def _gitpush(ctx: commands.Context):
+    emb = discord.Embed(title="🛠 Git Push інструкція", color=discord.Color.orange())
+    emb.add_field(name="1. cd до папки", value="`cd C:\\Users\\stas\\botslot`", inline=False)
+    emb.add_field(name="2. git add", value="`git add .`", inline=False)
+    emb.add_field(name="3. git commit", value='`git commit -m "Оновлення"`', inline=False)
+    emb.add_field(name="4. git push", value="`git push origin main`", inline=False)
+    await ctx.send(embed=emb)
 
 # ─── 12. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
