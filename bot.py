@@ -38,46 +38,39 @@ TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
 MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
 DEFAULT_TITLE = "Prikaati 'Karhu' | Jalkaväen haara"
 
-# ─── 4. SQM PARSER (ВИПРАВЛЕНО) ────────────────────────────────────────────────
+# ─── 4. SQM PARSER (ВИПРАВЛЕНО: ПІДТРИМКА ПРОБІЛІВ) ─────────────────────────────
 class SqmParser:
     def __init__(self):
-        # Слова-тригери для визначення початку нової групи
+        # Паттерни для пошуку Командира
         self.sl_patterns = [
             r"командир", r"squad leader", r"komandir", r"nodalas komandieris", 
             r"sl", r"sql", r"officer", r"офіцер", r"lidem", r"vadītājs", r"sergeant",
             r"leader", r"ст\.", r"старший"
         ]
         self.index_pattern = re.compile(r"\b(\d+-\d+)\b")
-        self.side_pattern = re.compile(r'side="?(\w+)"?;', re.IGNORECASE)
+        
+        # [FIX] Тепер бачить 'side="WEST"' і 'side = "WEST"' (з пробілами)
+        self.side_pattern = re.compile(r'side\s*=\s*"?(\w+)"?;', re.IGNORECASE)
+        # [FIX] Тепер бачить 'text="Slot"' і 'text = "Slot"'
+        self.text_pattern = re.compile(r'(?:text|description)\s*=\s*"(.*)"', re.IGNORECASE)
 
     def _clean_role_name(self, text):
-        """
-        Очищає назву ролі.
-        Вхід: '1. Командир відділення@Альфа 1-4 (AK-74)'
-        Вихід: 'Командир відділення'
-        """
-        # 1. Прибираємо зброю в дужках тимчасово
-        text = re.sub(r'\(.*?\)', '', text)
-        # 2. Прибираємо нумерацію на початку (1. 2.)
-        text = re.sub(r'^\s*\d+[\.\)]\s*', '', text)
-        # 3. Розділяємо по @. Беремо ЛІВУ частину (це роль)
+        """Очищає назву ролі від сміття, зброї та частини після @"""
+        text = re.sub(r'\(.*?\)', '', text)          # Видаляємо зброю в дужках
+        text = re.sub(r'^\s*\d+[\.\)]\s*', '', text) # Видаляємо нумерацію 1.
         if "@" in text:
-            text = text.split("@")[0]
+            text = text.split("@")[0]                # Беремо ліву частину від @
         return text.strip()
 
     def _normalize_slot(self, text):
-        """Формує фінальний рядок слота."""
-        # Шукаємо зброю в оригінальному тексті
+        """Формує красивий рядок: Роль (Зброя)"""
         weapons = re.findall(r'\((.*?)\)', text)
         best_weapon = max(weapons, key=len) if weapons else ""
-
-        # Отримуємо чисту назву ролі
         role_clean = self._clean_role_name(text)
         
         final_parts = [role_clean]
         if best_weapon:
             final_parts.append(f"({best_weapon})")
-        
         return " ".join(final_parts)
 
     def _extract_group_index(self, text):
@@ -89,60 +82,61 @@ class SqmParser:
         raw_units = [] 
         current_side = "UNKNOWN"
         
-        # Етап 1: Збір юнітів із файлу
+        # Етап 1: Надійний збір юнітів (враховуючи пробіли)
         for line in lines:
             line = line.strip()
-            # Пошук зміни сторони
+            
+            # Пошук сторони
             side_match = self.side_pattern.search(line)
             if side_match:
                 current_side = side_match.group(1).upper()
             
-            # Пошук тексту
-            if line.startswith('text=') or line.startswith('description='):
-                match = re.search(r'"(.*)"', line)
-                if match:
-                    raw_text = match.group(1)
-                    if raw_text and not raw_text.startswith("__"):
-                        raw_units.append({'side': current_side, 'text': raw_text})
+            # Пошук тексту слота
+            text_match = self.text_pattern.search(line)
+            if text_match:
+                raw_text = text_match.group(1)
+                # Фільтруємо системні змінні (наприклад __HEADER__)
+                if raw_text and not raw_text.startswith("__"):
+                    raw_units.append({'side': current_side, 'text': raw_text})
 
-        # Етап 2: Групування
+        # Етап 2: Розумне групування
         groups_map = {} 
         current_squad_slots = []
         current_squad_side = None
         
-        # Маркер кінця файлу
         raw_units.append({'side': 'END', 'text': 'END_MARKER'})
 
         for unit in raw_units:
             text = unit['text']
             side = unit['side']
             
-            # Чи це командир (початок нової групи)?
+            # Перевірка: чи це початок нової групи (SL)?
             is_sl = any(re.search(pat, text, re.IGNORECASE) for pat in self.sl_patterns)
             
-            # Умова закриття попередньої групи
-            should_close = (is_sl and current_squad_slots) or \
-                           (current_squad_side is not None and side != current_squad_side)
+            # Умова закриття попередньої групи:
+            # 1. Знайшли нового командира, і у нас вже є відкрита група.
+            # 2. АБО змінилася сторона (наприклад, йшли WEST, почалися EAST).
+            should_close_group = (is_sl and current_squad_slots) or \
+                                 (current_squad_side is not None and side != current_squad_side)
 
-            if should_close:
+            if should_close_group:
                 if current_squad_slots:
-                    first_raw = current_squad_slots[0]
-                    # Перевіряємо ще раз, чи перший слот - командир
-                    if any(re.search(pat, first_raw, re.IGNORECASE) for pat in self.sl_patterns):
+                    first_slot_raw = current_squad_slots[0]
+                    # Фінальна перевірка, що група починається з SL
+                    if any(re.search(pat, first_slot_raw, re.IGNORECASE) for pat in self.sl_patterns):
                         
-                        g_idx = self._extract_group_index(first_raw)
+                        g_idx = self._extract_group_index(first_slot_raw)
                         group_name = ""
 
-                        # --- Логіка витягування назви (ПРАВА частина від @) ---
-                        if "@" in first_raw:
-                            parts = first_raw.split("@", 1)
-                            # Права частина - назва групи
+                        # [FIX] Логіка назви з @: Назва праворуч від @
+                        if "@" in first_slot_raw:
+                            parts = first_slot_raw.split("@", 1)
                             group_name = parts[1].strip()
-                            # Прибираємо зброю з назви групи, якщо вона там є
+                            # Чистимо назву групи від дужок зброї
                             group_name = re.sub(r'\(.*?\)', '', group_name).strip()
                         else:
-                            # Фолбек: якщо @ немає
-                            name_buffer = first_raw
+                            # Фолбек: якщо немає @, чистимо вручну
+                            name_buffer = first_slot_raw
                             for pat in self.sl_patterns:
                                 name_buffer = re.sub(pat, "", name_buffer, flags=re.IGNORECASE)
                             group_name = re.sub(r'\(.*?\)', '', name_buffer).replace('|', '').strip().strip("-").strip()
@@ -152,16 +146,15 @@ class SqmParser:
                         
                         full_title = f"[{current_squad_side}] {group_name}"
 
-                        # --- Формування слотів ---
                         formatted_slots = []
                         for i, raw_s in enumerate(current_squad_slots):
                             formatted_slots.append(f"{i+1}. {self._normalize_slot(raw_s)}")
                         
-                        # --- КЛЮЧ УНІКАЛЬНОСТІ (ВИПРАВЛЕНО) ---
-                        # Тепер ключ включає назву групи. Це запобігає злиттю WEST Alpha і EAST Alpha.
+                        # [FIX] Ключ унікальності тепер: СТОРОНА + НАЗВА
+                        # Це гарантує, що [WEST] Alpha 1-4 і [EAST] Alpha 1-4 будуть окремими групами.
                         unique_key = (current_squad_side, group_name)
 
-                        new_group = {
+                        new_group_data = {
                             'title': full_title,
                             'pure_name': group_name,
                             'slots': formatted_slots,
@@ -169,114 +162,199 @@ class SqmParser:
                             'group_index': g_idx
                         }
 
-                        # Якщо така група вже є (наприклад, дублікат в файлі),
-                        # залишаємо ту, де слотів більше (або просто перезаписуємо)
-                        groups_map[unique_key] = new_group
+                        # Якщо знайдено точний дублікат (однакова сторона і назва), перезаписуємо, якщо новий довший
+                        groups_map[unique_key] = new_group_data
 
                 current_squad_slots = []
-
+            
             if text != 'END_MARKER':
                 current_squad_slots.append(text)
+                # Фіксуємо сторону групи по першому юніту (командиру)
                 if len(current_squad_slots) == 1:
                     current_squad_side = side
 
-        # Сортування: спочатку за стороною, потім за назвою
         return sorted(groups_map.values(), key=lambda x: (x['side'], x['title']))
 
 sqm_parser = SqmParser()
-# ─── 5. Логіка відображення ─────────────────────────────────────────────────────
-@tasks.loop(minutes=1)
-async def vtg_reminder():
-    now = datetime.datetime.now(KYIV_TZ)
-    if now.weekday() in (4, 6) and now.hour == 19 and now.minute == 30:
-        ch = bot.get_channel(VTG_CHANNEL_ID)
-        if ch:
-            try: await ch.send("||@everyone||\n**Сбор VTG**")
-            except: pass
+import os
+import re
+import subprocess
+import aiohttp
+import datetime
+import io
+from zoneinfo import ZoneInfo
 
-def build_embed(sess: dict) -> discord.Embed:
-    embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
-    lines = []
-    for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-        prefix = f"{i+1}. "
-        if owner:
-            lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
-        else:
-            lines.append(f"{prefix}{text}")
-    embed.description = "\n".join(lines)
-    return embed
+import discord
+from discord.ext import commands, tasks
+from discord.ui import View, Button, Modal, TextInput
+from dotenv import load_dotenv
+from keep_alive import keep_alive
 
-class SlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        owner = sessions[sid]["owners"][idx]
-        free = owner is None
-        label = f"{idx+1}. {'Зайняти' if free else 'Відмовитись'}"
-        style = discord.ButtonStyle.success if free else discord.ButtonStyle.danger
-        super().__init__(label=label, style=style, custom_id=f"slot-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
+# ─── 1. Keep-alive та ENV ───────────────────────────────────────────────────────
+keep_alive()
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+DEPLOY_HOOK_URL = os.getenv("DEPLOY_HOOK_URL")
+ADMIN_CHANNEL_ID = int(os.getenv("ADMIN_CHANNEL_ID"))
 
-    async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        owner = sess["owners"][self.idx]
-        ch_id = sess["channel_id"]
+# ─── 2. Інтенти та ініціалізація бота ───────────────────────────────────────────
+intents = discord.Intents.default()
+intents.guilds = True
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-        if owner is None:
-            # Перевірка на мульти-слот
-            for s in sessions.values():
-                if s["channel_id"] == ch_id and user in s["owners"]:
-                    return await inter.response.send_message("⚠️ Ви вже маєте слот.", ephemeral=True)
-            sess["owners"][self.idx] = user
-        elif owner == user:
-            sess["owners"][self.idx] = None
-        else:
-            return await inter.response.send_message(f"⚠️ Зайнято {owner.mention}.", view=ClaimSlotView(self.sid, self.idx), ephemeral=True)
+# ─── 3. Конфігурація ────────────────────────────────────────────────────────────
+KYIV_TZ          = ZoneInfo("Europe/Kyiv")
+VTG_CHANNEL_ID   = 1160843618433630228
+
+processed_messages: set[int] = set()
+sessions: dict[int, dict] = {}            
+claims: dict[tuple[int,int], list] = {}   
+request_counter = 0                       
+
+TRIGGER_RE    = re.compile(r'^\s*(\d+)[\.:]\s*(.+)$')
+MENTION_RE    = re.compile(r'<@!?(?P<id>\d+)>')
+DEFAULT_TITLE = "Prikaati 'Karhu' | Jalkaväen haara"
+
+# ─── 4. SQM PARSER (ВИПРАВЛЕНО: ПІДТРИМКА ПРОБІЛІВ) ─────────────────────────────
+class SqmParser:
+    def __init__(self):
+        # Паттерни для пошуку Командира
+        self.sl_patterns = [
+            r"командир", r"squad leader", r"komandir", r"nodalas komandieris", 
+            r"sl", r"sql", r"officer", r"офіцер", r"lidem", r"vadītājs", r"sergeant",
+            r"leader", r"ст\.", r"старший"
+        ]
+        self.index_pattern = re.compile(r"\b(\d+-\d+)\b")
+        
+        # [FIX] Тепер бачить 'side="WEST"' і 'side = "WEST"' (з пробілами)
+        self.side_pattern = re.compile(r'side\s*=\s*"?(\w+)"?;', re.IGNORECASE)
+        # [FIX] Тепер бачить 'text="Slot"' і 'text = "Slot"'
+        self.text_pattern = re.compile(r'(?:text|description)\s*=\s*"(.*)"', re.IGNORECASE)
+
+    def _clean_role_name(self, text):
+        """Очищає назву ролі від сміття, зброї та частини після @"""
+        text = re.sub(r'\(.*?\)', '', text)          # Видаляємо зброю в дужках
+        text = re.sub(r'^\s*\d+[\.\)]\s*', '', text) # Видаляємо нумерацію 1.
+        if "@" in text:
+            text = text.split("@")[0]                # Беремо ліву частину від @
+        return text.strip()
+
+    def _normalize_slot(self, text):
+        """Формує красивий рядок: Роль (Зброя)"""
+        weapons = re.findall(r'\((.*?)\)', text)
+        best_weapon = max(weapons, key=len) if weapons else ""
+        role_clean = self._clean_role_name(text)
+        
+        final_parts = [role_clean]
+        if best_weapon:
+            final_parts.append(f"({best_weapon})")
+        return " ".join(final_parts)
+
+    def _extract_group_index(self, text):
+        match = self.index_pattern.search(text)
+        return match.group(1) if match else None
+
+    def process_file(self, file_content_str):
+        lines = file_content_str.splitlines()
+        raw_units = [] 
+        current_side = "UNKNOWN"
+        
+        # Етап 1: Надійний збір юнітів (враховуючи пробіли)
+        for line in lines:
+            line = line.strip()
             
-        await inter.response.edit_message(embed=build_embed(sess), view=SlotView(self.sid))
+            # Пошук сторони
+            side_match = self.side_pattern.search(line)
+            if side_match:
+                current_side = side_match.group(1).upper()
+            
+            # Пошук тексту слота
+            text_match = self.text_pattern.search(line)
+            if text_match:
+                raw_text = text_match.group(1)
+                # Фільтруємо системні змінні (наприклад __HEADER__)
+                if raw_text and not raw_text.startswith("__"):
+                    raw_units.append({'side': current_side, 'text': raw_text})
 
-class SlotView(View):
-    def __init__(self, sid: int):
-        super().__init__(timeout=None)
-        if sid in sessions:
-            for idx in range(len(sessions[sid]["lines"])):
-                self.add_item(SlotButton(sid, idx))
-
-class ClaimSlotButton(Button):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(label="❗ Претендувати", style=discord.ButtonStyle.primary, custom_id=f"claim-{sid}-{idx}")
-        self.sid, self.idx = sid, idx
-
-    async def callback(self, inter: discord.Interaction):
-        user = inter.user
-        sess = sessions[self.sid]
-        for s in sessions.values():
-            if s["channel_id"] == sess["channel_id"] and user in s["owners"]:
-                return await inter.response.send_message("⚠️ Ви вже маєте слот.", ephemeral=True)
+        # Етап 2: Розумне групування
+        groups_map = {} 
+        current_squad_slots = []
+        current_squad_side = None
         
-        key = (self.sid, self.idx)
-        lst = claims.setdefault(key, [])
-        if user in lst:
-            return await inter.response.send_message("ℹ️ Заявка вже є.", ephemeral=True)
-        lst.append(user)
-        await inter.response.send_message("✅ Заявка надіслана.", ephemeral=True)
-        
-        global request_counter
-        request_counter += 1
-        embed = discord.Embed(title=f"📝 Заявка #{request_counter}", description=sess["title"], color=discord.Color.orange())
-        embed.add_field(name="Слот", value=str(self.idx+1))
-        embed.add_field(name="Власник", value=sess["owners"][self.idx].mention if sess["owners"][self.idx] else "Вільний")
-        embed.add_field(name="Кандидат", value=user.mention, inline=False)
-        
-        admin_ch = bot.get_channel(ADMIN_CHANNEL_ID)
-        if admin_ch:
-            msg = await admin_ch.send(embed=embed)
-            await msg.edit(view=ClaimDecisionView(self.sid, self.idx, user.id, msg.id))
+        raw_units.append({'side': 'END', 'text': 'END_MARKER'})
 
-class ClaimSlotView(View):
-    def __init__(self, sid: int, idx: int):
-        super().__init__(timeout=None)
-        self.add_item(ClaimSlotButton(sid, idx))
-        # ─── 6. Адмін-інструментарій ────────────────────────────────────────────────────
+        for unit in raw_units:
+            text = unit['text']
+            side = unit['side']
+            
+            # Перевірка: чи це початок нової групи (SL)?
+            is_sl = any(re.search(pat, text, re.IGNORECASE) for pat in self.sl_patterns)
+            
+            # Умова закриття попередньої групи:
+            # 1. Знайшли нового командира, і у нас вже є відкрита група.
+            # 2. АБО змінилася сторона (наприклад, йшли WEST, почалися EAST).
+            should_close_group = (is_sl and current_squad_slots) or \
+                                 (current_squad_side is not None and side != current_squad_side)
+
+            if should_close_group:
+                if current_squad_slots:
+                    first_slot_raw = current_squad_slots[0]
+                    # Фінальна перевірка, що група починається з SL
+                    if any(re.search(pat, first_slot_raw, re.IGNORECASE) for pat in self.sl_patterns):
+                        
+                        g_idx = self._extract_group_index(first_slot_raw)
+                        group_name = ""
+
+                        # [FIX] Логіка назви з @: Назва праворуч від @
+                        if "@" in first_slot_raw:
+                            parts = first_slot_raw.split("@", 1)
+                            group_name = parts[1].strip()
+                            # Чистимо назву групи від дужок зброї
+                            group_name = re.sub(r'\(.*?\)', '', group_name).strip()
+                        else:
+                            # Фолбек: якщо немає @, чистимо вручну
+                            name_buffer = first_slot_raw
+                            for pat in self.sl_patterns:
+                                name_buffer = re.sub(pat, "", name_buffer, flags=re.IGNORECASE)
+                            group_name = re.sub(r'\(.*?\)', '', name_buffer).replace('|', '').strip().strip("-").strip()
+
+                        if not group_name:
+                            group_name = f"Squad {g_idx}" if g_idx else "Infantry"
+                        
+                        full_title = f"[{current_squad_side}] {group_name}"
+
+                        formatted_slots = []
+                        for i, raw_s in enumerate(current_squad_slots):
+                            formatted_slots.append(f"{i+1}. {self._normalize_slot(raw_s)}")
+                        
+                        # [FIX] Ключ унікальності тепер: СТОРОНА + НАЗВА
+                        # Це гарантує, що [WEST] Alpha 1-4 і [EAST] Alpha 1-4 будуть окремими групами.
+                        unique_key = (current_squad_side, group_name)
+
+                        new_group_data = {
+                            'title': full_title,
+                            'pure_name': group_name,
+                            'slots': formatted_slots,
+                            'side': current_squad_side,
+                            'group_index': g_idx
+                        }
+
+                        # Якщо знайдено точний дублікат (однакова сторона і назва), перезаписуємо, якщо новий довший
+                        groups_map[unique_key] = new_group_data
+
+                current_squad_slots = []
+            
+            if text != 'END_MARKER':
+                current_squad_slots.append(text)
+                # Фіксуємо сторону групи по першому юніту (командиру)
+                if len(current_squad_slots) == 1:
+                    current_squad_side = side
+
+        return sorted(groups_map.values(), key=lambda x: (x['side'], x['title']))
+
+sqm_parser = SqmParser()
+# ─── 6. Адмін-інструменти та Команди ────────────────────────────────────────────
 class DecisionModal(Modal):
     def __init__(self, sid, idx, uid, msg_id, accept):
         super().__init__(title="Рішення")
@@ -306,7 +384,7 @@ class DecisionModal(Modal):
         if admin_ch:
             try: await (await admin_ch.fetch_message(self.msg_id)).delete()
             except: pass
-        await inter.response.send_message("✔️ OK.", ephemeral=True)
+        await inter.response.send_message("✔️ Опрацьовано.", ephemeral=True)
 
 class ClaimDecisionView(View):
     def __init__(self, sid, idx, uid, msg_id):
@@ -392,7 +470,7 @@ class AssignSlotView(View):
         if sid in sessions:
             for idx in range(len(sessions[sid]["lines"])):
                 self.add_item(AssignSlotButton(sid, idx, uid))
-                # ─── 7. Команди та Події ────────────────────────────────────────────────────────
+
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}")
@@ -438,7 +516,7 @@ async def import_sqm(ctx, filter_idx: str = None):
         content = (await ctx.message.attachments[0].read()).decode('utf-8', errors='ignore')
         groups = sqm_parser.process_file(content)
 
-        # Фільтрація
+        # Фільтрація (за індексом або назвою)
         if filter_idx:
             filtered = []
             low_f = filter_idx.lower()
