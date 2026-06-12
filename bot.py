@@ -591,5 +591,200 @@ async def _gitpush(ctx: commands.Context):
     emb.set_footer(text="Після push → !оновити")
     await ctx.send(embed=emb)
 
-# ─── 12. Запуск бота ─────────────────────────────────────────────────────────────
+# ─── 12. Команда !слоти — парсинг SQM файлу місії ──────────────────────────────
+
+def parse_sqm_slots(content: str) -> dict[str, dict]:
+    """
+    Парсить .sqm файл місії Arma 3 та повертає словник відділень.
+    Ключ: назва відділення (напр. "Альфа 1-2")
+    Значення: {"title": "Альфа 1-2 || Мотопіхотне відділення ІІ Буран", "slots": [...], "side": "blufor/opfor/indep"}
+    """
+    import re
+
+    # Витягуємо всі description та їх сусідній контекст (side)
+    # Шукаємо блоки: description + side поряд у тому самому unit-блоці
+    # Простий підхід: зібрати всі description по порядку
+    descriptions = re.findall(r'description="([^"]*)"', content)
+
+    groups: dict[str, dict] = {}
+    current_group: str | None = None
+    current_title: str | None = None
+    current_slots: list[str] = []
+
+    for desc in descriptions:
+        if '@' in desc:
+            # Зберігаємо попереднє відділення
+            if current_group and current_slots:
+                if current_group not in groups:
+                    groups[current_group] = {"title": current_title, "slots": current_slots[:]}
+                # Якщо вже є — значить дублікат (обидві сторони), пропускаємо
+
+            # Парсимо новий заголовок
+            # Формат: "N. Роль @Назва X-Y  ІІ  Тип відділення ..."
+            m = re.search(r'@(\S+\s+[\d\-]+)\s*(?:ІІ|II)\s*(.*)', desc)
+            if m:
+                current_group = m.group(1).strip()
+                type_name = re.sub(r'\s{2,}', ' ', m.group(2).strip())
+                current_title = f"{current_group} || {type_name}"
+                # Роль першого слоту — до знаку @
+                role_m = re.match(r'\d+\.\s*(.+?)\s*@', desc)
+                first_role = role_m.group(1).strip() if role_m else "Слот 1"
+                current_slots = [first_role]
+            else:
+                # Не вдалося розпарсити — скидаємо
+                current_group = None
+                current_slots = []
+                current_title = None
+        elif current_group:
+            slot_m = re.match(r'\d+\.\s*(.*)', desc)
+            if slot_m:
+                current_slots.append(slot_m.group(1).strip())
+
+    # Зберігаємо останнє відділення
+    if current_group and current_slots and current_group not in groups:
+        groups[current_group] = {"title": current_title, "slots": current_slots[:]}
+
+    return groups
+
+
+# Глобальний кеш розпарсених відділень: guild_id → {group_name → data}
+mission_cache: dict[int, dict[str, dict]] = {}
+
+
+@bot.command(name="слоти")
+async def слоти(ctx: commands.Context, group_id: str = None, side: str = None):
+    """
+    Використання:
+      !слоти <назва-відділення> [сторона]   — показати слоти відділення
+      !слоти список                          — список всіх відділень
+      (з прикріпленим .sqm файлом)          — завантажити місію
+    
+    Приклади:
+      !слоти 1-2 blufor
+      !слоти список
+    """
+    guild_id = ctx.guild.id if ctx.guild else ctx.author.id
+
+    # ── Якщо є прикріплений файл — завантажуємо місію ──
+    if ctx.message.attachments:
+        att = ctx.message.attachments[0]
+        if not att.filename.endswith(".sqm"):
+            return await ctx.send("❌ Потрібен файл з розширенням `.sqm`.")
+        
+        await ctx.send("⏳ Зчитую файл місії...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(att.url) as resp:
+                    raw = await resp.read()
+            # Пробуємо декодувати (UTF-8 або Windows-1251)
+            try:
+                content = raw.decode("utf-8")
+            except UnicodeDecodeError:
+                content = raw.decode("windows-1251", errors="replace")
+
+            groups = parse_sqm_slots(content)
+            if not groups:
+                return await ctx.send("❌ Не знайдено жодного відділення у файлі місії.")
+
+            mission_cache[guild_id] = groups
+            await ctx.send(
+                f"✅ Місію завантажено! Знайдено **{len(groups)}** відділень.\n"
+                f"Використовуй `!слоти список` щоб побачити всі, або `!слоти 1-2 blufor` для конкретного."
+            )
+        except Exception as e:
+            await ctx.send(f"❌ Помилка читання файлу: `{e}`")
+        return
+
+    # ── Якщо немає кешу — просимо завантажити ──
+    if guild_id not in mission_cache:
+        return await ctx.send(
+            "❌ Місія не завантажена. Використай команду `!слоти` з прикріпленим `.sqm` файлом."
+        )
+
+    groups = mission_cache[guild_id]
+
+    # ── !слоти список ──
+    if group_id is None or group_id.lower() == "список":
+        lines = []
+        for name, data in groups.items():
+            lines.append(f"• `{name}` — {data['title']}")
+        
+        # Розбиваємо на частини якщо забагато
+        chunk = []
+        chunk_len = 0
+        for line in lines:
+            if chunk_len + len(line) > 1800:
+                embed = discord.Embed(
+                    title="📋 Відділення місії",
+                    description="\n".join(chunk),
+                    color=discord.Color.blue()
+                )
+                await ctx.send(embed=embed)
+                chunk = []
+                chunk_len = 0
+            chunk.append(line)
+            chunk_len += len(line) + 1
+
+        if chunk:
+            embed = discord.Embed(
+                title="📋 Відділення місії",
+                description="\n".join(chunk),
+                color=discord.Color.blue()
+            )
+            await ctx.send(embed=embed)
+        return
+
+    # ── !слоти <ID> [side] ──
+    # Нормалізуємо пошук: шукаємо по частині назви
+    query = group_id.strip().lower()
+    side_query = (side or "").lower()
+
+    # Збираємо всі підходящі відділення
+    matches = []
+    for name, data in groups.items():
+        name_lower = name.lower()
+        # Шукаємо по номеру відділення (напр "1-2" входить в "Альфа 1-2")
+        if query in name_lower:
+            matches.append((name, data))
+
+    if not matches:
+        return await ctx.send(
+            f"❌ Відділення `{group_id}` не знайдено. "
+            f"Використай `!слоти список` щоб побачити всі доступні."
+        )
+
+    # Якщо вказана сторона — намагаємось відфільтрувати за типом відділення в назві
+    # В SQM обидві сторони мають однакові назви відділень, але різні типи
+    # Blufor = рейнджери/США; Opfor = ПВК/Буран; Indep = незалежні
+    SIDE_KEYWORDS = {
+        "blufor": ["рейнджер", "снайпер", "мінометн", "медичн", "apache", "chinook", "soar", "armія сша"],
+        "opfor":  ["пвк", "буран", "бтр", "land cruiser", "зу-23"],
+        "indep":  [],
+    }
+
+    if side_query and side_query in SIDE_KEYWORDS:
+        keywords = SIDE_KEYWORDS[side_query]
+        filtered = []
+        for name, data in matches:
+            title_lower = data["title"].lower()
+            if any(kw in title_lower for kw in keywords):
+                filtered.append((name, data))
+        if filtered:
+            matches = filtered
+
+    # Якщо кілька збігів — показуємо всі
+    for name, data in matches:
+        slots_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(data["slots"]))
+        embed = discord.Embed(
+            title=data["title"],
+            description=slots_text,
+            color=discord.Color.green() if "рейнджер" in data["title"].lower() or "soar" in data["title"].lower()
+                  else discord.Color.red() if any(k in data["title"].lower() for k in ["пвк","буран","бтр"])
+                  else discord.Color.orange()
+        )
+        embed.set_footer(text=f"Слотів: {len(data['slots'])}")
+        await ctx.send(embed=embed)
+
+
+# ─── 13. Запуск бота ─────────────────────────────────────────────────────────────
 bot.run(TOKEN)
