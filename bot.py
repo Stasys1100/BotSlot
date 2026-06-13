@@ -578,26 +578,38 @@ class PboGroupSelect(Select):
             at_marker = f"@{callsign}"
 
             # ── Заголовок ──
-            # Перший юніт: "1. Роль@callsign | Назва групи | Транспорт | Локація"
+            # Перший юніт: "1. Роль@callsign | Назва | Транспорт | Локація"
+            # або:         "1. Роль | Зброя @Альфа 2-6 | Назва | Транспорт | Локація"
+            # Шукаємо "@" і беремо все що ПІСЛЯ нього до кінця, розбиваємо по "|"
             first_name = units[0]["name"] if units else callsign
-            if at_marker in first_name:
-                after_at = first_name.split(at_marker, 1)[1]
-                # Розбиваємо по "|", прибираємо порожні та локацію (остання частина)
-                parts = [p.strip() for p in after_at.split("|") if p.strip()]
-                # Останню частину (локація) відкидаємо якщо частин більше 1
+            AT_RE = re.compile(r'@[^|]+\|?\s*')
+            at_match = re.search(r'@', first_name)
+            if at_match:
+                after_at = first_name[at_match.start():]
+                # Видаляємо саму @-мітку (до першого "|" або кінця)
+                pipe_idx = after_at.find("|")
+                if pipe_idx != -1:
+                    remainder = after_at[pipe_idx+1:]  # "Назва | Транспорт | Локація"
+                else:
+                    remainder = ""
+                parts = [p.strip() for p in remainder.split("|") if p.strip()]
+                # Відкидаємо останню частину (локація/спавн)
                 desc_parts = parts[:-1] if len(parts) > 1 else parts
                 group_desc = " | ".join(desc_parts)
                 title = f"{callsign} | {group_desc}" if group_desc else callsign
             else:
                 title = callsign
 
-            # ── Рядки слотів — видаляємо нумерацію і @-мітку ──
+            # ── Рядки слотів — видаляємо нумерацію і всю @-мітку з хвостом ──
             lines = []
             for u in units:
                 name = u["name"]
-                if at_marker in name:
-                    name = name.split(at_marker, 1)[0]
-                name = NUMBER_RE.sub("", name).strip()
+                # Видаляємо від "@" до кінця рядка (включно з "| Група | Транспорт | Локація")
+                at_pos = name.find("@")
+                if at_pos != -1:
+                    name = name[:at_pos]
+                # Видаляємо початкову нумерацію "1. ", "2. " тощо
+                name = NUMBER_RE.sub("", name).strip().rstrip("|").strip()
                 lines.append(name)
 
             owners = [None] * len(lines)
