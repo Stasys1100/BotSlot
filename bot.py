@@ -62,23 +62,28 @@ SIDE_COLORS = {
 def build_embed(sess: dict) -> discord.Embed:
     side = sess.get("side", "west")
     color = SIDE_COLORS.get(side, discord.Color.from_rgb(41, 128, 185))
-    embed = discord.Embed(title=f"**{sess['title']}**", color=color)
+    embed = discord.Embed(title=sess["title"], color=color)
 
     lines = []
     for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-        num = f"`{i+1:02d}`"
+        num = f"`{i+1}.`"
         slot_text = text.strip()
         if owner:
-            lines.append(f"{num} {slot_text}\n┗ 👤 {owner.mention}")
+            lines.append(f"{num} {slot_text}\n> 👤 {owner.mention}")
         else:
             lines.append(f"{num} {slot_text}")
+        lines.append("")   # порожній рядок між слотами
+
+    # Прибираємо останній зайвий порожній рядок
+    if lines and lines[-1] == "":
+        lines.pop()
 
     embed.description = "\n".join(lines)
 
     total = len(sess["lines"])
     taken = sum(1 for o in sess["owners"] if o is not None)
     free  = total - taken
-    embed.set_footer(text=f"Слоти: {taken}/{total} зайнято  •  Вільно: {free}")
+    embed.set_footer(text=f"🟢 Вільно: {free}  •  🔴 Зайнято: {taken}  •  Всього: {total}")
     return embed
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
@@ -573,13 +578,16 @@ class PboGroupSelect(Select):
             at_marker = f"@{callsign}"
 
             # ── Заголовок ──
+            # Перший юніт: "1. Роль@callsign | Назва групи | Транспорт | Локація"
             first_name = units[0]["name"] if units else callsign
             if at_marker in first_name:
                 after_at = first_name.split(at_marker, 1)[1]
+                # Розбиваємо по "|", прибираємо порожні та локацію (остання частина)
                 parts = [p.strip() for p in after_at.split("|") if p.strip()]
-                # Беремо перші N-1 частини (без локації в кінці)
-                group_desc = " | ".join(parts[:-1]) if len(parts) > 1 else " | ".join(parts)
-                title = f"{callsign}  ·  {group_desc}" if group_desc else callsign
+                # Останню частину (локація) відкидаємо якщо частин більше 1
+                desc_parts = parts[:-1] if len(parts) > 1 else parts
+                group_desc = " | ".join(desc_parts)
+                title = f"{callsign} | {group_desc}" if group_desc else callsign
             else:
                 title = callsign
 
@@ -640,9 +648,6 @@ class PboGroupSelectView(View):
 @bot.command(name="pbo")
 async def _pbo(ctx: commands.Context):
     """Завантажити .pbo файл і обрати слоти для публікації."""
-    if ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
-
     if not ctx.message.attachments:
         return await ctx.send("❌ Прикріпіть .pbo файл до повідомлення.")
 
@@ -692,6 +697,8 @@ async def _pbo(ctx: commands.Context):
 
 
 # ─── 10. Події on_ready та on_message ────────────────────────────────────────────
+BOT_LOG_CHANNEL_ID = 1395065909185478769
+
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
@@ -701,17 +708,12 @@ async def on_ready():
         description=f"📦 Commit: `{commit}`",
         color=discord.Color.green()
     )
-    for guild in bot.guilds:
-        ch = discord.utils.find(
-            lambda c: isinstance(c, discord.TextChannel)
-                      and c.permissions_for(guild.me).send_messages,
-            guild.text_channels
-        )
-        if ch:
-            try:
-                await ch.send(embed=embed)
-            except:
-                pass
+    log_ch = bot.get_channel(BOT_LOG_CHANNEL_ID)
+    if log_ch:
+        try:
+            await log_ch.send(embed=embed)
+        except Exception:
+            pass
     if not vtg_reminder.is_running():
         vtg_reminder.start()
 
