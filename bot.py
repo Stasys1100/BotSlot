@@ -52,16 +52,33 @@ async def vtg_reminder():
                 pass
 
 # ─── 5. Генератор Embed для слотів ─────────────────────────────────────────────
+SIDE_COLORS = {
+    "west":        discord.Color.from_rgb(41, 128, 185),   # синій
+    "east":        discord.Color.from_rgb(192, 57, 43),    # червоний
+    "independent": discord.Color.from_rgb(39, 174, 96),    # зелений
+    "civilian":    discord.Color.from_rgb(127, 140, 141),  # сірий
+}
+
 def build_embed(sess: dict) -> discord.Embed:
-    embed = discord.Embed(title=sess["title"], color=discord.Color.blue())
+    side = sess.get("side", "west")
+    color = SIDE_COLORS.get(side, discord.Color.from_rgb(41, 128, 185))
+    embed = discord.Embed(title=f"**{sess['title']}**", color=color)
+
     lines = []
     for i, (text, owner) in enumerate(zip(sess["lines"], sess["owners"])):
-        prefix = f"{i+1}. "
+        num = f"`{i+1:02d}`"
+        slot_text = text.strip()
         if owner:
-            lines.append(f"{prefix}{text} – Зайнято {owner.mention}")
+            lines.append(f"{num} {slot_text}\n┗ 👤 {owner.mention}")
         else:
-            lines.append(f"{prefix}{text}")
+            lines.append(f"{num} {slot_text}")
+
     embed.description = "\n".join(lines)
+
+    total = len(sess["lines"])
+    taken = sum(1 for o in sess["owners"] if o is not None)
+    free  = total - taken
+    embed.set_footer(text=f"Слоти: {taken}/{total} зайнято  •  Вільно: {free}")
     return embed
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
@@ -542,38 +559,38 @@ class PboGroupSelect(Select):
         if not chosen:
             return await inter.response.send_message("❌ Немає обраних груп.", ephemeral=True)
 
-        # Публікуємо кожну групу окремим повідомленням (як на скріншоті)
         await inter.response.edit_message(
-            content=f"✅ Публікую {len(chosen)} груп(и)...",
+            content=f"⏳ Публікую {len(chosen)} груп(и)...",
             view=None
         )
 
         channel = inter.channel
+        NUMBER_RE = re.compile(r'^\d+\.\s*')
+
         for group in chosen:
             callsign = group["callsign"]
             units = group["units"]
+            at_marker = f"@{callsign}"
 
-            # Заголовок: перший юніт після "@" містить назву групи/транспорту
+            # ── Заголовок ──
             first_name = units[0]["name"] if units else callsign
-            # Витягуємо частину після "@callsign" — опис групи
-            at_split = first_name.split(f"@{callsign}")
-            if len(at_split) > 1:
-                group_desc = at_split[1].strip(" |")
+            if at_marker in first_name:
+                after_at = first_name.split(at_marker, 1)[1]
+                parts = [p.strip() for p in after_at.split("|") if p.strip()]
+                # Беремо перші N-1 частини (без локації в кінці)
+                group_desc = " | ".join(parts[:-1]) if len(parts) > 1 else " | ".join(parts)
+                title = f"{callsign}  ·  {group_desc}" if group_desc else callsign
             else:
-                group_desc = ""
+                title = callsign
 
-            title = f"{callsign} | {group_desc}" if group_desc else callsign
-
-            # Рядки слотів — ім'я юніта без частини після "@"
+            # ── Рядки слотів — видаляємо нумерацію і @-мітку ──
             lines = []
             for u in units:
                 name = u["name"]
-                # Прибираємо "@callsign | ..." з першого рядка
-                if f"@{callsign}" in name:
-                    clean = name.split(f"@{callsign}")[0].strip()
-                else:
-                    clean = name
-                lines.append(clean)
+                if at_marker in name:
+                    name = name.split(at_marker, 1)[0]
+                name = NUMBER_RE.sub("", name).strip()
+                lines.append(name)
 
             owners = [None] * len(lines)
             forbidden_matrix = [[] for _ in lines]
@@ -584,11 +601,30 @@ class PboGroupSelect(Select):
                 "owners":     owners,
                 "channel_id": channel.id,
                 "forbidden":  forbidden_matrix,
+                "side":       side,
             }
             embed = build_embed(sess)
             sent = await channel.send(embed=embed)
             sessions[sent.id] = sess
             await sent.edit(view=SlotView(sent.id))
+
+        # ── Видалення проміжних повідомлень ──
+        msgs_to_delete = data.get("messages_to_delete", [])
+        for mid in msgs_to_delete:
+            try:
+                msg = await channel.fetch_message(mid)
+                await msg.delete()
+            except Exception:
+                pass
+
+        # Видаляємо статус-повідомлення ("Публікую...")
+        try:
+            status = await channel.fetch_message(self.msg_id)
+            await status.delete()
+        except Exception:
+            pass
+
+        pbo_sessions.pop(self.msg_id, None)
 
 
 class PboGroupSelectView(View):
@@ -638,7 +674,11 @@ async def _pbo(ctx: commands.Context):
     files_count = result.get("filesCount", "?")
     fname = result.get("fileName", att.filename)
 
-    pbo_sessions[status_msg.id] = {"slots": slots_data, "selected_side": None}
+    pbo_sessions[status_msg.id] = {
+        "slots": slots_data,
+        "selected_side": None,
+        "messages_to_delete": [ctx.message.id],  # зберігаємо !pbo команду юзера
+    }
 
     sides_text = " | ".join(side_label(s) for s in available_sides)
     await status_msg.edit(
