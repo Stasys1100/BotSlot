@@ -542,7 +542,7 @@ class PboGroupSelect(Select):
             parts = desc_raw.split("|")
             desc = parts[1].strip() if len(parts) > 1 else desc_raw
             desc = desc[:100]
-            options.append(SelectOption(label=label, description=desc, value=label))
+            options.append(SelectOption(label=label, description=desc, value=g["callsign"]))
         super().__init__(
             placeholder=f"Оберіть групи (до 25)...",
             options=options,
@@ -575,27 +575,24 @@ class PboGroupSelect(Select):
         for group in chosen:
             callsign = group["callsign"]
             units = group["units"]
-            at_marker = f"@{callsign}"
 
             # ── Заголовок ──
-            # Перший юніт: "1. Роль@callsign | Назва | Транспорт | Локація"
-            # або:         "1. Роль | Зброя @Альфа 2-6 | Назва | Транспорт | Локація"
-            # Шукаємо "@" і беремо все що ПІСЛЯ нього до кінця, розбиваємо по "|"
+            # Перший юніт: "1. Роль@callsign | Назва | Транспорт | (Локація)"
+            # або:         "1. Роль | Зброя @Альфа 2-6 | Назва | Транспорт"
+            # Шукаємо "@" і беремо все що ПІСЛЯ нього, розбиваємо по "|"
             first_name = units[0]["name"] if units else callsign
-            AT_RE = re.compile(r'@[^|]+\|?\s*')
             at_match = re.search(r'@', first_name)
             if at_match:
                 after_at = first_name[at_match.start():]
                 # Видаляємо саму @-мітку (до першого "|" або кінця)
                 pipe_idx = after_at.find("|")
                 if pipe_idx != -1:
-                    remainder = after_at[pipe_idx+1:]  # "Назва | Транспорт | Локація"
+                    remainder = after_at[pipe_idx+1:]  # "Назва | Транспорт | (Локація)"
                 else:
                     remainder = ""
                 parts = [p.strip() for p in remainder.split("|") if p.strip()]
-                # Відкидаємо останню частину (локація/спавн)
-                desc_parts = parts[:-1] if len(parts) > 1 else parts
-                group_desc = " | ".join(desc_parts)
+                # Не відкидаємо нічого — показуємо весь опис повністю
+                group_desc = " | ".join(parts)
                 title = f"{callsign} | {group_desc}" if group_desc else callsign
             else:
                 title = callsign
