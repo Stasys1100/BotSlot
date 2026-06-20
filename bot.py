@@ -59,6 +59,40 @@ SIDE_COLORS = {
     "civilian":    discord.Color.from_rgb(127, 140, 141),  # сірий
 }
 
+def parse_group_metadata(group: dict) -> tuple[str, str]:
+    fallback_callsign = group.get("callsign", "")
+    units = group.get("units", [])
+    if not units:
+        return fallback_callsign, ""
+
+    first_name = units[0].get("name", "")
+    at_idx = first_name.find("@")
+    if at_idx == -1:
+        return fallback_callsign, ""
+
+    after_at = first_name[at_idx + 1:].strip()
+    
+    pipe_idx = after_at.find("|")
+    if pipe_idx != -1:
+        raw_callsign = after_at[:pipe_idx].strip()
+        remainder = after_at[pipe_idx + 1:].strip()
+    else:
+        raw_callsign = after_at.strip()
+        remainder = ""
+
+    parts = [p.strip() for p in remainder.split("|") if p.strip()]
+    group_desc = " | ".join(parts)
+
+    callsign = fallback_callsign
+    if raw_callsign:
+        m = re.search(r'(\d+)\s*-\s*(\d+)', raw_callsign)
+        if m:
+            callsign = f"Alpha {m.group(1)}-{m.group(2)}"
+        else:
+            callsign = raw_callsign
+
+    return callsign, group_desc
+
 def build_embed(sess: dict) -> discord.Embed:
     side = sess.get("side", "west")
     color = SIDE_COLORS.get(side, discord.Color.from_rgb(41, 128, 185))
@@ -535,13 +569,9 @@ class PboGroupSelect(Select):
         chunk = groups[batch*25:(batch+1)*25]
         options = []
         for g in chunk:
-            label = g["callsign"]
-            # Перший юніт — підзаголовок
-            desc_raw = g["units"][0]["name"] if g["units"] else ""
-            # Беремо частину після "|" якщо є
-            parts = desc_raw.split("|")
-            desc = parts[1].strip() if len(parts) > 1 else desc_raw
-            desc = desc[:100]
+            callsign, desc = parse_group_metadata(g)
+            label = callsign[:100]
+            desc = desc[:100] if desc else "Група"
             options.append(SelectOption(label=label, description=desc, value=g["callsign"]))
         super().__init__(
             placeholder=f"Оберіть групи (до 25)...",
@@ -570,32 +600,12 @@ class PboGroupSelect(Select):
         )
 
         channel = inter.channel
-        NUMBER_RE = re.compile(r'^\d+\.\s*')
+        NUMBER_RE = re.compile(r'^\d+[\.:]\s*')
 
         for group in chosen:
-            callsign = group["callsign"]
             units = group["units"]
-
-            # ── Заголовок ──
-            # Перший юніт: "1. Роль@callsign | Назва | Транспорт | (Локація)"
-            # або:         "1. Роль | Зброя @Альфа 2-6 | Назва | Транспорт"
-            # Шукаємо "@" і беремо все що ПІСЛЯ нього, розбиваємо по "|"
-            first_name = units[0]["name"] if units else callsign
-            at_match = re.search(r'@', first_name)
-            if at_match:
-                after_at = first_name[at_match.start():]
-                # Видаляємо саму @-мітку (до першого "|" або кінця)
-                pipe_idx = after_at.find("|")
-                if pipe_idx != -1:
-                    remainder = after_at[pipe_idx+1:]  # "Назва | Транспорт | (Локація)"
-                else:
-                    remainder = ""
-                parts = [p.strip() for p in remainder.split("|") if p.strip()]
-                # Не відкидаємо нічого — показуємо весь опис повністю
-                group_desc = " | ".join(parts)
-                title = f"{callsign} | {group_desc}" if group_desc else callsign
-            else:
-                title = callsign
+            meta_callsign, group_desc = parse_group_metadata(group)
+            title = f"{meta_callsign} | {group_desc}" if group_desc else meta_callsign
 
             # ── Рядки слотів — видаляємо нумерацію і всю @-мітку з хвостом ──
             lines = []
