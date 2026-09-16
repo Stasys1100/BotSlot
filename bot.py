@@ -60,12 +60,13 @@ SIDE_COLORS = {
 }
 
 def parse_group_metadata(group: dict) -> tuple[str, str]:
-    fallback_callsign = group.get("callsign", "")
-    units = group.get("units", [])
+    fallback_callsign = (group.get("callsign") or "").strip()
+    units = group.get("units") or []
     if not units:
         return fallback_callsign, ""
 
-    first_name = units[0].get("name", "")
+    first_unit = units[0] if isinstance(units[0], dict) else {}
+    first_name = (first_unit.get("name") or "")
     at_idx = first_name.find("@")
     if at_idx == -1:
         return fallback_callsign, ""
@@ -91,7 +92,7 @@ def parse_group_metadata(group: dict) -> tuple[str, str]:
         else:
             callsign = raw_callsign
 
-    return callsign, group_desc
+    return callsign.strip(), group_desc.strip()
 
 def build_embed(sess: dict) -> discord.Embed:
     side = sess.get("side", "west")
@@ -174,7 +175,7 @@ class SlotView(View):
     def __init__(self, sid: int):
         super().__init__(timeout=None)
         if sid in sessions:
-            for idx in range(len(sessions[sid]["lines"])):
+            for idx in range(min(25, len(sessions[sid]["lines"]))):
                 self.add_item(SlotButton(sid, idx))
 
 # ─── 7. “Претендувати” на слот ─────────────────────────────────────────────────
@@ -418,7 +419,7 @@ class RemoveSlotView(View):
     def __init__(self, sid: int):
         super().__init__(timeout=None)
         if sid in sessions:
-            for idx in range(len(sessions[sid]["lines"])):
+            for idx in range(min(25, len(sessions[sid]["lines"]))):
                 self.add_item(RemoveSlotButton(sid, idx))
 
 @bot.command(name="зняти", aliases=["release"])
@@ -505,7 +506,7 @@ class AssignSlotView(View):
     def __init__(self, sid: int, uid: int):
         super().__init__(timeout=None)
         if sid in sessions:
-            for idx in range(len(sessions[sid]["lines"])):
+            for idx in range(min(25, len(sessions[sid]["lines"]))):
                 self.add_item(AssignSlotButton(sid, idx, uid))
 
 # ─── 10. PBO Upload Flow ─────────────────────────────────────────────────────────
@@ -562,22 +563,41 @@ class PboSideView(View):
 
 class PboGroupSelect(Select):
     """Крок 2: мультивибір груп (callsigns)."""
-    def __init__(self, msg_id: int, groups: list[dict], batch: int = 0):
+    def __init__(self, msg_id: int, groups: list[dict], batch: int = 0, total_batches: int = 1):
         self.msg_id = msg_id
         self.batch = batch
         # Discord дозволяє max 25 опцій у Select
         chunk = groups[batch*25:(batch+1)*25]
         options = []
-        for g in chunk:
+        for i, g in enumerate(chunk):
+            global_idx = batch * 25 + i
             callsign, desc = parse_group_metadata(g)
+            callsign = (callsign or "").strip()
+            if not callsign:
+                callsign = f"Група {global_idx + 1}"
             label = callsign[:100]
-            desc = desc[:100] if desc else "Група"
-            options.append(SelectOption(label=label, description=desc, value=g["callsign"]))
+
+            units = g.get("units") or []
+            units_count = len(units)
+            if desc:
+                desc_text = f"{desc} ({units_count} сл.)"
+            else:
+                desc_text = f"{units_count} сл."
+            desc_val = desc_text[:100] if desc_text else "Група"
+
+            # Використовуємо global_idx як унікальний value для кожної опції
+            options.append(SelectOption(label=label, description=desc_val, value=str(global_idx)))
+
+        placeholder = (
+            f"Групи {batch*25 + 1}–{min((batch+1)*25, len(groups))} (частина {batch+1}/{total_batches})..."
+            if total_batches > 1
+            else "Оберіть групи (до 25)..."
+        )
         super().__init__(
-            placeholder=f"Оберіть групи (до 25)...",
+            placeholder=placeholder,
             options=options,
             min_values=1,
-            max_values=len(options),
+            max_values=max(1, len(options)),
             custom_id=f"pbo-group-{msg_id}-{batch}"
         )
 
@@ -587,9 +607,16 @@ class PboGroupSelect(Select):
             return await inter.response.send_message("❌ Сесія застаріла.", ephemeral=True)
 
         side = data["selected_side"]
-        selected_callsigns = set(self.values)
         groups = data["slots"].get(side, [])
-        chosen = [g for g in groups if g["callsign"] in selected_callsigns]
+
+        selected_indices = set()
+        for v in self.values:
+            try:
+                selected_indices.add(int(v))
+            except ValueError:
+                pass
+
+        chosen = [groups[i] for i in sorted(selected_indices) if 0 <= i < len(groups)]
 
         if not chosen:
             return await inter.response.send_message("❌ Немає обраних груп.", ephemeral=True)
@@ -603,21 +630,27 @@ class PboGroupSelect(Select):
         NUMBER_RE = re.compile(r'^\d+[\.:]\s*')
 
         for group in chosen:
-            units = group["units"]
+            units = group.get("units") or []
             meta_callsign, group_desc = parse_group_metadata(group)
+            meta_callsign = (meta_callsign or "").strip()
             title = f"{meta_callsign} | {group_desc}" if group_desc else meta_callsign
+            if not title.strip():
+                title = f"Група {side_label(side)}"
 
             # ── Рядки слотів — видаляємо нумерацію і всю @-мітку з хвостом ──
             lines = []
             for u in units:
-                name = u["name"]
+                name = (u.get("name") if isinstance(u, dict) else "") or ""
                 # Видаляємо від "@" до кінця рядка (включно з "| Група | Транспорт | Локація")
                 at_pos = name.find("@")
                 if at_pos != -1:
                     name = name[:at_pos]
                 # Видаляємо початкову нумерацію "1. ", "2. " тощо
                 name = NUMBER_RE.sub("", name).strip().rstrip("|").strip()
-                lines.append(name)
+                lines.append(name or "Слот")
+
+            if not lines:
+                continue
 
             owners = [None] * len(lines)
             forbidden_matrix = [[] for _ in lines]
@@ -661,7 +694,7 @@ class PboGroupSelectView(View):
         # Discord дозволяє max 5 Select у View
         total_batches = min(5, (len(groups) + 24) // 25)
         for b in range(total_batches):
-            self.add_item(PboGroupSelect(msg_id, groups, b))
+            self.add_item(PboGroupSelect(msg_id, groups, b, total_batches=total_batches))
 
 
 @bot.command(name="pbo")
