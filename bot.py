@@ -75,14 +75,20 @@ async def vtg_reminder():
             except:
                 pass
 
-# ─── 5. Генератор Embed для слотів ─────────────────────────────────────────────
+# ─── 5. Палітра «Теплий мінімалізм» та генератор Embed ──────────────────────────
+WARM_ACCENT = discord.Color.from_rgb(207, 148, 86)   # Теплий бурштин / пісок (#CF9456)
+WARM_BLUE   = discord.Color.from_rgb(86, 126, 160)   # М'який теплий сланець (#567EA0)
+WARM_RED    = discord.Color.from_rgb(194, 98, 77)    # Теракота / глина (#C2624D)
+WARM_GREEN  = discord.Color.from_rgb(112, 142, 106)  # Тепла шавлія / мох (#708E6A)
+WARM_GRAY   = discord.Color.from_rgb(150, 142, 133)  # Теплий тауп / камінь (#968E85)
+
 SIDE_COLORS = {
-    "west":        discord.Color.from_rgb(41, 128, 185),   # синій
-    "east":        discord.Color.from_rgb(192, 57, 43),    # червоний
-    "independent": discord.Color.from_rgb(39, 174, 96),    # зелений
-    "civilian":    discord.Color.from_rgb(127, 140, 141),  # сірий
-    "blue":        discord.Color.from_rgb(41, 128, 185),   # синій
-    "red":         discord.Color.from_rgb(192, 57, 43),    # червоний
+    "west":        WARM_BLUE,
+    "east":        WARM_RED,
+    "independent": WARM_GREEN,
+    "civilian":    WARM_GRAY,
+    "blue":        WARM_BLUE,
+    "red":         WARM_RED,
 }
 
 def parse_group_metadata(group: dict) -> tuple[str, str]:
@@ -122,7 +128,7 @@ def parse_group_metadata(group: dict) -> tuple[str, str]:
 
 def build_embed(sess: dict) -> discord.Embed:
     side = sess.get("side", "west")
-    color = SIDE_COLORS.get(side, discord.Color.from_rgb(41, 128, 185))
+    color = SIDE_COLORS.get(side, WARM_BLUE)
     embed = discord.Embed(title=sess["title"], color=color)
 
     lines = []
@@ -130,7 +136,7 @@ def build_embed(sess: dict) -> discord.Embed:
         num = f"`{i+1}.`"
         slot_text = text.strip()
         if owner:
-            lines.append(f"{num} {slot_text}\n> 👤 {owner.mention}")
+            lines.append(f"{num} {slot_text}\n> {owner.mention}")
         else:
             lines.append(f"{num} {slot_text}")
         lines.append("")   # порожній рядок між слотами
@@ -144,7 +150,7 @@ def build_embed(sess: dict) -> discord.Embed:
     total = len(sess["lines"])
     taken = sum(1 for o in sess["owners"] if o is not None)
     free  = total - taken
-    embed.set_footer(text=f"🟢 Вільно: {free}  •  🔴 Зайнято: {taken}  •  Всього: {total}")
+    embed.set_footer(text=f"Вільно: {free} · Зайнято: {taken} · Всього: {total}")
     return embed
 
 # ─── 6. SlotButton та SlotView ─────────────────────────────────────────────────
@@ -794,7 +800,7 @@ class VtgGameSelect(Select):
                     date_str = raw_date[:10]
             label = f"Гра {pos}: {m_name}"[:100]
             ver_num = (g.get("missionVersion") or {}).get("version", "")
-            desc = f"{date_str} | Версія: {ver_num}" if ver_num else date_str
+            desc = f"{date_str} · Версія {ver_num}" if ver_num else date_str
             options.append(SelectOption(label=label, description=desc[:100], value=str(i)))
 
         super().__init__(
@@ -806,7 +812,7 @@ class VtgGameSelect(Select):
 
     async def callback(self, inter: discord.Interaction):
         if inter.user.id != self.caller_id:
-            return await inter.response.send_message("❌ Це меню викликано іншим адміністратором.", ephemeral=True)
+            return await inter.response.send_message("Це меню викликано іншим адміністратором.", ephemeral=True)
 
         game_idx = int(self.values[0])
         game = self.games[game_idx]
@@ -821,18 +827,18 @@ class VtgGameSelect(Select):
         version_id = version.get("id")
 
         if not mission_id or not version_id:
-            return await inter.followup.send("❌ У обраної гри відсутній ID місії або версії.", ephemeral=True)
+            return await inter.followup.send("У обраної гри відсутній ID місії або версії.", ephemeral=True)
 
         try:
             side_type, role_name, info = await client.detect_squad_side(game, TARGET_SQUAD_NAME)
             slots_data = await client.get_mission_slots(mission_id, version_id)
         except Exception as e:
-            return await inter.followup.send(f"❌ Помилка при зверненні до VTG API: `{e}`", ephemeral=True)
+            return await inter.followup.send(f"Помилка звернення до VTG API: `{e}`", ephemeral=True)
 
         # Отримуємо плаский список груп для обраної сторони
         groups = extract_group_list(slots_data, side_type, role_name)
         if not groups:
-            return await inter.followup.send(f"❌ Не знайдено відділень для сторони `{side_type}` у відповіді API.", ephemeral=True)
+            return await inter.followup.send(f"Не знайдено відділень для сторони `{side_type}` у відповіді API.", ephemeral=True)
 
         vtg_wizard_sessions[inter.message.id] = {
             "game": game,
@@ -867,7 +873,7 @@ class VtgSquadSelect(Select):
             raw_callsign = (g.get("callsign") or f"Група {global_idx+1}").strip()
             norm_callsign = normalize_callsign(raw_callsign)
             meta_cs, desc = parse_group_metadata(g)
-            label = f"{norm_callsign} | {raw_callsign}"[:100]
+            label = f"{norm_callsign} · {raw_callsign}"[:100] if norm_callsign != raw_callsign else raw_callsign[:100]
 
             units = g.get("units") or []
             count = g.get("count") or len(units)
@@ -880,19 +886,19 @@ class VtgSquadSelect(Select):
 
             desc_text = f"{count} сл."
             if first_weapon:
-                desc_text += f" | {first_weapon}"
+                desc_text += f" · {first_weapon}"
 
             options.append(SelectOption(label=label, description=desc_text[:100], value=str(global_idx)))
 
         placeholder = (
-            f"Відділення {batch*25 + 1}–{min((batch+1)*25, len(groups))} (частина {batch+1}/{total_batches})..."
+            f"Відділення {batch*25 + 1}–{min((batch+1)*25, len(groups))} ({batch+1}/{total_batches})..."
             if total_batches > 1
             else "Оберіть відділення для участі..."
         )
         super().__init__(
             placeholder=placeholder,
             options=options,
-            min_values=1,
+            min_values=0,
             max_values=max(1, len(options)),
             custom_id=f"vtg-squad-{wizard_msg_id}-{batch}"
         )
@@ -900,25 +906,20 @@ class VtgSquadSelect(Select):
     async def callback(self, inter: discord.Interaction):
         data = vtg_wizard_sessions.get(self.wizard_msg_id)
         if not data:
-            return await inter.response.send_message("❌ Сесія майстра застаріла.", ephemeral=True)
+            return await inter.response.send_message("Сесія майстра застаріла.", ephemeral=True)
         if inter.user.id != data["caller_id"]:
-            return await inter.response.send_message("❌ Це меню викликано іншим адміністратором.", ephemeral=True)
+            return await inter.response.send_message("Це меню викликано іншим адміністратором.", ephemeral=True)
 
-        for v in self.values:
-            try:
-                data["selected_indices"].add(int(v))
-            except ValueError:
-                pass
-
-        embed = build_vtg_squad_select_embed(data)
-        await inter.response.edit_message(embed=embed, view=VtgSquadSelectView(self.wizard_msg_id))
+        batch_indices = set(range(self.batch * 25, min((self.batch + 1) * 25, len(data["groups"]))))
+        data["selected_indices"] = (data["selected_indices"] - batch_indices) | {int(v) for v in self.values if v.isdigit()}
+        await inter.response.defer()
 
 
 class VtgPublishButton(Button):
     def __init__(self, wizard_msg_id: int):
         super().__init__(
-            label="🚀 Опублікувати тему на форумі",
-            style=discord.ButtonStyle.success,
+            label="Опублікувати слоти",
+            style=discord.ButtonStyle.primary,
             custom_id=f"vtg-publish-{wizard_msg_id}"
         )
         self.wizard_msg_id = wizard_msg_id
@@ -926,24 +927,24 @@ class VtgPublishButton(Button):
     async def callback(self, inter: discord.Interaction):
         data = vtg_wizard_sessions.get(self.wizard_msg_id)
         if not data:
-            return await inter.response.send_message("❌ Сесія майстра застаріла.", ephemeral=True)
+            return await inter.response.send_message("Сесія майстра застаріла.", ephemeral=True)
         if inter.user.id != data["caller_id"]:
-            return await inter.response.send_message("❌ Це меню викликано іншим адміністратором.", ephemeral=True)
+            return await inter.response.send_message("Це меню викликано іншим адміністратором.", ephemeral=True)
 
         selected_indices = sorted(data.get("selected_indices", set()))
         if not selected_indices:
             return await inter.response.send_message(
-                "⚠️ Ви не обрали жодного відділення. Будь ласка, оберіть відділення зі списку вище.",
+                "Оберіть потрібні відділення у списку вище.",
                 ephemeral=True
             )
 
         await inter.response.defer()
-        await inter.message.edit(content="⏳ Створюю тему на форумі слотування та публікую слоти...", view=None, embed=None)
+        await inter.message.edit(content="Створення теми на форумі...", view=None, embed=None)
 
         game = data["game"]
         mission = game.get("mission") or {}
         mission_name = (mission.get("name") or "Місія").strip()
-        side_type = data["side_type"]
+        side_type = str(data["side_type"]).upper()
         role_name = data["role_name"]
         game_pos = game.get("position", 0) + 1
 
@@ -965,18 +966,19 @@ class VtgPublishButton(Button):
         forum_ch = await get_or_fetch_channel(SLOTS_FORUM_CHANNEL_ID)
         if not forum_ch:
             return await inter.followup.send(
-                f"❌ Не вдалося знайти форум-канал слотування з ID `{SLOTS_FORUM_CHANNEL_ID}`. Перевірте налаштування та права бота."
+                f"Не вдалося знайти форум-канал слотування з ID `{SLOTS_FORUM_CHANNEL_ID}`. Перевірте права бота."
             )
 
+        side_color = SIDE_COLORS.get(side_type.lower(), WARM_ACCENT)
         starter_embed = discord.Embed(
-            title=f"📌 {mission_name}",
+            title=mission_name,
             description=(
-                f"🗓 **Дата гри:** `{date_str}`\n"
-                f"🛡 **Сторона:** `{role_name}` ({side_type})\n"
-                f"👥 **Відділення:** `{', '.join(callsigns)}`\n\n"
-                f"*Займіть свій слот нижче за допомогою кнопок під відділеннями.*"
+                f"Дата: **{date_str}** · Гра **№{game_pos}**\n"
+                f"Сторона: **{role_name}** ({side_type})\n"
+                f"Відділення: **{', '.join(callsigns)}**\n\n"
+                f"*Займіть свій слот за допомогою кнопок під списками відділень.*"
             ),
-            color=SIDE_COLORS.get(side_type.lower(), discord.Color.blue())
+            color=side_color
         )
 
         try:
@@ -993,9 +995,9 @@ class VtgPublishButton(Button):
                 )
                 await thread.send(embed=starter_embed)
             else:
-                return await inter.followup.send(f"❌ Канал `{SLOTS_FORUM_CHANNEL_ID}` не підтримує публікації тем.")
+                return await inter.followup.send(f"Канал `{SLOTS_FORUM_CHANNEL_ID}` не підтримує публікації тем.")
         except Exception as e:
-            return await inter.followup.send(f"❌ Помилка при створенні теми у форумі: `{e}`")
+            return await inter.followup.send(f"Помилка при створенні теми у форумі: `{e}`")
 
         # Публікація слотів для кожного обраного відділення
         published_count = 0
@@ -1034,57 +1036,19 @@ class VtgPublishButton(Button):
 
         thread_url = getattr(thread, "jump_url", f"https://discord.com/channels/{inter.guild_id}/{thread.id}")
         await inter.followup.send(
-            f"✅ **Тему успішно створено на форумі слотування!**\n"
-            f"📌 **Назва:** `{title}`\n"
-            f"🔗 **Посилання:** {thread_url}\n"
-            f"📦 Опубліковано відділень: **{published_count}**"
+            f"Тему успішно опубліковано на форумі:\n"
+            f"**{title}**\n"
+            f"{thread_url} · Опубліковано відділень: {published_count}"
         )
         vtg_wizard_sessions.pop(self.wizard_msg_id, None)
-
-
-class VtgToggleSideButton(Button):
-    def __init__(self, wizard_msg_id: int):
-        super().__init__(
-            label="🔁 Змінити сторону (Атака/Оборона)",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"vtg-toggle-{wizard_msg_id}"
-        )
-        self.wizard_msg_id = wizard_msg_id
-
-    async def callback(self, inter: discord.Interaction):
-        data = vtg_wizard_sessions.get(self.wizard_msg_id)
-        if not data:
-            return await inter.response.send_message("❌ Сесія майстра застаріла.", ephemeral=True)
-        if inter.user.id != data["caller_id"]:
-            return await inter.response.send_message("❌ Це меню викликано іншим адміністратором.", ephemeral=True)
-
-        slots_data = data["slots_data"]
-        curr_side = str(data["side_type"]).upper()
-        new_side = "BLUE" if curr_side == "RED" else "RED"
-        new_role = "Атака" if new_side == "BLUE" else "Оборона"
-        if data["game"].get("mission", {}).get("missionObjective") == "ENCOUTER_BATTLE":
-            new_role = "ЗУСТРІЧНИЙ БІЙ"
-
-        groups = extract_group_list(slots_data, new_side, new_role)
-        if not groups:
-            return await inter.response.send_message(f"⚠️ Не знайдено відділень для сторони `{new_side}`.", ephemeral=True)
-
-        data["side_type"] = new_side
-        data["role_name"] = new_role
-        data["info"] = f"Сторону змінено вручну на {new_role} ({new_side})"
-        data["groups"] = groups
-        data["selected_indices"] = set()
-
-        embed = build_vtg_squad_select_embed(data)
-        await inter.response.edit_message(embed=embed, view=VtgSquadSelectView(self.wizard_msg_id))
 
 
 def build_vtg_squad_select_embed(data: dict) -> discord.Embed:
     game = data["game"]
     mission = game.get("mission") or {}
     mission_name = (mission.get("name") or "Місія").strip()
-    side_type = data["side_type"]
-    role_name = data["role_name"]
+    side_type = str(data.get("side_type", "")).upper()
+    role_name = data.get("role_name", "")
     game_pos = game.get("position", 0) + 1
 
     raw_date = game.get("date", "")
@@ -1096,22 +1060,19 @@ def build_vtg_squad_select_embed(data: dict) -> discord.Embed:
         except Exception:
             date_str = raw_date[:10]
 
-    groups = data["groups"]
-    selected_indices = sorted(data.get("selected_indices", set()))
-    selected_callsigns = [normalize_callsign(groups[i].get("callsign", "")) for i in selected_indices if 0 <= i < len(groups)]
-    selected_text = ", ".join(selected_callsigns) if selected_callsigns else "*ще не обрано жодного*"
+    info = (data.get("info") or "").strip()
+    info_line = f"\n{info}" if info else ""
+
+    side_color = SIDE_COLORS.get(side_type.lower(), WARM_ACCENT)
 
     embed = discord.Embed(
-        title=f"📋 Налаштування слотів: {mission_name}",
+        title=f"Налаштування слотів — {mission_name}",
         description=(
-            f"🗓 **Дата:** `{date_str}` | **Гра №:** `{game_pos}`\n"
-            f"🛡 **Сторона:** `{role_name}` ({side_type})\n"
-            f"ℹ️ {data.get('info', '')}\n\n"
-            f"**Обрані відділення ({len(selected_indices)}):**\n"
-            f"👉 `{selected_text}`\n\n"
-            f"*Позначте потрібні відділення у списку нижче та натисніть «🚀 Опублікувати тему на форумі».*"
+            f"Дата: **{date_str}** · Гра **№{game_pos}**\n"
+            f"Сторона: **{role_name}** ({side_type}){info_line}\n\n"
+            f"*Оберіть потрібні відділення у списку нижче та натисніть «Опублікувати слоти».*"
         ),
-        color=SIDE_COLORS.get(side_type.lower(), discord.Color.green())
+        color=side_color
     )
     return embed
 
@@ -1127,41 +1088,40 @@ class VtgSquadSelectView(View):
         for b in range(total_batches):
             self.add_item(VtgSquadSelect(wizard_msg_id, groups, b, total_batches=total_batches))
         self.add_item(VtgPublishButton(wizard_msg_id))
-        self.add_item(VtgToggleSideButton(wizard_msg_id))
 
 
 @bot.command(name="слоти", aliases=["slots", "vtg_slots", "week"])
 async def _слоти(ctx: commands.Context):
-    """Вибрати гру уікенду та автоматично створити тему слотування на форумі."""
+    """Вибрати гру уікенду та створити тему слотування на форумі."""
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
-        return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
+        return await ctx.send("Ця команда доступна лише в адміністративному каналі.")
 
     api_key = (os.getenv("VTG_API_KEY") or "").strip().strip("'\"")
     if not api_key:
         return await ctx.send(
-            "❌ **VTG_API_KEY не налаштовано.**\n"
-            "Будь ласка, додайте `VTG_API_KEY=ваш_ключ` у файл `.env` та перезапустіть бота."
+            "**VTG_API_KEY не налаштовано.**\n"
+            "Додайте `VTG_API_KEY` у змінні середовища та перезапустіть бота."
         )
 
-    status_msg = await ctx.send("⏳ Отримую ігри поточного уікенду з VTG API...")
+    status_msg = await ctx.send("Завантаження розкладу ігор...")
 
     client = VtgApiClient(api_key)
     try:
         weekend, games = await client.get_current_week_games()
     except Exception as e:
-        return await status_msg.edit(content=f"❌ Помилка звернення до VTG API: `{e}`")
+        return await status_msg.edit(content=f"Помилка звернення до VTG API: `{e}`")
 
     if not games:
-        return await status_msg.edit(content="❌ Не знайдено опублікованих ігор для поточного уікенду.")
+        return await status_msg.edit(content="Не знайдено опублікованих ігор для поточного уікенду.")
 
     wk_name = weekend.get("name", "Уікенд") if weekend else "Поточний уікенд"
     embed = discord.Embed(
-        title=f"🎮 {wk_name} — Вибір місії",
+        title=f"{wk_name} · Вибір місії",
         description=(
-            f"Знайдено **{len(games)}** гри на цьому уікенді.\n"
-            f"Оберіть місію зі списку нижче, щоб автоматично визначити сторону загону **«{TARGET_SQUAD_NAME}»** та налаштувати відділення:"
+            f"Знайдено {len(games)} гри на уікенді.\n"
+            f"Оберіть потрібну зі списку нижче:"
         ),
-        color=discord.Color.blue()
+        color=WARM_ACCENT
     )
 
     view = VtgGameSelectView(games, ctx.author.id)
