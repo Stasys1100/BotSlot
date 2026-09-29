@@ -811,7 +811,7 @@ class VtgGameSelect(Select):
         game = self.games[game_idx]
         await inter.response.defer()
 
-        api_key = os.getenv("VTG_API_KEY", VTG_API_KEY)
+        api_key = (os.getenv("VTG_API_KEY") or "").strip().strip("'\"")
         client = VtgApiClient(api_key)
 
         mission = game.get("mission") or {}
@@ -1150,7 +1150,7 @@ async def _слоти(ctx: commands.Context):
     if ADMIN_CHANNEL_ID and ctx.channel.id != ADMIN_CHANNEL_ID:
         return await ctx.send("❌ Ця команда доступна лише в адміністративному каналі.")
 
-    api_key = os.getenv("VTG_API_KEY", VTG_API_KEY)
+    api_key = (os.getenv("VTG_API_KEY") or "").strip().strip("'\"")
     if not api_key:
         return await ctx.send(
             "❌ **VTG_API_KEY не налаштовано.**\n"
