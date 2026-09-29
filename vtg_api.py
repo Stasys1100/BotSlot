@@ -222,3 +222,53 @@ def format_forum_title(date_str: str, mission_name: str, callsigns: list[str], g
     truncated_callsigns = callsigns_text[:30].rstrip(",") + "…"
     full_title = f"Дата: {date_str} | Місія: {mission_name[:20]}… | Відділення: {truncated_callsigns} | {game_role_part}"
     return full_title[:100]
+
+def extract_group_list(data: Any, side_type: str = "RED", role_name: str = "Оборона") -> list[dict]:
+    """
+    Гарантовано витягує плаский список відділень (list of group dicts)
+    з будь-якої вкладеності відповіді API (/slots), чи то dict {'RED': [...]},
+    чи {'defense': {'RED': [...]}}, чи прямий список [...].
+    """
+    if isinstance(data, list):
+        return data
+
+    if not isinstance(data, dict):
+        return []
+
+    target_role_key = "defense" if "оборон" in role_name.lower() else "attack"
+    sub = (
+        data.get(target_role_key)
+        or data.get(side_type)
+        or data.get(side_type.upper())
+        or data.get(side_type.lower())
+    )
+
+    if isinstance(sub, list):
+        return sub
+    if isinstance(sub, dict):
+        for k in (side_type, side_type.upper(), side_type.lower(), "RED", "BLUE", "red", "blue"):
+            if isinstance(sub.get(k), list):
+                return sub[k]
+        for v in sub.values():
+            if isinstance(v, list):
+                return v
+
+    for k in (side_type, side_type.upper(), side_type.lower(), "RED", "BLUE", "defense", "attack"):
+        val = data.get(k)
+        if isinstance(val, list):
+            return val
+        if isinstance(val, dict):
+            for sub_v in val.values():
+                if isinstance(sub_v, list):
+                    return sub_v
+
+    for v in data.values():
+        if isinstance(v, list):
+            return v
+        if isinstance(v, dict):
+            for sub_v in v.values():
+                if isinstance(sub_v, list):
+                    return sub_v
+
+    return []
+

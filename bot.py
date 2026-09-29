@@ -16,6 +16,7 @@ from vtg_api import (
     normalize_callsign,
     clean_unit_role_name,
     format_forum_title,
+    extract_group_list,
     KYIV_TZ
 )
 
@@ -828,21 +829,10 @@ class VtgGameSelect(Select):
         except Exception as e:
             return await inter.followup.send(f"❌ Помилка при зверненні до VTG API: `{e}`", ephemeral=True)
 
-        # Отримуємо групи для сторони (наприклад 'RED', 'BLUE' або 'defense', 'attack')
-        groups = slots_data.get(side_type) or slots_data.get(side_type.upper()) or slots_data.get(side_type.lower())
+        # Отримуємо плаский список груп для обраної сторони
+        groups = extract_group_list(slots_data, side_type, role_name)
         if not groups:
-            if "оборон" in role_name.lower():
-                groups = slots_data.get("defense") or slots_data.get("RED") or slots_data.get("red")
-            else:
-                groups = slots_data.get("attack") or slots_data.get("BLUE") or slots_data.get("blue")
-
-        if not groups and slots_data:
-            first_key = list(slots_data.keys())[0]
-            groups = slots_data[first_key]
-            side_type = str(first_key)
-
-        if not groups:
-            return await inter.followup.send(f"❌ Не знайдено відділень для сторони `{side_type}`.", ephemeral=True)
+            return await inter.followup.send(f"❌ Не знайдено відділень для сторони `{side_type}` у відповіді API.", ephemeral=True)
 
         vtg_wizard_sessions[inter.message.id] = {
             "game": game,
@@ -1075,11 +1065,7 @@ class VtgToggleSideButton(Button):
         if data["game"].get("mission", {}).get("missionObjective") == "ENCOUTER_BATTLE":
             new_role = "ЗУСТРІЧНИЙ БІЙ"
 
-        groups = slots_data.get(new_side) or slots_data.get(new_side.lower())
-        if not groups:
-            key = "attack" if new_side == "BLUE" else "defense"
-            groups = slots_data.get(key, [])
-
+        groups = extract_group_list(slots_data, new_side, new_role)
         if not groups:
             return await inter.response.send_message(f"⚠️ Не знайдено відділень для сторони `{new_side}`.", ephemeral=True)
 
