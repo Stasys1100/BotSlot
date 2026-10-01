@@ -192,8 +192,13 @@ class AdminUserSelect(discord.ui.UserSelect):
             pass
             
         await inter.response.defer()
-        try: await inter.message.delete()
-        except: pass
+        try:
+            if hasattr(self.view, 'original_inter'):
+                await self.view.original_inter.delete_original_response()
+            else:
+                await inter.message.delete()
+        except Exception as e:
+            print("Delete error:", e)
 
 class AdminControlTakeButton(discord.ui.Button):
     def __init__(self, sid: int, idx: int):
@@ -220,8 +225,13 @@ class AdminControlTakeButton(discord.ui.Button):
             except:
                 pass
         await inter.response.defer()
-        try: await inter.message.delete()
-        except: pass
+        try:
+            if hasattr(self.view, 'original_inter'):
+                await self.view.original_inter.delete_original_response()
+            else:
+                await inter.message.delete()
+        except Exception as e:
+            print("Delete error:", e)
 
 class AdminControlReleaseButton(discord.ui.Button):
     def __init__(self, sid: int, idx: int, disabled: bool):
@@ -253,20 +263,31 @@ class AdminControlReleaseButton(discord.ui.Button):
                     pass
                         
         await inter.response.defer()
-        try: await inter.message.delete()
-        except: pass
+        try:
+            if hasattr(self.view, 'original_inter'):
+                await self.view.original_inter.delete_original_response()
+            else:
+                await inter.message.delete()
+        except Exception as e:
+            print("Delete error:", e)
 
 class AdminControlCloseButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="Закрити", style=discord.ButtonStyle.secondary)
     async def callback(self, inter: discord.Interaction):
         await inter.response.defer()
-        try: await inter.message.delete()
-        except: pass
+        try:
+            if hasattr(self.view, 'original_inter'):
+                await self.view.original_inter.delete_original_response()
+            else:
+                await inter.message.delete()
+        except Exception as e:
+            print("Delete error:", e)
 
 class AdminSlotControlView(discord.ui.View):
-    def __init__(self, sid: int, idx: int):
+    def __init__(self, sid: int, idx: int, original_inter: discord.Interaction):
         super().__init__(timeout=300)
+        self.original_inter = original_inter
         sess = sessions.get(sid, {})
         owner = sess.get("owners", [None])[idx]
         
@@ -313,7 +334,7 @@ class SlotButton(Button):
                 description=f"**Тема:** {sess['title']}\n**Слот:** {slot_name}\n**Статус:** {owner_display}\n\nОберіть дію нижче:",
                 color=discord.Color.gold()
             )
-            return await inter.response.send_message(embed=embed, view=AdminSlotControlView(self.sid, self.idx), ephemeral=True)
+            return await inter.response.send_message(embed=embed, view=AdminSlotControlView(self.sid, self.idx, inter), ephemeral=True)
 
         # ПЕРЕВІРКА НА ЗАБОРОНУ (для звичайних користувачів)
         forbidden_ids = sess.get("forbidden", [])[self.idx]
