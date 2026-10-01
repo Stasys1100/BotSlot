@@ -281,7 +281,12 @@ class SlotButton(Button):
 
     async def callback(self, inter: discord.Interaction):
         user = inter.user
-        sess = sessions[self.sid]
+        if self.sid not in sessions:
+            await reconstruct_session(inter.message)
+        sess = sessions.get(self.sid)
+        if not sess:
+            return await inter.response.send_message("❌ Помилка: сесія не знайдена. Спробуйте оновити тему.", ephemeral=True)
+            
         owner = sess["owners"][self.idx]
         ch_id = sess["channel_id"]
 
@@ -1308,25 +1313,27 @@ async def reconstruct_session(msg: discord.Message):
     }
 
 async def setup_hook():
+    pass
+
+bot.setup_hook = setup_hook
+
+
+async def recover_sessions():
     print("Recovering sessions from recent messages...")
     channels_to_check = [VTG_CHANNEL_ID, SLOTS_FORUM_CHANNEL_ID]
     for channel_id in channels_to_check:
         if not channel_id: continue
         ch = bot.get_channel(channel_id)
-        if not ch:
-            try:
-                ch = await bot.fetch_channel(channel_id)
-            except:
-                continue
         if not ch: continue
         
         targets = []
         if isinstance(ch, discord.ForumChannel):
-            targets.extend(ch.threads)
-            try:
-                async for arch_thread in ch.archived_threads(limit=10):
-                    targets.append(arch_thread)
-            except: pass
+            for t in ch.threads:
+                if t not in targets: targets.append(t)
+            if hasattr(ch.guild, 'threads'):
+                for t in ch.guild.threads:
+                    if t.parent_id == ch.id and t not in targets:
+                        targets.append(t)
         else:
             targets.append(ch)
             
@@ -1348,8 +1355,6 @@ async def setup_hook():
         for idx in range(min(25, len(sess.get("lines", [])))):
             bot.add_view(ClaimSlotView(sid, idx))
 
-bot.setup_hook = setup_hook
-
 @bot.event
 async def on_ready():
     print(f"[on_ready] {bot.user}")
@@ -1367,6 +1372,7 @@ async def on_ready():
             pass
     if not vtg_reminder.is_running():
         vtg_reminder.start()
+    bot.loop.create_task(recover_sessions())
 
 @bot.event
 async def on_message(message: discord.Message):
