@@ -285,7 +285,13 @@ class SlotButton(Button):
         owner = sess["owners"][self.idx]
         ch_id = sess["channel_id"]
 
-        if inter.channel.permissions_for(user).manage_messages or user.guild_permissions.administrator:
+        is_admin = False
+        if hasattr(inter, "permissions") and getattr(inter.permissions, "manage_messages", False):
+            is_admin = True
+        elif getattr(user, "guild_permissions", None) and user.guild_permissions.administrator:
+            is_admin = True
+            
+        if is_admin:
             slot_name = sess["lines"][self.idx]
             owner_display = f"<@{owner}>" if owner else "Вільний"
             
@@ -1314,14 +1320,25 @@ async def setup_hook():
                 continue
         if not ch: continue
         
-        try:
-            async for msg in ch.history(limit=50):
-                if msg.author == bot.user and msg.embeds:
-                    embed = msg.embeds[0]
-                    if embed.footer and embed.footer.text and "Вільно:" in embed.footer.text:
-                        await reconstruct_session(msg)
-        except Exception as e:
-            print(f"Error scanning channel {channel_id}: {e}")
+        targets = []
+        if isinstance(ch, discord.ForumChannel):
+            targets.extend(ch.threads)
+            try:
+                async for arch_thread in ch.archived_threads(limit=10):
+                    targets.append(arch_thread)
+            except: pass
+        else:
+            targets.append(ch)
+            
+        for t in targets:
+            try:
+                async for msg in t.history(limit=25):
+                    if msg.author == bot.user and msg.embeds:
+                        embed = msg.embeds[0]
+                        if embed.footer and embed.footer.text and "Вільно:" in embed.footer.text:
+                            await reconstruct_session(msg)
+            except Exception as e:
+                pass
 
     print(f"Re-registering views for {len(sessions)} sessions...")
     for sid, sess in sessions.items():
