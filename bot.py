@@ -191,7 +191,9 @@ class AdminUserSelect(discord.ui.UserSelect):
         except:
             pass
             
-        await inter.response.edit_message(content=f"✅ {selected_user.mention} призначено на слот.", embed=None, view=None)
+        await inter.response.defer()
+        try: await inter.message.delete()
+        except: pass
 
 class AdminControlTakeButton(discord.ui.Button):
     def __init__(self, sid: int, idx: int):
@@ -217,7 +219,9 @@ class AdminControlTakeButton(discord.ui.Button):
                 await main_msg.edit(embed=build_embed(sess), view=SlotView(self.sid))
             except:
                 pass
-        await inter.response.edit_message(content="✅ Ви зайняли слот.", embed=None, view=None)
+        await inter.response.defer()
+        try: await inter.message.delete()
+        except: pass
 
 class AdminControlReleaseButton(discord.ui.Button):
     def __init__(self, sid: int, idx: int, disabled: bool):
@@ -248,13 +252,17 @@ class AdminControlReleaseButton(discord.ui.Button):
                 except:
                     pass
                         
-        await inter.response.edit_message(content="✅ Слот звільнено.", embed=None, view=None)
+        await inter.response.defer()
+        try: await inter.message.delete()
+        except: pass
 
 class AdminControlCloseButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="Закрити", style=discord.ButtonStyle.secondary)
     async def callback(self, inter: discord.Interaction):
-        await inter.response.edit_message(content="Меню закрито.", embed=None, view=None)
+        await inter.response.defer()
+        try: await inter.message.delete()
+        except: pass
 
 class AdminSlotControlView(discord.ui.View):
     def __init__(self, sid: int, idx: int):
