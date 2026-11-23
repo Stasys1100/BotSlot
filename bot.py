@@ -19,6 +19,16 @@ from vtg_api import (
     extract_group_list,
     KYIV_TZ
 )
+from ocap_api import (
+    OcapApiClient,
+    is_valid_match,
+    build_match_embed,
+    build_day_embeds,
+    VtgResultsDateView,
+    load_posted_matches,
+    save_posted_matches,
+    init_posted_matches_if_needed
+)
 
 # ─── 1. Keep-alive та ENV ───────────────────────────────────────────────────────
 keep_alive()
@@ -74,6 +84,46 @@ async def vtg_reminder():
                 await ch.send("||@everyone||\n**Сбор VTG**")
             except:
                 pass
+
+# ─── 4.1. Автоматичний трекер результатів місій VTG ─────────────────────────────
+ocap_client = OcapApiClient()
+posted_match_ids: set[int] = load_posted_matches()
+
+@tasks.loop(minutes=2)
+async def vtg_results_tracker():
+    global posted_match_ids
+    ch = await get_or_fetch_channel(VTG_CHANNEL_ID)
+    if not ch:
+        return
+
+    try:
+        matches = await ocap_client.get_rotation_matches()
+        if not matches:
+            return
+
+        # При першому запуску ініціалізуємо поточними ID, щоб не спамити історією
+        if not posted_match_ids:
+            posted_match_ids = init_posted_matches_if_needed(matches)
+            return
+
+        # Шукаємо нові матчі, які ще не були опубліковані
+        new_matches = [m for m in matches if m.get("missionId") not in posted_match_ids and is_valid_match(m)]
+        if not new_matches:
+            return
+
+        # Відправляємо по черзі (від старіших до новіших)
+        for m in reversed(new_matches):
+            mid = m.get("missionId")
+            embed = build_match_embed(m, all_matches=matches, target_squad=TARGET_SQUAD_NAME)
+            try:
+                await ch.send(embed=embed)
+                posted_match_ids.add(mid)
+                save_posted_matches(posted_match_ids)
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"[vtg_results_tracker] Помилка відправки повідомлення: {e}")
+    except Exception as e:
+        print(f"[vtg_results_tracker] Помилка: {e}")
 
 # ─── 5. Палітра «Теплий мінімалізм» та генератор Embed ──────────────────────────
 WARM_ACCENT = discord.Color.from_rgb(207, 148, 86)   # Теплий бурштин / пісок (#CF9456)
@@ -1303,6 +1353,19 @@ async def _слоти(ctx: commands.Context):
     await status_msg.edit(content=None, embed=embed, view=view)
 
 
+@bot.command(name="результати", aliases=["итоги", "results", "last_game"])
+async def _результати(ctx: commands.Context):
+    """Вибрати ігровий день та подивитися результати ігор."""
+    matches = await ocap_client.get_rotation_matches()
+    valid_matches = [m for m in matches if is_valid_match(m)]
+    if not valid_matches:
+        return await ctx.send("Не знайдено завершених місій ротації.")
+
+    view = VtgResultsDateView(valid_matches, ctx.author.id, target_squad=TARGET_SQUAD_NAME)
+    msg = await ctx.send("Оберіть ігровий день для перегляду результатів:", view=view)
+    view.message = msg
+
+
 # ─── 11. Події on_ready та on_message ────────────────────────────────────────────
 BOT_LOG_CHANNEL_ID = 1395065909185478769
 
@@ -1401,6 +1464,8 @@ async def on_ready():
             pass
     if not vtg_reminder.is_running():
         vtg_reminder.start()
+    if not vtg_results_tracker.is_running():
+        vtg_results_tracker.start()
     bot.loop.create_task(recover_sessions())
 
 @bot.event
