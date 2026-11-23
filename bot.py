@@ -22,12 +22,13 @@ from vtg_api import (
 from ocap_api import (
     OcapApiClient,
     is_valid_match,
-    build_match_embed,
-    build_day_embeds,
+    build_single_game_embed,
+    build_day_embed,
     VtgResultsDateView,
     load_posted_matches,
     save_posted_matches,
-    init_posted_matches_if_needed
+    init_posted_matches_if_needed,
+    ANNOUNCEMENT_CHANNEL_ID
 )
 
 # ─── 1. Keep-alive та ENV ───────────────────────────────────────────────────────
@@ -114,7 +115,7 @@ async def vtg_results_tracker():
         # Відправляємо по черзі (від старіших до новіших)
         for m in reversed(new_matches):
             mid = m.get("missionId")
-            embed = build_match_embed(m, all_matches=matches, target_squad=TARGET_SQUAD_NAME)
+            embed = build_single_game_embed(m, all_matches=matches, target_squad=TARGET_SQUAD_NAME)
             try:
                 await ch.send(embed=embed)
                 posted_match_ids.add(mid)
@@ -1355,14 +1356,14 @@ async def _слоти(ctx: commands.Context):
 
 @bot.command(name="результати", aliases=["итоги", "results", "last_game"])
 async def _результати(ctx: commands.Context):
-    """Вибрати ігровий день та подивитися результати ігор."""
+    """Вибрати ігровий день та опублікувати результати в канал анонсів."""
     matches = await ocap_client.get_rotation_matches()
     valid_matches = [m for m in matches if is_valid_match(m)]
     if not valid_matches:
         return await ctx.send("Не знайдено завершених місій ротації.")
 
     view = VtgResultsDateView(valid_matches, ctx.author.id, target_squad=TARGET_SQUAD_NAME)
-    msg = await ctx.send("Оберіть ігровий день для перегляду результатів:", view=view)
+    msg = await ctx.send(f"Оберіть ігровий день для публікації в <#{ANNOUNCEMENT_CHANNEL_ID}>:", view=view)
     view.message = msg
 
 

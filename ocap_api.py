@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 import datetime
-from typing import Optional
+from typing import Optional, Tuple
 from collections import defaultdict
 import aiohttp
 import discord
@@ -10,6 +10,7 @@ from discord.ui import View, Select
 from discord import SelectOption
 
 OCAP_API_URL = "https://stats.replays.vtg.in.ua/api/v1"
+ANNOUNCEMENT_CHANNEL_ID = 1160843618433630228
 
 WEEKDAYS_UA = {
     0: "Понеділок",
@@ -21,10 +22,10 @@ WEEKDAYS_UA = {
     6: "Неділя"
 }
 
-# Кольори з мінімалістичної палітри bot.py
-WARM_BLUE = discord.Color.from_rgb(86, 126, 160)   # #567EA0 (Перемога Сторони 1)
-WARM_RED  = discord.Color.from_rgb(194, 98, 77)    # #C2624D (Поразка / Перемога Сторони 2)
-WARM_GRAY = discord.Color.from_rgb(150, 142, 133)  # #968E85 (Нічия)
+# Яскраві кольори для підсумку
+COLOR_WIN  = discord.Color.green()    # #2ECC71
+COLOR_LOSS = discord.Color.red()      # #E74C3C
+COLOR_DRAW = discord.Color.gold()     # #F1C40F
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posted_matches.json")
 
@@ -80,11 +81,37 @@ def get_game_number(match: dict, all_matches: list[dict] = None) -> int:
     return 1
 
 
-def build_match_embed(m: dict, all_matches: list[dict] = None, target_squad: str = "28") -> discord.Embed:
+def format_game_single_line(m: dict, all_matches: list[dict] = None, target_squad: str = "28") -> Tuple[str, Optional[bool]]:
     """
-    Формує ультра-лаконічний Embed результату місії без рахунку ротації,
-    із зазначенням номеру гри (Гра 1 / Гра 2).
+    Формує результат однієї гри в один рядок із кольоровим маркером.
+    Повертає: (рядок, чи_перемога_наша)
     """
+    game_num = get_game_number(m, all_matches) if all_matches else 1
+    mission_name = m.get("name", "Невідома місія")
+    world = m.get("world", "")
+    duration_min = m.get("duration", 0) // 60
+
+    winner = m.get("winner")
+    # Сторона 1 містить загін 28 (індекс 0)
+    if winner == 0:
+        is_win = True
+        marker = "🟢"
+        status = f"**[{target_squad}] ПЕРЕМОГА** (Сторона 1)"
+    elif winner == 1:
+        is_win = False
+        marker = "🔴"
+        status = f"**[{target_squad}] ПОРАЗКА** (Сторона 2)"
+    else:
+        is_win = None
+        marker = "⚪"
+        status = f"**[{target_squad}] НІЧИЯ**"
+
+    line = f"{marker} {status} · `Гра {game_num}` · `{mission_name}` · `{world}` ({duration_min} хв)"
+    return line, is_win
+
+
+def build_single_game_embed(m: dict, all_matches: list[dict] = None, target_squad: str = "28") -> discord.Embed:
+    """Формує однорядковий Embed для однієї щойно завершеної місії (авто-трекер)."""
     date_str = m.get("date", "")
     day_name = ""
     short_date = ""
@@ -96,43 +123,11 @@ def build_match_embed(m: dict, all_matches: list[dict] = None, target_squad: str
         except Exception:
             short_date = date_str
 
-    game_num = get_game_number(m, all_matches) if all_matches else 1
-    mission_name = m.get("name", "Невідома місія")
-    world = m.get("world", "")
-    duration_min = m.get("duration", 0) // 60
+    line, is_win = format_game_single_line(m, all_matches=all_matches, target_squad=target_squad)
+    color = COLOR_WIN if is_win is True else (COLOR_LOSS if is_win is False else COLOR_DRAW)
 
-    winner = m.get("winner")
-    # Сторона 1 містить загін 28 (індекс 0)
-    if winner == 0:
-        status_text = f"[{target_squad}] ПЕРЕМОГА"
-        winner_side = "Сторона 1"
-        color = WARM_BLUE
-    elif winner == 1:
-        status_text = f"[{target_squad}] ПОРАЗКА"
-        winner_side = "Сторона 2"
-        color = WARM_RED
-    else:
-        status_text = f"[{target_squad}] НІЧИЯ"
-        winner_side = "Нічия"
-        color = WARM_GRAY
-
-    title_parts = ["VTG"]
-    if day_name:
-        title_parts.append(f"{day_name} ({short_date})")
-    title_parts.append(f"Гра {game_num}")
-    title = " · ".join(title_parts)
-
-    desc = (
-        f"`{mission_name}` · `{world}` ({duration_min} хв)\n"
-        f"**{status_text}** ({winner_side})"
-    )
-
-    embed = discord.Embed(
-        title=title,
-        description=desc,
-        color=color
-    )
-    return embed
+    title = f"VTG · {day_name} ({short_date})" if day_name else "VTG"
+    return discord.Embed(title=title, description=line, color=color)
 
 
 def get_matches_for_date(valid_matches: list[dict], date_str: str) -> list[dict]:
@@ -141,10 +136,40 @@ def get_matches_for_date(valid_matches: list[dict], date_str: str) -> list[dict]
     return sorted(day_matches, key=lambda x: x.get("missionId", 0))
 
 
-def build_day_embeds(valid_matches: list[dict], date_str: str, target_squad: str = "28") -> list[discord.Embed]:
-    """Формує список Embed для всіх ігор обраного дня."""
+def build_day_embed(valid_matches: list[dict], date_str: str, target_squad: str = "28") -> Optional[discord.Embed]:
+    """Формує єдиний компактний Embed для всіх ігор обраного дня (кожна гра в один рядок)."""
     day_matches = get_matches_for_date(valid_matches, date_str)
-    return [build_match_embed(m, all_matches=valid_matches, target_squad=target_squad) for m in day_matches]
+    if not day_matches:
+        return None
+
+    lines = []
+    wins = 0
+    losses = 0
+    for m in day_matches:
+        line, is_win = format_game_single_line(m, all_matches=valid_matches, target_squad=target_squad)
+        lines.append(line)
+        if is_win is True:
+            wins += 1
+        elif is_win is False:
+            losses += 1
+
+    # Колір смуги: зелений, якщо тільки перемоги; червоний, якщо тільки поразки; золотий, якщо 1-1
+    if wins > 0 and losses == 0:
+        color = COLOR_WIN
+    elif losses > 0 and wins == 0:
+        color = COLOR_LOSS
+    else:
+        color = COLOR_DRAW
+
+    dt = datetime.date.fromisoformat(date_str)
+    day_name = WEEKDAYS_UA.get(dt.weekday(), "")
+    short_date = dt.strftime("%d.%m")
+
+    return discord.Embed(
+        title=f"VTG · {day_name} ({short_date})",
+        description="\n".join(lines),
+        color=color
+    )
 
 
 # ─── UI компоненти: Меню вибору ігрового дня ──────────────────────────────────────
@@ -186,16 +211,33 @@ class VtgResultsDateSelect(Select):
             return await inter.response.send_message("Це меню викликано іншим користувачем.", ephemeral=True)
 
         selected_date = self.values[0]
-        embeds = build_day_embeds(self.valid_matches, selected_date, target_squad=self.target_squad)
-        if not embeds:
+        embed = build_day_embed(self.valid_matches, selected_date, target_squad=self.target_squad)
+        if not embed:
             return await inter.response.send_message("За цей день ігор не знайдено.", ephemeral=True)
+
+        # Отримуємо цільовий канал анонсів 1160843618433630228
+        bot = inter.client
+        announcement_ch = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
+        if announcement_ch is None:
+            try:
+                announcement_ch = await bot.fetch_channel(ANNOUNCEMENT_CHANNEL_ID)
+            except Exception:
+                announcement_ch = None
+
+        target_channel = announcement_ch if announcement_ch else inter.channel
 
         if self.view:
             self.view.selected = True
             self.view.stop()
 
-        # Публікуємо результат обраного дня та прибираємо меню вибору
-        await inter.response.edit_message(content=None, embeds=embeds, view=None)
+        # Відправляємо результат строго в канал анонсів
+        await target_channel.send(embed=embed)
+
+        # Якщо команда викликалась в іншому каналі - підтверджуємо відправку
+        if inter.channel.id != target_channel.id:
+            await inter.response.edit_message(content=f"Результати за обраний день відправлено в <#{target_channel.id}>.", view=None)
+        else:
+            await inter.message.delete()
 
 
 class VtgResultsDateView(View):
@@ -207,7 +249,7 @@ class VtgResultsDateView(View):
         self.add_item(self.select)
 
     async def on_timeout(self):
-        # Якщо користувач так і не обрав день — видаляємо меню, нічого не поститься
+        # Якщо користувач так і не обрав день — видаляємо меню
         if not self.selected and self.message:
             try:
                 await self.message.delete()
