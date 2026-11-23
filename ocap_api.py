@@ -96,11 +96,11 @@ def format_game_single_line(m: dict, all_matches: list[dict] = None, target_squa
     if winner == 0:
         is_win = True
         marker = "🟢"
-        status = f"**[{target_squad}] ПЕРЕМОГА** (Сторона 1)"
+        status = f"**[{target_squad}] ПЕРЕМОГА**"
     elif winner == 1:
         is_win = False
         marker = "🔴"
-        status = f"**[{target_squad}] ПОРАЗКА** (Сторона 2)"
+        status = f"**[{target_squad}] ПОРАЗКА**"
     else:
         is_win = None
         marker = "⚪"
