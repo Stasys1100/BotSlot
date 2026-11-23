@@ -18,6 +18,7 @@ class VtgApiClient:
     def __init__(self, api_key: str, base_url: str = DEFAULT_API_URL):
         self.api_key = (api_key or "").strip()
         self.base_url = base_url.rstrip("/")
+        self._side_cache: dict[str, dict] = {}
 
     @property
     def headers(self) -> dict[str, str]:
@@ -88,12 +89,18 @@ class VtgApiClient:
         """Отримує детальну інформацію про сторону, включаючи список загонів (squads)."""
         if not side_id:
             return None
+        if hasattr(self, "_side_cache") and side_id in self._side_cache:
+            return self._side_cache[side_id]
         url = f"{self.base_url}/api/public/sides/{side_id}"
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(url, headers=self.headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
-                        return await resp.json()
+                        data = await resp.json()
+                        if not hasattr(self, "_side_cache"):
+                            self._side_cache = {}
+                        self._side_cache[side_id] = data
+                        return data
             except Exception:
                 pass
         return None

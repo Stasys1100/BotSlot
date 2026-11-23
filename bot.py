@@ -24,6 +24,7 @@ from ocap_api import (
     is_valid_match,
     build_single_game_embed,
     build_day_embed,
+    fetch_official_mission_names,
     VtgResultsDateView,
     load_posted_matches,
     save_posted_matches,
@@ -112,10 +113,13 @@ async def vtg_results_tracker():
         if not new_matches:
             return
 
+        # Отримуємо гарні назви місій та ролі з розкладу VTG
+        names_cache = await fetch_official_mission_names(VTG_API_KEY, target_squad=TARGET_SQUAD_NAME)
+
         # Відправляємо по черзі (від старіших до новіших)
         for m in reversed(new_matches):
             mid = m.get("missionId")
-            embed = build_single_game_embed(m, all_matches=matches, target_squad=TARGET_SQUAD_NAME)
+            embed = await build_single_game_embed(m, client=ocap_client, all_matches=matches, names_cache=names_cache, target_squad=TARGET_SQUAD_NAME)
             try:
                 await ch.send(embed=embed)
                 posted_match_ids.add(mid)
@@ -1362,7 +1366,8 @@ async def _результати(ctx: commands.Context):
     if not valid_matches:
         return await ctx.send("Не знайдено завершених місій ротації.")
 
-    view = VtgResultsDateView(valid_matches, ctx.author.id, target_squad=TARGET_SQUAD_NAME)
+    names_cache = await fetch_official_mission_names(VTG_API_KEY, target_squad=TARGET_SQUAD_NAME)
+    view = VtgResultsDateView(valid_matches, ctx.author.id, names_cache=names_cache, target_squad=TARGET_SQUAD_NAME)
     msg = await ctx.send(f"Оберіть ігровий день для публікації в <#{ANNOUNCEMENT_CHANNEL_ID}>:", view=view)
     view.message = msg
 

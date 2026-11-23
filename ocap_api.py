@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import datetime
@@ -8,6 +9,7 @@ import aiohttp
 import discord
 from discord.ui import View, Select
 from discord import SelectOption
+from vtg_api import KYIV_TZ, VtgApiClient
 
 OCAP_API_URL = "https://stats.replays.vtg.in.ua/api/v1"
 ANNOUNCEMENT_CHANNEL_ID = 1160843618433630228
@@ -47,6 +49,94 @@ class OcapApiClient:
                 print(f"[OcapApiClient] Помилка отримання ротації: {e}")
         return []
 
+    async def get_mission_squad_stats(self, mission_id: int, target_squad: str = "28") -> dict:
+        """Отримує статистику конкретного загону за місію (відвідуваність/гравці, вбивства, смерті, тімкіли)."""
+        if not mission_id:
+            return {"players": 0, "kills": 0, "deaths": 0, "teamKills": 0}
+        url = f"{self.base_url}/missions/{mission_id}"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        for s in data.get("squads", []):
+                            if s.get("name") == target_squad:
+                                return {
+                                    "players": s.get("players") or s.get("attendance", 0),
+                                    "kills": s.get("kills", 0),
+                                    "deaths": s.get("deaths", 0),
+                                    "teamKills": s.get("teamKills", 0)
+                                }
+            except Exception as e:
+                print(f"[OcapApiClient] Помилка отримання статистики місії {mission_id}: {e}")
+        return {"players": 0, "kills": 0, "deaths": 0, "teamKills": 0}
+
+
+def normalize_role_title(raw_role: str) -> str:
+    """Приводить назву ролі до акуратного вигляду (Оборона / Атака / Зустрічний бій)."""
+    if not raw_role:
+        return ""
+    r = raw_role.strip()
+    if r.upper() == "ЗУСТРІЧНИЙ БІЙ":
+        return "Зустрічний бій"
+    return r.capitalize() if r.isupper() else r
+
+
+def clean_mission_name_fallback(raw_name: str) -> str:
+    """Очищує технічне ім'я файлу, якщо офіційне не знайдене в розкладі."""
+    name = re.sub(r'^(?:VTG|mVTG)[_ ]*', '', raw_name, flags=re.IGNORECASE)
+    name = re.sub(r'_\d+(?:_v[\d\w_]+)?$', '', name, flags=re.IGNORECASE)
+    name = re.sub(r'_v[\d\w_]+$', '', name, flags=re.IGNORECASE)
+    name = name.replace('_', ' ').strip()
+    return name or raw_name
+
+
+async def fetch_official_mission_names(vtg_api_key: str, target_squad: str = "28") -> dict:
+    """
+    Отримує гарні офіційні назви місій та ролі загону (Оборона/Атака/Зустрічний бій)
+    із розкладу уікендів порталу VTG
+    (наприклад: 'Заколот', 'Busan Pocket', 'New Paralel', 'Захід-82\'').
+    """
+    if not vtg_api_key:
+        return {}
+    try:
+        client = VtgApiClient(vtg_api_key)
+        weekends = await client.get_published_weekends(take=15)
+        cache = {}
+        for wk in weekends:
+            games = wk.get("games", [])
+            by_date = defaultdict(list)
+            for g in games:
+                raw_d = g.get("date")
+                if raw_d:
+                    try:
+                        dt = datetime.datetime.fromisoformat(raw_d.replace("Z", "+00:00")).astimezone(KYIV_TZ)
+                        d_str = dt.strftime("%Y-%m-%d")
+                        by_date[d_str].append(g)
+                    except Exception:
+                        pass
+            for d_str, g_list in by_date.items():
+                sorted_g = sorted(g_list, key=lambda x: x.get("position", 0))
+                for idx, g in enumerate(sorted_g, 1):
+                    m_name = (g.get("mission") or {}).get("name")
+                    role = None
+                    try:
+                        _, role_name, _ = await client.detect_squad_side(g, target_squad=target_squad)
+                        role = normalize_role_title(role_name)
+                    except Exception:
+                        pass
+                    if m_name:
+                        info_dict = {
+                            "name": m_name.strip(),
+                            "role": role
+                        }
+                        cache[(d_str, idx)] = info_dict
+                        cache[(d_str, m_name.strip().lower())] = info_dict
+        return cache
+    except Exception as e:
+        print(f"[fetch_official_mission_names] Помилка отримання назв з VTG API: {e}")
+        return {}
+
 
 def is_valid_match(m: dict) -> bool:
     """
@@ -81,15 +171,38 @@ def get_game_number(match: dict, all_matches: list[dict] = None) -> int:
     return 1
 
 
-def format_game_single_line(m: dict, all_matches: list[dict] = None, target_squad: str = "28") -> Tuple[str, Optional[bool]]:
+def format_game_single_line(
+    m: dict,
+    all_matches: list[dict] = None,
+    names_cache: dict = None,
+    squad_stats: dict = None,
+    target_squad: str = "28"
+) -> Tuple[str, Optional[bool]]:
     """
-    Формує результат однієї гри в один рядок із кольоровим маркером.
-    Повертає: (рядок, чи_перемога_наша)
+    Формує результат однієї гри в один рядок:
+    Статус, номер гри, назва місії, тривалість, вбивства, смерті, тімкіли (без карти).
     """
     game_num = get_game_number(m, all_matches) if all_matches else 1
-    mission_name = m.get("name", "Невідома місія")
-    world = m.get("world", "")
+    date_str = m.get("date", "")
+    raw_name = m.get("name", "Невідома місія")
     duration_min = m.get("duration", 0) // 60
+
+    # Офіційна назва місії або очищена технічна, та роль загону
+    mission_name = None
+    role_name = None
+    if names_cache:
+        cached = names_cache.get((date_str, game_num))
+        if not cached:
+            fallback_n = clean_mission_name_fallback(raw_name).lower()
+            cached = names_cache.get((date_str, fallback_n))
+        if isinstance(cached, dict):
+            mission_name = cached.get("name")
+            role_name = cached.get("role")
+        elif isinstance(cached, str):
+            mission_name = cached
+
+    if not mission_name:
+        mission_name = clean_mission_name_fallback(raw_name)
 
     winner = m.get("winner")
     # Сторона 1 містить загін 28 (індекс 0)
@@ -106,11 +219,30 @@ def format_game_single_line(m: dict, all_matches: list[dict] = None, target_squa
         marker = "⚪"
         status = f"**[{target_squad}] НІЧИЯ**"
 
-    line = f"{marker} {status} · `Гра {game_num}` · `{mission_name}` · `{world}` ({duration_min} хв)"
+    # Роль загону в місії (Оборона / Атака / Зустрічний бій)
+    role_str = f" [{role_name}]" if role_name else ""
+
+    # Загальна статистика загону за матч (відвідуваність/гравці, вбивства, смерті, тімкіли)
+    stats_str = ""
+    if squad_stats:
+        p = squad_stats.get("players", 0)
+        k = squad_stats.get("kills", 0)
+        d = squad_stats.get("deaths", 0)
+        tk = squad_stats.get("teamKills", 0)
+        players_part = f" · Гравців: {p}" if p else ""
+        stats_str = f"{players_part} · Вбивств: {k} · Смертей: {d} · ТК: {tk}"
+
+    line = f"{marker} {status} · `Гра {game_num}` · `{mission_name}`{role_str} ({duration_min} хв){stats_str}"
     return line, is_win
 
 
-def build_single_game_embed(m: dict, all_matches: list[dict] = None, target_squad: str = "28") -> discord.Embed:
+async def build_single_game_embed(
+    m: dict,
+    client: OcapApiClient,
+    all_matches: list[dict] = None,
+    names_cache: dict = None,
+    target_squad: str = "28"
+) -> discord.Embed:
     """Формує однорядковий Embed для однієї щойно завершеної місії (авто-трекер)."""
     date_str = m.get("date", "")
     day_name = ""
@@ -123,7 +255,16 @@ def build_single_game_embed(m: dict, all_matches: list[dict] = None, target_squa
         except Exception:
             short_date = date_str
 
-    line, is_win = format_game_single_line(m, all_matches=all_matches, target_squad=target_squad)
+    mid = m.get("missionId", 0)
+    squad_stats = await client.get_mission_squad_stats(mid, target_squad=target_squad) if mid else {}
+
+    line, is_win = format_game_single_line(
+        m,
+        all_matches=all_matches,
+        names_cache=names_cache,
+        squad_stats=squad_stats,
+        target_squad=target_squad
+    )
     color = COLOR_WIN if is_win is True else (COLOR_LOSS if is_win is False else COLOR_DRAW)
 
     title = f"VTG · {day_name} ({short_date})" if day_name else "VTG"
@@ -136,17 +277,33 @@ def get_matches_for_date(valid_matches: list[dict], date_str: str) -> list[dict]
     return sorted(day_matches, key=lambda x: x.get("missionId", 0))
 
 
-def build_day_embed(valid_matches: list[dict], date_str: str, target_squad: str = "28") -> Optional[discord.Embed]:
-    """Формує єдиний компактний Embed для всіх ігор обраного дня (кожна гра в один рядок)."""
+async def build_day_embed(
+    client: OcapApiClient,
+    valid_matches: list[dict],
+    date_str: str,
+    names_cache: dict = None,
+    target_squad: str = "28"
+) -> Optional[discord.Embed]:
+    """Формує єдиний компактний Embed для всіх ігор обраного дня зі статистикою загону."""
     day_matches = get_matches_for_date(valid_matches, date_str)
     if not day_matches:
         return None
 
+    # Отримуємо статистику для ігор дня паралельно
+    stats_tasks = [client.get_mission_squad_stats(m.get("missionId", 0), target_squad=target_squad) for m in day_matches]
+    all_stats = await asyncio.gather(*stats_tasks)
+
     lines = []
     wins = 0
     losses = 0
-    for m in day_matches:
-        line, is_win = format_game_single_line(m, all_matches=valid_matches, target_squad=target_squad)
+    for m, sq_stats in zip(day_matches, all_stats):
+        line, is_win = format_game_single_line(
+            m,
+            all_matches=valid_matches,
+            names_cache=names_cache,
+            squad_stats=sq_stats,
+            target_squad=target_squad
+        )
         lines.append(line)
         if is_win is True:
             wins += 1
@@ -175,9 +332,10 @@ def build_day_embed(valid_matches: list[dict], date_str: str, target_squad: str 
 # ─── UI компоненти: Меню вибору ігрового дня ──────────────────────────────────────
 
 class VtgResultsDateSelect(Select):
-    def __init__(self, valid_matches: list[dict], caller_id: int, target_squad: str = "28", limit: int = 15):
+    def __init__(self, valid_matches: list[dict], caller_id: int, names_cache: dict = None, target_squad: str = "28", limit: int = 15):
         self.valid_matches = valid_matches
         self.caller_id = caller_id
+        self.names_cache = names_cache or {}
         self.target_squad = target_squad
 
         by_date = defaultdict(list)
@@ -194,7 +352,23 @@ class VtgResultsDateSelect(Select):
             d_matches = sorted(by_date[d], key=lambda x: x["missionId"])
             
             label = f"{day_name}, {dt.strftime('%d.%m.%Y')}"[:100]
-            mission_titles = ", ".join([m.get("name", "")[:18] for m in d_matches])
+            
+            desc_names = []
+            for idx, m in enumerate(d_matches, 1):
+                cached = self.names_cache.get((d, idx))
+                if isinstance(cached, dict):
+                    clean_n = cached.get("name") or clean_mission_name_fallback(m.get("name", ""))
+                    r = cached.get("role")
+                    if r:
+                        desc_names.append(f"{clean_n[:14]} [{r}]")
+                    else:
+                        desc_names.append(clean_n[:18])
+                elif isinstance(cached, str):
+                    desc_names.append(cached[:18])
+                else:
+                    clean_n = clean_mission_name_fallback(m.get("name", ""))
+                    desc_names.append(clean_n[:18])
+            mission_titles = ", ".join(desc_names)
             desc = f"{len(d_matches)} гри: {mission_titles}"[:100]
 
             options.append(SelectOption(label=label, description=desc, value=d))
@@ -211,11 +385,17 @@ class VtgResultsDateSelect(Select):
             return await inter.response.send_message("Це меню викликано іншим користувачем.", ephemeral=True)
 
         selected_date = self.values[0]
-        embed = build_day_embed(self.valid_matches, selected_date, target_squad=self.target_squad)
+        client = OcapApiClient()
+        embed = await build_day_embed(
+            client=client,
+            valid_matches=self.valid_matches,
+            date_str=selected_date,
+            names_cache=self.names_cache,
+            target_squad=self.target_squad
+        )
         if not embed:
             return await inter.response.send_message("За цей день ігор не знайдено.", ephemeral=True)
 
-        # Отримуємо цільовий канал анонсів 1160843618433630228
         bot = inter.client
         announcement_ch = bot.get_channel(ANNOUNCEMENT_CHANNEL_ID)
         if announcement_ch is None:
@@ -230,10 +410,9 @@ class VtgResultsDateSelect(Select):
             self.view.selected = True
             self.view.stop()
 
-        # Відправляємо результат строго в канал анонсів
+        # Відправляємо результат у канал анонсів
         await target_channel.send(embed=embed)
 
-        # Якщо команда викликалась в іншому каналі - підтверджуємо відправку
         if inter.channel.id != target_channel.id:
             await inter.response.edit_message(content=f"Результати за обраний день відправлено в <#{target_channel.id}>.", view=None)
         else:
@@ -241,15 +420,14 @@ class VtgResultsDateSelect(Select):
 
 
 class VtgResultsDateView(View):
-    def __init__(self, valid_matches: list[dict], caller_id: int, target_squad: str = "28"):
+    def __init__(self, valid_matches: list[dict], caller_id: int, names_cache: dict = None, target_squad: str = "28"):
         super().__init__(timeout=60)
         self.selected: bool = False
         self.message: Optional[discord.Message] = None
-        self.select = VtgResultsDateSelect(valid_matches, caller_id, target_squad=target_squad)
+        self.select = VtgResultsDateSelect(valid_matches, caller_id, names_cache=names_cache, target_squad=target_squad)
         self.add_item(self.select)
 
     async def on_timeout(self):
-        # Якщо користувач так і не обрав день — видаляємо меню
         if not self.selected and self.message:
             try:
                 await self.message.delete()
