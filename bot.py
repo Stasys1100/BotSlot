@@ -139,8 +139,9 @@ async def vtg_results_tracker():
                     save_pending_matches(pending_matches)
                     await asyncio.sleep(1)
 
-        # 4. ЕТАП 1: Перевіряємо щойно завершені місії на сервері реплеїв
-        raw_ops = await ocap_client.get_raw_operations()
+        # 4. ЕТАП 1: Перевіряємо щойно завершені місії на сервері реплеїв (СТРОГО ЛИШЕ ЗА СЬОГОДНІ)
+        today_str = datetime.datetime.now(KYIV_TZ).strftime("%Y-%m-%d")
+        raw_ops = await ocap_client.get_raw_operations(target_date=today_str)
         for op in raw_ops:
             mid = op.get("id")
             if not mid or mid in posted_match_ids or str(mid) in pending_matches:

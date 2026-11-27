@@ -52,15 +52,18 @@ class OcapApiClient:
                 print(f"[OcapApiClient] Помилка отримання ротації: {e}")
         return []
 
-    async def get_raw_operations(self) -> list[dict]:
-        """Отримує завершені операції безпосередньо з replays.vtg.in.ua одразу після завершення місії."""
+    async def get_raw_operations(self, target_date: str = None) -> list[dict]:
+        """Отримує завершені операції безпосередньо з replays.vtg.in.ua (за замовчуванням строго за вказану дату або сьогодні)."""
         url = f"{self.replays_url}/operations"
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        return [op for op in data if op.get("tag") == "VTG" and op.get("mission_duration", 0) >= 1500]
+                        ops = [op for op in data if op.get("tag") == "VTG" and op.get("mission_duration", 0) >= 1500]
+                        if target_date:
+                            ops = [op for op in ops if op.get("date") == target_date]
+                        return ops
             except Exception as e:
                 print(f"[OcapApiClient] Помилка отримання operations: {e}")
         return []
