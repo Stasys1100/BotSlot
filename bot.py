@@ -23,11 +23,14 @@ from ocap_api import (
     OcapApiClient,
     is_valid_match,
     build_single_game_embed,
+    build_preliminary_game_embed,
     build_day_embed,
     fetch_official_mission_names,
     VtgResultsDateView,
     load_posted_matches,
     save_posted_matches,
+    load_pending_matches,
+    save_pending_matches,
     init_posted_matches_if_needed,
     ANNOUNCEMENT_CHANNEL_ID
 )
@@ -90,45 +93,93 @@ async def vtg_reminder():
 # ─── 4.1. Автоматичний трекер результатів місій VTG ─────────────────────────────
 ocap_client = OcapApiClient()
 posted_match_ids: set[int] = load_posted_matches()
+pending_matches: dict = load_pending_matches()
 
 @tasks.loop(minutes=2)
 async def vtg_results_tracker():
-    global posted_match_ids
+    global posted_match_ids, pending_matches
     ch = await get_or_fetch_channel(VTG_CHANNEL_ID)
     if not ch:
         return
 
     try:
-        matches = await ocap_client.get_rotation_matches()
-        if not matches:
-            return
-
-        # При першому запуску ініціалізуємо поточними ID, щоб не спамити історією
-        if not posted_match_ids:
-            posted_match_ids = init_posted_matches_if_needed(matches)
-            return
-
-        # Шукаємо нові матчі, які ще не були опубліковані
-        new_matches = [m for m in matches if m.get("missionId") not in posted_match_ids and is_valid_match(m)]
-        if not new_matches:
-            return
-
-        # Отримуємо гарні назви місій та ролі з розкладу VTG
+        # 1. Отримуємо офіційні назви місій та ролі
         names_cache = await fetch_official_mission_names(VTG_API_KEY, target_squad=TARGET_SQUAD_NAME)
 
-        # Відправляємо по черзі (від старіших до новіших)
-        for m in reversed(new_matches):
-            mid = m.get("missionId")
-            embed = await build_single_game_embed(m, client=ocap_client, all_matches=matches, names_cache=names_cache, target_squad=TARGET_SQUAD_NAME)
-            try:
-                await ch.send(embed=embed)
-                posted_match_ids.add(mid)
-                save_posted_matches(posted_match_ids)
-                await asyncio.sleep(1)
-            except Exception as e:
-                print(f"[vtg_results_tracker] Помилка відправки повідомлення: {e}")
+        # 2. Отримуємо матчі з ротації (з підрахованою статистикою)
+        matches = await ocap_client.get_rotation_matches()
+        valid_matches = [m for m in matches if is_valid_match(m)] if matches else []
+
+        # При першому запуску ініціалізуємо поточними ID, щоб не спамити історією
+        if not posted_match_ids and valid_matches:
+            posted_match_ids = init_posted_matches_if_needed(valid_matches)
+            return
+
+        # 3. ЕТАП 2: Оновлюємо раніше надіслані попередні повідомлення, якщо статистика підтягнулася
+        if pending_matches and valid_matches:
+            for mid_str in list(pending_matches.keys()):
+                mid = int(mid_str)
+                m = next((x for x in valid_matches if x.get("missionId") == mid), None)
+                if m:
+                    pdata = pending_matches[mid_str]
+                    final_embed = await build_single_game_embed(
+                        m, client=ocap_client, all_matches=valid_matches, names_cache=names_cache, target_squad=TARGET_SQUAD_NAME
+                    )
+                    try:
+                        target_ch = await get_or_fetch_channel(pdata.get("channel_id", VTG_CHANNEL_ID))
+                        if target_ch:
+                            msg = await target_ch.fetch_message(pdata["message_id"])
+                            await msg.edit(content="@everyone", embed=final_embed)
+                    except Exception as e:
+                        print(f"[vtg_results_tracker] Не вдалося відредагувати повідомлення {pdata.get('message_id')}: {e}")
+
+                    posted_match_ids.add(mid)
+                    save_posted_matches(posted_match_ids)
+                    del pending_matches[mid_str]
+                    save_pending_matches(pending_matches)
+                    await asyncio.sleep(1)
+
+        # 4. ЕТАП 1: Перевіряємо щойно завершені місії на сервері реплеїв
+        raw_ops = await ocap_client.get_raw_operations()
+        for op in raw_ops:
+            mid = op.get("id")
+            if not mid or mid in posted_match_ids or str(mid) in pending_matches:
+                continue
+
+            # Перевіряємо, чи є місія вже в ротації OCAP зі статусом переможця
+            rot_match = next((x for x in valid_matches if x.get("missionId") == mid), None)
+            if rot_match:
+                # Результат і статистика вже готові — відправляємо одразу повне повідомлення з @everyone
+                final_embed = await build_single_game_embed(
+                    rot_match, client=ocap_client, all_matches=valid_matches, names_cache=names_cache, target_squad=TARGET_SQUAD_NAME
+                )
+                try:
+                    await ch.send(content="@everyone", embed=final_embed)
+                    posted_match_ids.add(mid)
+                    save_posted_matches(posted_match_ids)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"[vtg_results_tracker] Помилка відправки повідомлення: {e}")
+            else:
+                # Місія закінчилася на сервері, але статистика ще рахується OCAP (~5-10 хв).
+                # Відправляємо попереднє повідомлення в анонси з @everyone!
+                prelim_embed = build_preliminary_game_embed(
+                    op, all_ops=raw_ops, names_cache=names_cache, target_squad=TARGET_SQUAD_NAME
+                )
+                try:
+                    sent_msg = await ch.send(content="@everyone", embed=prelim_embed)
+                    pending_matches[str(mid)] = {
+                        "channel_id": ch.id,
+                        "message_id": sent_msg.id,
+                        "date": op.get("date")
+                    }
+                    save_pending_matches(pending_matches)
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"[vtg_results_tracker] Помилка відправки попереднього повідомлення: {e}")
     except Exception as e:
         print(f"[vtg_results_tracker] Помилка: {e}")
+
 
 # ─── 5. Палітра «Теплий мінімалізм» та генератор Embed ──────────────────────────
 WARM_ACCENT = discord.Color.from_rgb(207, 148, 86)   # Теплий бурштин / пісок (#CF9456)

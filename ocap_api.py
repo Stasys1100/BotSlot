@@ -12,6 +12,7 @@ from discord import SelectOption
 from vtg_api import KYIV_TZ, VtgApiClient
 
 OCAP_API_URL = "https://stats.replays.vtg.in.ua/api/v1"
+REPLAYS_API_URL = "https://replays.vtg.in.ua/api/v1"
 ANNOUNCEMENT_CHANNEL_ID = 1160843618433630228
 
 WEEKDAYS_UA = {
@@ -30,11 +31,13 @@ COLOR_LOSS = discord.Color.red()      # #E74C3C
 COLOR_DRAW = discord.Color.gold()     # #F1C40F
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "posted_matches.json")
+PENDING_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pending_matches.json")
 
 
 class OcapApiClient:
-    def __init__(self, base_url: str = OCAP_API_URL):
+    def __init__(self, base_url: str = OCAP_API_URL, replays_url: str = REPLAYS_API_URL):
         self.base_url = base_url.rstrip("/")
+        self.replays_url = replays_url.rstrip("/")
 
     async def get_rotation_matches(self) -> list[dict]:
         """Отримує список усіх матчів ротації (найновіші першими)."""
@@ -47,6 +50,19 @@ class OcapApiClient:
                         return data.get("rotation", {}).get("matches", [])
             except Exception as e:
                 print(f"[OcapApiClient] Помилка отримання ротації: {e}")
+        return []
+
+    async def get_raw_operations(self) -> list[dict]:
+        """Отримує завершені операції безпосередньо з replays.vtg.in.ua одразу після завершення місії."""
+        url = f"{self.replays_url}/operations"
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        return [op for op in data if op.get("tag") == "VTG" and op.get("mission_duration", 0) >= 1500]
+            except Exception as e:
+                print(f"[OcapApiClient] Помилка отримання operations: {e}")
         return []
 
     async def get_mission_squad_stats(self, mission_id: int, target_squad: str = "28") -> dict:
@@ -271,6 +287,66 @@ async def build_single_game_embed(
     return discord.Embed(title=title, description=line, color=color)
 
 
+def build_preliminary_game_embed(
+    op: dict,
+    all_ops: list[dict] = None,
+    names_cache: dict = None,
+    target_squad: str = "28"
+) -> discord.Embed:
+    """
+    Формує швидкий попередній Embed одразу після завершення гри на сервері,
+    поки сервер статистики ще не завершив 10-хвилинний підрахунок результатів.
+    """
+    date_str = op.get("date", "")
+    day_name = ""
+    short_date = ""
+    if date_str:
+        try:
+            dt = datetime.date.fromisoformat(date_str)
+            day_name = WEEKDAYS_UA.get(dt.weekday(), "")
+            short_date = dt.strftime("%d.%m")
+        except Exception:
+            short_date = date_str
+
+    raw_name = op.get("mission_name", "Невідома місія")
+    duration_min = op.get("mission_duration", 0) // 60
+
+    # Визначаємо номер гри за датою
+    game_num = 1
+    if all_ops:
+        same_date_ops = sorted(
+            [x for x in all_ops if x.get("date") == date_str],
+            key=lambda x: x.get("id", 0)
+        )
+        for idx, x in enumerate(same_date_ops, 1):
+            if x.get("id") == op.get("id"):
+                game_num = idx
+                break
+
+    # Назва місії та роль
+    mission_name = None
+    role_name = None
+    if names_cache:
+        cached = names_cache.get((date_str, game_num))
+        if not cached:
+            fallback_n = clean_mission_name_fallback(raw_name).lower()
+            cached = names_cache.get((date_str, fallback_n))
+        if isinstance(cached, dict):
+            mission_name = cached.get("name")
+            role_name = cached.get("role")
+        elif isinstance(cached, str):
+            mission_name = cached
+
+    if not mission_name:
+        mission_name = clean_mission_name_fallback(raw_name)
+
+    role_str = f" [{role_name}]" if role_name else ""
+    line = f"🏁 **[{target_squad}] МІСІЯ ЗАВЕРШЕНА** · `Гра {game_num}` · `{mission_name}`{role_str} ({duration_min} хв) · ⏳ *Підрахунок результатів та статистики...*"
+
+    title = f"VTG · {day_name} ({short_date})" if day_name else "VTG"
+    return discord.Embed(title=title, description=line, color=discord.Color.gold())
+
+
 def get_matches_for_date(valid_matches: list[dict], date_str: str) -> list[dict]:
     """Повертає матчі за вказану дату у хронологічному порядку (Гра 1, потім Гра 2)."""
     day_matches = [m for m in valid_matches if m.get("date") == date_str]
@@ -410,8 +486,8 @@ class VtgResultsDateSelect(Select):
             self.view.selected = True
             self.view.stop()
 
-        # Відправляємо результат у канал анонсів
-        await target_channel.send(embed=embed)
+        # Відправляємо результат у канал анонсів з тегом @everyone
+        await target_channel.send(content="@everyone", embed=embed)
 
         if inter.channel.id != target_channel.id:
             await inter.response.edit_message(content=f"Результати за обраний день відправлено в <#{target_channel.id}>.", view=None)
@@ -455,6 +531,28 @@ def save_posted_matches(posted_ids: set[int], filepath: str = STATE_FILE):
     try:
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(sorted(list(posted_ids)), f, indent=2)
+    except Exception as e:
+        print(f"[OcapApiClient] Помилка запису {filepath}: {e}")
+
+
+def load_pending_matches(filepath: str = PENDING_STATE_FILE) -> dict:
+    """Завантажує словник місій, які очікують на фінальну статистику: {str(mid): {channel_id, message_id}}."""
+    if not os.path.exists(filepath):
+        return {}
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f"[OcapApiClient] Помилка читання {filepath}: {e}")
+        return {}
+
+
+def save_pending_matches(pending: dict, filepath: str = PENDING_STATE_FILE):
+    """Зберігає очікуючі оновлення місії у файл."""
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(pending, f, indent=2)
     except Exception as e:
         print(f"[OcapApiClient] Помилка запису {filepath}: {e}")
 
